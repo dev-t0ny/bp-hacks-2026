@@ -723,7 +723,10 @@ function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, game: Game
         "X-Internal": env.DISCORD_BOT_TOKEN,
       },
       body: JSON.stringify({ phase, game }),
-    }).catch((err) => console.error(`Phase ${phase} trigger failed:`, err))
+    }).then(async (res) => {
+      if (!res.ok) console.error(`Phase ${phase} HTTP ${res.status}: ${await res.text()}`);
+      else console.log(`Phase ${phase} triggered OK`);
+    }).catch((err) => console.error(`Phase ${phase} fetch error:`, err))
   );
 }
 
@@ -861,44 +864,12 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
     });
   }
 
-  // Countdown is triggered by handleRevealRole when all players have seen their role.
-  // Schedule a fallback: if not all seen after ROLE_CHECK_TIMEOUT, start countdown anyway.
-  triggerPhase(ctx, env, "role_check_timeout", game);
+  // Countdown is triggered directly by handleRevealRole when all players click "Voir mon rôle".
 }
 
-// ── Phase: role_check_timeout — fallback if not all players check roles in time ──
-async function phaseRoleCheckTimeout(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  // Wait 25s, then check. Re-invoke until ROLE_CHECK_TIMEOUT total (~120s = ~5 invocations).
-  await sleep(25000);
-  try {
-    const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
-    const title: string = msg.embeds?.[0]?.title ?? "";
-    // If no longer in role check phase, countdown was already triggered by handleRevealRole
-    if (!title.includes("Découvrez vos rôles")) return;
-    const current = parseGameFromEmbed(msg);
-    if (current?.seen?.length === game.players.length) {
-      // All seen but countdown wasn't triggered (shouldn't happen, but safety)
-      triggerPhase(ctx, env, "countdown", current);
-      return;
-    }
-  } catch {
-    triggerPhase(ctx, env, "countdown", game);
-    return;
-  }
-  // Decrement remaining timeout checks (max ~5 rounds of 25s ≈ 120s)
-  const round = ((game as any)._timeoutRound ?? 0) + 1;
-  if (round >= 5) {
-    // Timeout — force start countdown
-    triggerPhase(ctx, env, "countdown", game);
-  } else {
-    // Re-invoke
-    triggerPhase(ctx, env, "role_check_timeout", { ...game, _timeoutRound: round } as any);
-  }
-}
 
-// ── Phase: countdown — 10s visible countdown then trigger night ──
-async function phaseCountdown(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  // Re-read latest game state from embed (seen might have updated)
+// ── Countdown + Night — runs in ctx.waitUntil from handleRevealRole (~25s) ──
+async function runCountdownAndNight(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   try {
     const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
     const latest = parseGameFromEmbed(msg);
@@ -906,6 +877,8 @@ async function phaseCountdown(token: string, game: GameState, ctx: ExecutionCont
   } catch {}
 
   const nightStateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  // 10s countdown with progress bar
   for (let remaining = GAME_START_DELAY; remaining > 0; remaining--) {
     try {
       const bar = "█".repeat(remaining) + "░".repeat(GAME_START_DELAY - remaining);
@@ -932,13 +905,7 @@ async function phaseCountdown(token: string, game: GameState, ctx: ExecutionCont
     await sleep(1000);
   }
 
-  // Trigger the night phase
-  triggerPhase(ctx, env, "night_village_sleeps", game);
-}
-
-// ── Phase: night_village_sleeps — "Le village s'endort" then trigger wolves wake ──
-async function phaseVillageSleeps(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  const nightStateUrl = `https://garou.bot/s/${encodeState(game)}`;
+  // "Le village s'endort..."
   await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
     embeds: [{
       title: `🌙 Le village s'endort... — Partie #${game.gameNumber}`,
@@ -972,12 +939,7 @@ async function phaseVillageSleeps(token: string, game: GameState, ctx: Execution
     components: [],
   });
 
-  // Trigger the wolf vote phase
-  triggerPhase(ctx, env, "night_wolf_vote", game);
-}
-
-// ── Phase: night_wolf_vote — unlock tanière, ping wolves, wait for votes ──
-async function phaseWolfVote(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  // Start night vote (unlock tanière, ping wolves, send vote buttons)
   await startNightPhase(token, game, ctx, env);
 }
 
@@ -1416,18 +1378,23 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
     } catch {}
   }
   if (!game.seen) game.seen = [];
-  const alreadySeen = game.seen.includes(userId);
-  if (!alreadySeen) {
+  if (!game.seen.includes(userId)) {
     game.seen.push(userId);
     if (game.lobbyMessageId) {
       try {
         await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
       } catch {}
     }
-    // All players have seen their role → trigger countdown
-    if (game.seen.length === game.players.length) {
-      triggerPhase(ctx, env, "countdown", game);
-    }
+  }
+  // All players seen → run countdown + night directly in background
+  if (game.seen.length >= game.players.length) {
+    try {
+      const checkMsg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
+      const title: string = checkMsg.embeds?.[0]?.title ?? "";
+      if (title.includes("Découvrez vos rôles")) {
+        ctx.waitUntil(runCountdownAndNight(token, game, ctx, env));
+      }
+    } catch {}
   }
 
   // Build description lines
@@ -1528,11 +1495,7 @@ export default {
       const token = env.DISCORD_BOT_TOKEN;
       const work = (async () => {
         try {
-          if (phase === "role_check_timeout") await phaseRoleCheckTimeout(token, payload.game, ctx, env);
-          else if (phase === "countdown") await phaseCountdown(token, payload.game, ctx, env);
-          else if (phase === "night_village_sleeps") await phaseVillageSleeps(token, payload.game, ctx, env);
-          else if (phase === "night_wolf_vote") await phaseWolfVote(token, payload.game, ctx, env);
-          else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
+          if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
           else console.error("Unknown phase:", phase);
         } catch (err) {
           console.error(`Phase ${phase} failed:`, err);
@@ -1578,6 +1541,7 @@ export default {
       }
     }
 
+    console.error("Unknown interaction:", JSON.stringify({ type: interaction.type, customId: interaction.data?.custom_id, component_type: interaction.data?.component_type }));
     return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
   },
 };
