@@ -1252,11 +1252,18 @@ async function handleRevealRole(interaction: any, env: Env): Promise<Response> {
   const role = ROLES[roleKey]!;
 
   // Track that this player has seen their role
+  // Fetch latest message to avoid race condition (multiple players clicking at once)
+  const token = env.DISCORD_BOT_TOKEN;
+  if (game.lobbyMessageId) {
+    try {
+      const latestMsg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+      const latest = parseGameFromEmbed(latestMsg);
+      if (latest) game.seen = latest.seen ?? [];
+    } catch {}
+  }
   if (!game.seen) game.seen = [];
   if (!game.seen.includes(userId)) {
     game.seen.push(userId);
-    // Update the main embed to show who has seen their role
-    const token = env.DISCORD_BOT_TOKEN;
     if (game.lobbyMessageId) {
       try {
         await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
