@@ -28,10 +28,11 @@ export interface ConfigState {
   discussionTime: number;
   voteTime: number;
   selectedRoles: number[];
+  botCount: number;
 }
 
 export function encodeConfigState(config: ConfigState): string {
-  const compact = {
+  const compact: Record<string, unknown> = {
     s: config.step,
     cr: config.creatorId,
     g: config.guildId,
@@ -42,6 +43,7 @@ export function encodeConfigState(config: ConfigState): string {
     vt: config.voteTime,
     rb: rolesToBitmask(config.selectedRoles),
   };
+  if (config.botCount) compact.bc = config.botCount;
   return btoa(JSON.stringify(compact));
 }
 
@@ -60,6 +62,7 @@ export function decodeConfigState(url: string): ConfigState | null {
       discussionTime: compact.dt ?? 120,
       voteTime: compact.vt ?? 60,
       selectedRoles: bitmaskToRoles(compact.rb ?? "0000000000000000"),
+      botCount: compact.bc ?? 0,
     };
   } catch {
     return null;
@@ -90,6 +93,7 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
     `> **Votes:** ${config.anonymousVotes ? "🔒 Anonyme" : "👁️ Public"}`,
     `> **Discussion:** ${formatTime(config.discussionTime)}`,
     `> **Vote:** ${formatTime(config.voteTime)}`,
+    `> **Bots IA:** ${config.botCount > 0 ? `🤖 ${config.botCount}` : "Aucun"}`,
     "",
     `🎭 **Rôles:** ${rolesCount} sélectionnés`,
     rolesCount > 0
@@ -149,23 +153,17 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
         components: [
           {
             type: 3,
-            custom_id: "cfg_votes",
-            placeholder: "🗳️ Type de votes",
+            custom_id: "cfg_bots",
+            placeholder: "🤖 Nombre de bots IA",
             min_values: 1,
             max_values: 1,
             options: [
-              {
-                label: "Vote Public",
-                value: "public",
-                description: "Tout le monde voit les votes",
-                default: !config.anonymousVotes,
-              },
-              {
-                label: "Vote Anonyme",
-                value: "anonyme",
-                description: "Les votes sont cachés",
-                default: config.anonymousVotes,
-              },
+              { label: "Aucun bot", value: "0", default: config.botCount === 0 },
+              { label: "1 bot", value: "1", default: config.botCount === 1 },
+              { label: "2 bots", value: "2", default: config.botCount === 2 },
+              { label: "3 bots", value: "3", default: config.botCount === 3 },
+              { label: "4 bots", value: "4", default: config.botCount === 4 },
+              { label: "5 bots", value: "5", default: config.botCount === 5 },
             ],
           },
         ],
@@ -210,6 +208,18 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
       {
         type: 1,
         components: [
+          {
+            type: 2,
+            style: config.anonymousVotes ? 2 : 1,
+            label: "👁️ Public",
+            custom_id: "cfg_votes_public",
+          },
+          {
+            type: 2,
+            style: config.anonymousVotes ? 1 : 2,
+            label: "🔒 Anonyme",
+            custom_id: "cfg_votes_anonyme",
+          },
           {
             type: 2,
             style: 1,

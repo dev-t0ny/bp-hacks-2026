@@ -4324,6 +4324,33 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
     lobbyMessageId: game.lobbyMessageId,
     game,
   });
+
+  // Schedule bot discussion messages
+  const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const aliveBots = bots.filter((b) => b.alive);
+  if (aliveBots.length > 0 && game.roles) {
+    // Build alive players list for bot context
+    const botAlivePlayers: { id: string; name: string }[] = [];
+    for (const id of livingPlayers) {
+      try {
+        const m: any = await getGuildMember(token, game.guildId, id);
+        botAlivePlayers.push({ id, name: m.nick || m.user.global_name || m.user.username });
+      } catch { botAlivePlayers.push({ id, name: id }); }
+    }
+    for (const b of aliveBots) {
+      botAlivePlayers.push({ id: b.id, name: b.name });
+    }
+
+    for (const bot of aliveBots) {
+      const role = game.roles[bot.id] ?? "villageois";
+      const delay = botDelay(discussionSeconds);
+      ctx.waitUntil(
+        sleep(delay).then(() =>
+          executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers)
+        )
+      );
+    }
+  }
 }
 
 async function phaseDiscussionTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
@@ -4392,8 +4419,12 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
   const voteSeconds = game.voteTime ?? 60;
   const deadline = Math.floor(Date.now() / 1000) + voteSeconds;
 
-  // Build targets (all living players)
-  const targets = await Promise.all(
+  // Load bots
+  const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const aliveBots = bots.filter((b) => b.alive);
+
+  // Build targets (all living players + bots)
+  const targets: { id: string; name: string }[] = await Promise.all(
     livingPlayers.map(async (id) => {
       let name = id;
       try {
@@ -4403,6 +4434,12 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
       return { id, name };
     })
   );
+  for (const b of aliveBots) {
+    targets.push({ id: b.id, name: b.name });
+  }
+
+  // Voters = living humans + alive bots
+  const allVoters = [...livingPlayers, ...aliveBots.map((b) => b.id)];
 
   const dvState: DayVoteState = {
     gameNumber: game.gameNumber,
@@ -4411,7 +4448,7 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
     lobbyMessageId: game.lobbyMessageId!,
     targets,
     votes: {},
-    voters: livingPlayers,
+    voters: allVoters,
     deadline,
     allRoles: game.roles,
     couple: game.couple,
@@ -4422,7 +4459,13 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
   const stateUrl = `https://garou.bot/dv/${encodeDayVoteState(dvState)}`;
 
   // Build voter status lines
-  const voterLines = livingPlayers.map((id) => `⬜ <@${id}> — *en attente...*`);
+  const voterLines = allVoters.map((id) => {
+    if (id.startsWith("bot_")) {
+      const b = aliveBots.find((b) => b.id === id);
+      return `⬜ 🤖 ${b?.name ?? id} — *en attente...*`;
+    }
+    return `⬜ <@${id}> — *en attente...*`;
+  });
 
   // Build buttons (5 per row max)
   const rows: any[] = [];
@@ -4488,6 +4531,19 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
     voteMessageId: voteMsg.id,
     gameChannelId: game.gameChannelId,
   });
+
+  // Schedule bot day votes
+  if (aliveBots.length > 0 && game.roles) {
+    for (const bot of aliveBots) {
+      const role = game.roles[bot.id] ?? "villageois";
+      const delay = botDelay(voteSeconds);
+      ctx.waitUntil(
+        sleep(delay).then(() =>
+          executeBotDayVote(token, env, bot, bots, game.gameChannelId, voteMsg.id, game.gameNumber, role, ctx)
+        )
+      );
+    }
+  }
 }
 
 async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -4521,10 +4577,12 @@ async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext):
   // Build updated voter lines
   const voterLines = dv.voters.map((id) => {
     const vote = dv.votes[id];
-    if (!vote) return `⬜ <@${id}> — *en attente...*`;
-    if (vote === "skip") return `⏭️ <@${id}> — **Passe**`;
+    const isBot = id.startsWith("bot_");
+    const displayName = isBot ? `🤖 ${dv.targets.find((t) => t.id === id)?.name ?? id}` : `<@${id}>`;
+    if (!vote) return `⬜ ${displayName} — *en attente...*`;
+    if (vote === "skip") return `⏭️ ${displayName} — **Passe**`;
     const target = dv.targets.find((t) => t.id === vote);
-    return `✅ <@${id}> — a voté pour **${target?.name ?? "?"}**`;
+    return `✅ ${displayName} — a voté pour **${target?.name ?? "?"}**`;
   });
 
   const allVoted = dv.voters.every((id) => dv.votes[id]);
@@ -4646,19 +4704,34 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
   if (!game.dead) game.dead = [];
   game.dead.push(eliminatedId);
 
-  // Set eliminated player as spectator (can view, can't send)
-  try {
-    await setChannelPermission(token, dv.gameChannelId, eliminatedId, {
-      allow: String(1 << 10), deny: String(1 << 11), type: 1,
-    });
-  } catch {}
+  const isBot = eliminatedId.startsWith("bot_");
+
+  // Set eliminated player as spectator (can view, can't send) — skip for bots
+  if (!isBot) {
+    try {
+      await setChannelPermission(token, dv.gameChannelId, eliminatedId, {
+        allow: String(1 << 10), deny: String(1 << 11), type: 1,
+      });
+    } catch {}
+  } else {
+    // Mark bot as dead in KV
+    const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+    const bot = bots.find((b) => b.id === eliminatedId);
+    if (bot) {
+      bot.alive = false;
+      await saveBots(env.ACTIVE_PLAYERS, game.gameNumber, bots);
+    }
+  }
 
   // Announce elimination with role reveal
+  const eliminatedDisplay = isBot
+    ? `🤖 **${eliminatedName}**`
+    : `**${eliminatedName}** (<@${eliminatedId}>)`;
   await sendMessage(token, dv.gameChannelId, {
     embeds: [{
       title: "⚖️ Le village a rendu son verdict!",
       description: [
-        `**${eliminatedName}** (<@${eliminatedId}>) a été éliminé(e) par le village!`,
+        `${eliminatedDisplay} a été éliminé(e) par le village!`,
         "",
         `${roleInfo.emoji} C'était **${roleInfo.name}**!`,
         "",
@@ -4675,20 +4748,34 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
     const partnerId = eliminatedId === game.couple[0] ? game.couple[1] : game.couple[0];
     if (!game.dead.includes(partnerId)) {
       game.dead.push(partnerId);
-      try {
-        await setChannelPermission(token, dv.gameChannelId, partnerId, {
-          allow: String(1 << 10), deny: String(1 << 11), type: 1,
-        });
-      } catch {}
-      const pm: any = await getGuildMember(token, game.guildId, partnerId).catch(() => null);
-      const pName = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
+      const partnerIsBot = partnerId.startsWith("bot_");
+      if (!partnerIsBot) {
+        try {
+          await setChannelPermission(token, dv.gameChannelId, partnerId, {
+            allow: String(1 << 10), deny: String(1 << 11), type: 1,
+          });
+        } catch {}
+      } else {
+        const pBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+        const pBot = pBots.find((b) => b.id === partnerId);
+        if (pBot) { pBot.alive = false; await saveBots(env.ACTIVE_PLAYERS, game.gameNumber, pBots); }
+      }
+      let pName: string;
+      if (partnerIsBot) {
+        const pBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+        pName = pBots.find((b) => b.id === partnerId)?.name ?? "?";
+      } else {
+        const pm: any = await getGuildMember(token, game.guildId, partnerId).catch(() => null);
+        pName = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
+      }
       const partnerRole = game.roles?.[partnerId] ?? "villageois";
       const partnerRoleInfo = ROLES[partnerRole] ?? ROLES.villageois!;
+      const partnerDisplay = partnerIsBot ? `🤖 **${pName}**` : `**${pName}** (<@${partnerId}>)`;
       await sendMessage(token, dv.gameChannelId, {
         embeds: [{
           title: "💔 Le couple est brisé...",
           description: [
-            `**${pName}** (<@${partnerId}>) meurt de chagrin.`,
+            `${partnerDisplay} meurt de chagrin.`,
             "",
             `${partnerRoleInfo.emoji} C'était **${partnerRoleInfo.name}**!`,
           ].join("\n"),
@@ -4697,6 +4784,13 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
       });
     }
   }
+
+  // Append to game history
+  await appendHistory(
+    env.ACTIVE_PLAYERS,
+    game.gameNumber,
+    `Jour: ${eliminatedName} a été éliminé(e) par le village. ${roleInfo.name}.`,
+  );
 
   // Check chasseur
   if (eliminatedRole === "chasseur") {
