@@ -1,4 +1,4 @@
-import { Conversation, bot, actions } from "@botpress/runtime";
+import { Conversation, bot } from "@botpress/runtime";
 import * as discord from "../actions/discord-api";
 import { buildGameEmbed, type GameState } from "../actions/embed-builder";
 
@@ -55,7 +55,7 @@ export default new Conversation({
     const text = ((message as any).text ?? (message.payload as any)?.text ?? "").trim();
 
     // Only respond if the bot is mentioned (@Garou)
-    const BOT_DISCORD_ID = "1482380236522787008";
+    const BOT_DISCORD_ID = "1482405258746663084";
     if (!text.includes(`<@${BOT_DISCORD_ID}>`) && !text.includes(`<@!${BOT_DISCORD_ID}>`)) return;
 
     // Lenient match: look for "loupgarou" followed by a number anywhere in the text
@@ -64,8 +64,7 @@ export default new Conversation({
     if (!match) {
       await execute({
         instructions:
-          "Tu es Garou, un bot de jeu de Loup-Garou sur Discord. Réponds TOUJOURS en français. Dis aux utilisateurs de taper /loupgarou <nombre> pour créer une partie. Sois bref. Tu peux aussi générer des images de scènes du jeu si on te le demande.",
-        tools: [actions.generateSceneImage.asTool()],
+          "Tu es Garou, un bot de jeu de Loup-Garou sur Discord. Réponds TOUJOURS en français. Dis aux utilisateurs de taper /loupgarou <nombre> pour créer une partie. Sois bref.",
       });
       return;
     }

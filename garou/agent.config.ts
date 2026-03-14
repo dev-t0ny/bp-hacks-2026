@@ -1,7 +1,7 @@
 import { z, defineConfig } from "@botpress/runtime";
 
 export default defineConfig({
-  name: "garou",
+  name: "Adam-Bot",
   description: "An AI agent built with Botpress ADK",
 
   defaultModels: {
@@ -11,7 +11,10 @@ export default defineConfig({
 
   bot: {
     state: z.object({
-      gameCounter: z.number().optional().describe("Auto-incrementing game number counter"),
+      gameCounter: z
+        .number()
+        .optional()
+        .describe("Auto-incrementing game number counter"),
     }),
   },
 
