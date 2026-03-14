@@ -3,6 +3,8 @@ import nacl from "tweetnacl";
 interface Env {
   DISCORD_PUBLIC_KEY: string;
   DISCORD_BOT_TOKEN: string;
+  VOICE_SERVICE_URL?: string;
+  VOICE_SERVICE_TOKEN?: string;
 }
 
 // ── Discord REST API ────────────────────────────────────────────────
@@ -164,6 +166,7 @@ interface GameState {
   creatorName: string;
   guildId: string;
   gameChannelId: string;
+  voiceChannelId?: string;
   maxPlayers: number;
   players: string[];
   lobbyMessageId?: string;
@@ -181,6 +184,7 @@ function encodeState(game: GameState): string {
     n: game.creatorName,
     gi: game.guildId,
     ch: game.gameChannelId,
+    vc: game.voiceChannelId,
     m: game.maxPlayers,
     p: game.players,
     lm: game.lobbyMessageId,
@@ -204,6 +208,7 @@ function decodeState(url: string): GameState | null {
       creatorName: compact.n,
       guildId: compact.gi,
       gameChannelId: compact.ch,
+      voiceChannelId: compact.vc,
       maxPlayers: compact.m,
       players: compact.p ?? [],
       lobbyMessageId: compact.lm,
@@ -397,11 +402,20 @@ function hexToUint8(hex: string): Uint8Array {
   return bytes;
 }
 
-function verifySignature(body: string, signature: string, timestamp: string, publicKey: string): boolean {
-  const msg = new TextEncoder().encode(timestamp + body);
-  const sig = hexToUint8(signature);
-  const key = hexToUint8(publicKey);
-  return nacl.sign.detached.verify(msg, sig, key);
+async function verifySignature(body: string, signature: string, timestamp: string, publicKey: string): Promise<boolean> {
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      hexToUint8(publicKey),
+      { name: "Ed25519", namedCurve: "Ed25519" },
+      false,
+      ["verify"]
+    );
+    const msg = new TextEncoder().encode(timestamp + body);
+    return await crypto.subtle.verify("Ed25519", key, hexToUint8(signature), msg);
+  } catch {
+    return false;
+  }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -419,6 +433,66 @@ function sleep(ms: number) {
 
 function getMessage(token: string, channelId: string, messageId: string) {
   return discordFetch(token, `/channels/${channelId}/messages/${messageId}`);
+}
+
+const VOICE_SERVICE_TIMEOUT_MS = 10_000;
+
+async function triggerStartSound(env: Env, game: GameState): Promise<void> {
+  if (!env.VOICE_SERVICE_URL || !game.voiceChannelId) {
+    if (!env.VOICE_SERVICE_URL) {
+      console.log("[garou] Voice service skipped: VOICE_SERVICE_URL not set");
+    }
+    return;
+  }
+
+  const endpoint = `${env.VOICE_SERVICE_URL.replace(/\/+$/, "")}/play-start-sfx`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (env.VOICE_SERVICE_TOKEN) {
+    headers.Authorization = `Bearer ${env.VOICE_SERVICE_TOKEN}`;
+  }
+
+  console.log(
+    `[garou] Triggering start sound: guildId=${game.guildId} voiceChannelId=${game.voiceChannelId} endpoint=${endpoint}`
+  );
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), VOICE_SERVICE_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        guildId: game.guildId,
+        voiceChannelId: game.voiceChannelId,
+        gameNumber: game.gameNumber,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[garou] Voice service error ${res.status}: ${body}`);
+      return;
+    }
+
+    const data = (await res.json().catch(() => ({}))) as { ok?: boolean; skipped?: boolean };
+    if (data.skipped) {
+      console.log("[garou] Voice service skipped playback (e.g. no one in voice channel)");
+    } else {
+      console.log("[garou] Start sound played successfully");
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("abort")) {
+      console.error("[garou] Voice service timeout: request took longer than", VOICE_SERVICE_TIMEOUT_MS, "ms");
+    } else {
+      console.error("[garou] Voice service unreachable:", err);
+    }
+  }
 }
 
 async function findOrCreateCategory(token: string, guildId: string): Promise<string> {
@@ -490,12 +564,32 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
         ],
       });
 
+      const voiceChannel: any = await createChannel(token, guildId, {
+        name: `vocal-partie-${gameNumber}`,
+        type: 2,
+        parent_id: categoryId,
+        permission_overwrites: [
+          { id: guildId, type: 0, deny: String(1 << 10) },
+          {
+            id: botUser.id,
+            type: 1,
+            allow: String((1 << 10) | (1 << 20) | (1 << 21)),
+          },
+          {
+            id: userId,
+            type: 1,
+            allow: String((1 << 10) | (1 << 20)),
+          },
+        ],
+      });
+
       const gameState: GameState = {
         gameNumber,
         creatorId: userId,
         creatorName,
         guildId,
         gameChannelId: gameChannel.id,
+        voiceChannelId: voiceChannel.id,
         maxPlayers,
         players: [userId],
         announceChannelId: channelId,
@@ -554,6 +648,13 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
     type: 1,
   });
 
+  if (game.voiceChannelId) {
+    await setChannelPermission(token, game.voiceChannelId, userId, {
+      allow: String((1 << 10) | (1 << 20)),
+      type: 1,
+    });
+  }
+
   const member: any = await getGuildMember(token, game.guildId, userId);
   const playerName = member.nick || member.user.global_name || member.user.username;
 
@@ -561,7 +662,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
 
   // Game is full → start countdown
   if (game.players.length >= game.maxPlayers) {
-    ctx.waitUntil(runCountdown(token, game));
+    ctx.waitUntil(runCountdown(token, game, env));
   }
 
   return json({
@@ -574,6 +675,9 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
           type: 1,
           components: [
             { type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` },
+            ...(game.voiceChannelId
+              ? [{ type: 2, style: 5, label: "🔊 Rejoindre le vocal", url: `https://discord.com/channels/${game.guildId}/${game.voiceChannelId}` }]
+              : []),
           ],
         },
       ],
@@ -595,6 +699,9 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   game.players = game.players.filter((id) => id !== userId);
 
   try { await deleteChannelPermission(token, game.gameChannelId, userId); } catch {}
+  if (game.voiceChannelId) {
+    try { await deleteChannelPermission(token, game.voiceChannelId, userId); } catch {}
+  }
 
   const member: any = await getGuildMember(token, game.guildId, userId);
   const playerName = member.nick || member.user.global_name || member.user.username;
@@ -602,6 +709,9 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   // No players left → delete everything
   if (game.players.length === 0) {
     try { await deleteChannel(token, game.gameChannelId); } catch {}
+    if (game.voiceChannelId) {
+      try { await deleteChannel(token, game.voiceChannelId); } catch {}
+    }
     if (game.wolfChannelId) {
       try { await deleteChannel(token, game.wolfChannelId); } catch {}
     }
@@ -634,9 +744,11 @@ const COUNTDOWN_SECONDS = 30;
 const EMBED_COLOR_NIGHT = 0x0d1b2a;
 const EMBED_COLOR_PURPLE = 0x6c3483;
 
-async function startGame(token: string, game: GameState) {
+async function startGame(token: string, game: GameState, env: Env) {
   if (!game.lobbyMessageId) return;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  await triggerStartSound(env, game);
 
   // ── Phase 1: Night falls ──
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
@@ -843,7 +955,7 @@ function isGameStarted(title: string): boolean {
   return title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin");
 }
 
-async function runCountdown(token: string, game: GameState) {
+async function runCountdown(token: string, game: GameState, env: Env) {
   if (!game.lobbyMessageId) return;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
@@ -927,7 +1039,7 @@ async function runCountdown(token: string, game: GameState) {
     if (isGameStarted(title)) return;
     const currentGame = parseGameFromEmbed(msg);
     if (!currentGame || currentGame.players.length < MIN_PLAYERS) return;
-    await startGame(token, currentGame);
+    await startGame(token, currentGame, env);
   } catch (err) {
     console.error("Countdown auto-start failed:", err);
   }
@@ -1333,7 +1445,7 @@ async function handleStart(interaction: any, env: Env): Promise<Response> {
 
   // Use deferred response + background for the animation
   const deferredResponse = json({ type: 6 }); // ACK with no message (update deferred)
-  (globalThis as any).__backgroundWork = startGame(token, game);
+  (globalThis as any).__backgroundWork = startGame(token, game, env);
   return deferredResponse;
 }
 
@@ -1349,7 +1461,7 @@ async function handleSkipCountdown(interaction: any, env: Env): Promise<Response
   }
 
   const token = env.DISCORD_BOT_TOKEN;
-  (globalThis as any).__backgroundWork = startGame(token, game);
+  (globalThis as any).__backgroundWork = startGame(token, game, env);
   return json({ type: 6 }); // ACK
 }
 
@@ -1365,7 +1477,7 @@ export default {
     const timestamp = req.headers.get("x-signature-timestamp");
     const body = await req.text();
 
-    if (!signature || !timestamp || !verifySignature(body, signature, timestamp, env.DISCORD_PUBLIC_KEY)) {
+    if (!signature || !timestamp || !(await verifySignature(body, signature, timestamp, env.DISCORD_PUBLIC_KEY))) {
       return new Response("Invalid signature", { status: 401 });
     }
 

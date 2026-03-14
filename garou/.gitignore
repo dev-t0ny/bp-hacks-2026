@@ -10,16 +10,10 @@ dist/
 .env
 .env.local
 .env.production
-.dev.vars
-.wrangler.toml
-.wrangler.toml.example
 
-
-
-# IDE / editor
+# IDE files
 .vscode/
 .idea/
-.claude/
 *.swp
 *.swo
 

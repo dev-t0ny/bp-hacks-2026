@@ -1,14 +1,14 @@
 {
   "name": "garou",
   "version": "1.0.0",
-  "description": "A Botpress Agent built with the ADK",
+  "description": "A Botpress Agent built with the ADK — Loup-Garou on Discord",
   "type": "module",
   "packageManager": "pnpm@latest",
   "scripts": {
-    "dev": "npm --prefix garou run dev",
-    "dev:interactions": "npm --prefix garou run dev:interactions",
-    "dev:voice": "npm --prefix garou run dev:voice",
-    "build": "npm --prefix garou run build"
+    "dev": "adk dev",
+    "dev:interactions": "bun run interactions-server.ts",
+    "dev:voice": "npm --prefix voice-service run dev",
+    "build": "adk build"
   },
   "dependencies": {
     "@botpress/runtime": "^1.16.3",

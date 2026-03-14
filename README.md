@@ -34,11 +34,13 @@ Le serveur d'interactions est un Cloudflare Worker deja deploye a :
 https://garou-interactions.gabgingras.workers.dev
 ```
 
-Pour redeploy apres des changements :
+Pour redeploy après des changements :
 
 ```bash
-cd worker && wrangler deploy
+cd garou/worker && wrangler deploy
 ```
+
+Avant le premier deploy (ou en local), copiez `garou/worker/.dev.vars.example` vers `garou/worker/.dev.vars` et renseignez les variables. En production, utilisez `wrangler secret put` pour les secrets.
 
 ## Utilisation
 
@@ -80,15 +82,23 @@ garou/
 
 L'etat du jeu est stocke dans les champs caches de l'embed Discord (pas de base de donnees).
 
+**Son au démarrage de partie :** le worker appelle un service vocal (Node + Discord.js) qui rejoint le salon vocal et joue un fichier audio. Pour que le son fonctionne à 100 % :
+- Le service canonique est dans **garou/voice-service/** — voir [garou/voice-service/README.md](garou/voice-service/README.md) pour la config, la checklist et les tests.
+- **Local :** lancer `pnpm run dev:voice`, et dans `garou/worker` avoir `.dev.vars` avec `VOICE_SERVICE_URL=http://127.0.0.1:3001`.
+- **Production (Cloudflare) :** le worker ne peut pas joindre localhost. Déployer le voice-service sur une URL publique (ex. tunnel Cloudflare Try, ou hébergement Node), puis définir `VOICE_SERVICE_URL` (et optionnellement `VOICE_SERVICE_TOKEN`) via `wrangler secret put` dans `garou/worker`.
+
 ## Dev
 
 ```bash
 # Bot ADK (terminal interactif requis)
 pnpm run dev
 
-# Redeploy le Worker apres modifications
-cd worker && wrangler deploy
+# Redeploy le Worker après modifications
+cd garou/worker && wrangler deploy
 
 # Build sans deployer
 pnpm run build
+
+# Service vocal (son au demarrage de partie) — voir garou/voice-service/README.md
+pnpm run dev:voice
 ```

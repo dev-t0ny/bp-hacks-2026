@@ -1,0 +1,12 @@
+name = "garou-interactions"
+main = "index.ts"
+compatibility_date = "2024-12-01"
+account_id = "3314599f71a92145cd2769c61ab3edf4"
+
+# For local dev: copy .dev.vars.example to .dev.vars and set values.
+# For production: use `wrangler secret put DISCORD_PUBLIC_KEY` etc. and set VOICE_SERVICE_URL to your deployed voice-service URL.
+[vars]
+DISCORD_PUBLIC_KEY = ""
+DISCORD_BOT_TOKEN = ""
+VOICE_SERVICE_URL = ""
+VOICE_SERVICE_TOKEN = ""
