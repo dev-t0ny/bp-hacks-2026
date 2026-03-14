@@ -746,6 +746,272 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ── LLM Call (for bot decisions) ────────────────────────────────────
+
+async function callLLM(prompt: string, env: Env): Promise<string> {
+  if (!env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 150,
+        messages: [{ role: "user", content: prompt }],
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) throw new Error(`LLM API ${res.status}`);
+    const data: any = await res.json();
+    return data.content?.[0]?.text ?? "";
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
+// ── Bot Wolf Vote Execution ─────────────────────────────────────────
+
+async function executeBotWolfVote(
+  token: string,
+  env: Env,
+  bot: BotPlayer,
+  allBots: BotPlayer[],
+  wolfChannelId: string,
+  voteMessageId: string,
+  gameNumber: number,
+  ctx: ExecutionContext,
+): Promise<void> {
+  // Re-read VoteState from embed to avoid race conditions
+  const currentMsg: any = await getMessage(token, wolfChannelId, voteMessageId);
+  if (!currentMsg.components?.length) return; // Already resolved
+  const voteState = parseVoteFromEmbed(currentMsg);
+  if (!voteState) return;
+
+  const gameHistory = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
+
+  // Build known info for wolf: list wolf teammates
+  const wolfBots = allBots.filter((b) => b.alive && voteState.wolves.includes(b.id));
+  const knownInfo = wolfBots.length > 1
+    ? `Tes alliés loups: ${wolfBots.filter((b) => b.id !== bot.id).map((b) => b.name).join(", ")}`
+    : "";
+
+  const req: BotDecisionRequest = {
+    bot,
+    role: "loup",
+    phase: "night_vote",
+    alivePlayers: voteState.targets,
+    aliveHumans: voteState.targets.filter((t) => !t.id.startsWith("bot_")),
+    aliveBots: allBots.filter((b) => b.alive),
+    gameHistory,
+    knownInfo,
+  };
+
+  let decision: BotDecisionResult;
+  try {
+    const prompt = buildBotPrompt(req);
+    const llmResponse = await callLLM(prompt, env);
+    const parsed = JSON.parse(llmResponse.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+    const targetName = parsed.target ?? "";
+    const target = voteState.targets.find((t) =>
+      t.name.toLowerCase().includes(targetName.toLowerCase())
+    );
+    decision = {
+      action: target?.id ?? voteState.targets[0]?.id ?? "skip",
+      message: parsed.message ?? `Je vote pour ${target?.name ?? "quelqu'un"}.`,
+    };
+  } catch {
+    decision = fallbackDecision(voteState.targets, bot.id);
+  }
+
+  // Apply vote
+  voteState.votes[bot.id] = decision.action;
+
+  // Post bot message in wolf thread
+  await sendMessage(token, wolfChannelId, {
+    content: `🤖 **${bot.name}** : "${decision.message}"`,
+  });
+
+  // Update vote embed with new state
+  await editMessage(token, wolfChannelId, voteMessageId, buildVoteEmbed(voteState));
+
+  // Check unanimous
+  const allVoted = voteState.wolves.every((wId) => voteState.votes[wId]);
+  const allSameTarget = allVoted && new Set(Object.values(voteState.votes)).size === 1;
+  if (allSameTarget) {
+    await resolveNightVote(token, voteState, voteMessageId, ctx, env);
+  }
+}
+
+// ── Bot Day Discussion ──────────────────────────────────────────────
+
+async function executeBotDiscussion(
+  token: string,
+  env: Env,
+  bot: BotPlayer,
+  allBots: BotPlayer[],
+  gameChannelId: string,
+  gameNumber: number,
+  role: string,
+  alivePlayers: { id: string; name: string }[],
+): Promise<void> {
+  if (!botSpeaks()) return;
+
+  const gameHistory = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
+
+  const req: BotDecisionRequest = {
+    bot,
+    role,
+    phase: "day_discussion",
+    alivePlayers,
+    aliveHumans: alivePlayers.filter((p) => !p.id.startsWith("bot_")),
+    aliveBots: allBots.filter((b) => b.alive),
+    gameHistory,
+    knownInfo: "",
+  };
+
+  try {
+    const prompt = buildBotPrompt(req);
+    const llmResponse = await callLLM(prompt, env);
+    const message = llmResponse.trim().slice(0, 200);
+    if (message) {
+      await sendMessage(token, gameChannelId, {
+        content: `🤖 **${bot.name}** : "${message}"`,
+      });
+    }
+  } catch {
+    // Silent fail — bot just doesn't speak this round
+  }
+}
+
+// ── Bot Day Vote ────────────────────────────────────────────────────
+
+async function executeBotDayVote(
+  token: string,
+  env: Env,
+  bot: BotPlayer,
+  allBots: BotPlayer[],
+  gameChannelId: string,
+  voteMessageId: string,
+  gameNumber: number,
+  role: string,
+  ctx: ExecutionContext,
+): Promise<void> {
+  // Re-read DayVoteState from embed
+  const currentMsg: any = await getMessage(token, gameChannelId, voteMessageId);
+  if (!currentMsg.components?.length) return;
+  const dv = parseDayVoteFromEmbed(currentMsg);
+  if (!dv) return;
+
+  const gameHistory = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
+
+  const req: BotDecisionRequest = {
+    bot,
+    role,
+    phase: "day_vote",
+    alivePlayers: dv.targets,
+    aliveHumans: dv.targets.filter((t) => !t.id.startsWith("bot_")),
+    aliveBots: allBots.filter((b) => b.alive),
+    gameHistory,
+    knownInfo: role === "loup"
+      ? `Ne vote pas contre: ${allBots.filter((b) => b.alive && b.id !== bot.id && dv.allRoles?.[b.id] === "loup").map((b) => b.name).join(", ")}`
+      : "",
+  };
+
+  let targetId: string;
+  let message: string;
+  try {
+    const prompt = buildBotPrompt(req);
+    const llmResponse = await callLLM(prompt, env);
+    const parsed = JSON.parse(llmResponse.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
+    const targetName = parsed.target ?? "";
+    const target = dv.targets.find((t) =>
+      t.name.toLowerCase().includes(targetName.toLowerCase())
+    );
+    targetId = target?.id ?? dv.targets[0]?.id ?? "skip";
+    message = parsed.message ?? `Je vote pour ${target?.name ?? "quelqu'un"}.`;
+  } catch {
+    const fd = fallbackDecision(dv.targets, bot.id);
+    targetId = fd.action;
+    message = fd.message;
+  }
+
+  dv.votes[bot.id] = targetId;
+
+  // Build updated voter lines
+  const voterLines = dv.voters.map((id) => {
+    const vote = dv.votes[id];
+    if (!vote) return `⬜ <@${id}> — *en attente...*`;
+    if (id.startsWith("bot_")) {
+      const b = allBots.find((b) => b.id === id);
+      const bName = b ? `🤖 ${b.name}` : id;
+      if (vote === "skip") return `⏭️ ${bName} — **Passe**`;
+      const target = dv.targets.find((t) => t.id === vote);
+      return `✅ ${bName} — a voté pour **${target?.name ?? "?"}**`;
+    }
+    if (vote === "skip") return `⏭️ <@${id}> — **Passe**`;
+    const target = dv.targets.find((t) => t.id === vote);
+    return `✅ <@${id}> — a voté pour **${target?.name ?? "?"}**`;
+  });
+
+  const updatedUrl = `https://garou.bot/dv/${encodeDayVoteState(dv)}`;
+
+  await editMessage(token, gameChannelId, voteMessageId, {
+    embeds: [{
+      title: `🗳️ Vote du village — Partie #${dv.gameNumber}`,
+      url: updatedUrl,
+      description: [
+        "Votez pour éliminer un suspect, ou passez votre tour.",
+        "",
+        `⏰ Fin du vote: <t:${dv.deadline}:R>`,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...voterLines,
+      ].join("\n"),
+      color: EMBED_COLOR,
+      image: { url: SCENE_IMAGES.day_elimination },
+    }],
+    components: currentMsg.components,
+  });
+
+  // Post message
+  await sendMessage(token, gameChannelId, {
+    content: `🤖 **${bot.name}** vote pour éliminer **${dv.targets.find((t) => t.id === targetId)?.name ?? "quelqu'un"}** : "${message}"`,
+  });
+
+  // Check all voted
+  const allVoted = dv.voters.every((id) => dv.votes[id]);
+  if (allVoted) {
+    await editMessage(token, gameChannelId, voteMessageId, {
+      embeds: [{
+        title: `🗳️ Vote du village — Partie #${dv.gameNumber}`,
+        url: updatedUrl,
+        description: [
+          "Votez pour éliminer un suspect, ou passez votre tour.",
+          "",
+          `⏰ Fin du vote: <t:${dv.deadline}:R>`,
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+          "",
+          ...voterLines,
+        ].join("\n"),
+        color: EMBED_COLOR,
+        image: { url: SCENE_IMAGES.day_elimination },
+      }],
+      components: [],
+    });
+    await resolveDayVote(token, dv, ctx, env);
+  }
+}
+
 function getMessage(token: string, channelId: string, messageId: string) {
   return discordFetch(token, `/channels/${channelId}/messages/${messageId}`);
 }
@@ -1048,15 +1314,6 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
 
   const backgroundWork = (async () => {
     try {
-      // Check if creator is already in a game
-      const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
-      if (activeGame !== null) {
-        await editOriginalInteractionResponse(appId, interactionToken, {
-          content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en créer une nouvelle.`,
-        });
-        return;
-      }
-
       const member: any = await getGuildMember(token, guildId, userId);
       const creatorName = member.nick || member.user.global_name || member.user.username;
       const categoryId = await findOrCreateCategory(token, guildId);
@@ -1177,10 +1434,6 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
 
   // Check if creator is already in a game
   const token = env.DISCORD_BOT_TOKEN;
-  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
-  if (activeGame !== null) {
-    return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en créer une nouvelle.`, flags: 64 } });
-  }
 
   // Build initial config state with default preset
   const defaultPreset = DEFAULT_PRESETS[0]!;
@@ -1229,14 +1482,6 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
       if (alreadyIn) {
         await editOriginalInteractionResponse(appId, interactionToken, {
           content: "❌ Tu es déjà dans cette partie!",
-        });
-        return;
-      }
-
-      const activeGame = await getActiveGame(kv, token, userId);
-      if (activeGame !== null) {
-        await editOriginalInteractionResponse(appId, interactionToken, {
-          content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en rejoindre une autre.`,
         });
         return;
       }
@@ -1795,6 +2040,7 @@ interface VoteState {
   couple?: [string, string];
   allRoles?: Record<string, string>; // all player roles (for chasseur check)
   allPlayers?: string[]; // all living players
+  wolfNames?: Record<string, string>; // bot wolf id → display name
 }
 
 function encodeVoteState(vote: VoteState): string {
@@ -1809,6 +2055,7 @@ function encodeVoteState(vote: VoteState): string {
   if (vote.couple) o.cp = vote.couple;
   if (vote.allRoles) o.ar = vote.allRoles;
   if (vote.allPlayers) o.ap = vote.allPlayers;
+  if (vote.wolfNames && Object.keys(vote.wolfNames).length) o.wn = vote.wolfNames;
   return btoa(JSON.stringify(o));
 }
 
@@ -1827,6 +2074,7 @@ function decodeVoteState(url: string): VoteState | null {
       couple: c.cp,
       allRoles: c.ar,
       allPlayers: c.ap,
+      wolfNames: c.wn,
     };
   } catch { return null; }
 }
@@ -2074,7 +2322,10 @@ function buildVoteEmbed(vote: VoteState) {
   const voteLines = vote.wolves.map((wId) => {
     const targetId = vote.votes[wId];
     const target = targetId ? vote.targets.find((t) => t.id === targetId) : null;
-    return `🐺 <@${wId}> → ${target ? `**${target.name}**` : "*(en attente...)*"}`;
+    const wolfLabel = wId.startsWith("bot_")
+      ? `🤖 **${vote.wolfNames?.[wId] ?? wId}**`
+      : `🐺 <@${wId}>`;
+    return `${wolfLabel} → ${target ? `**${target.name}**` : "*(en attente...)*"}`;
   });
 
   const buttonRows: any[] = [];
@@ -2646,28 +2897,51 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
 
   const dead = game.dead ?? [];
   const livingPlayers = game.players.filter(id => !dead.includes(id));
-  const wolfIds = livingPlayers.filter(id => {
+  const humanWolfIds = livingPlayers.filter(id => {
     const r = game.roles![id];
     return r === "loup" || r === "loup_blanc";
   });
-  const targetIds = livingPlayers.filter(id => !wolfIds.includes(id));
 
-  const targets = await Promise.all(
-    targetIds.map(async (id) => {
+  // Load bots and find bot wolves
+  const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const botWolfIds = bots
+    .filter((b) => b.alive && (game.roles?.[b.id] === "loup" || game.roles?.[b.id] === "loup_blanc"))
+    .map((b) => b.id);
+  const allWolfIds = [...humanWolfIds, ...botWolfIds];
+
+  // Human non-wolf targets
+  const humanTargetIds = livingPlayers.filter(id => !allWolfIds.includes(id));
+  const humanTargets = await Promise.all(
+    humanTargetIds.map(async (id) => {
       const member: any = await getGuildMember(token, game.guildId, id);
       return { id, name: member.nick || member.user.global_name || member.user.username };
     })
   );
 
+  // Bot non-wolf targets
+  const botTargets = bots
+    .filter((b) => b.alive && !botWolfIds.includes(b.id))
+    .map((b) => ({ id: b.id, name: b.name }));
+
+  const targets = [...humanTargets, ...botTargets];
+
   const deadline = Math.floor(Date.now() / 1000) + NIGHT_VOTE_SECONDS;
+
+  // Build wolf name map for display
+  const wolfNames: Record<string, string> = {};
+  for (const b of bots.filter((b) => botWolfIds.includes(b.id))) {
+    wolfNames[b.id] = b.name;
+  }
 
   const voteState: VoteState = {
     gameNumber: game.gameNumber, guildId: game.guildId,
     gameChannelId: game.gameChannelId, wolfChannelId: "",
-    lobbyMessageId: game.lobbyMessageId!, wolves: wolfIds,
+    lobbyMessageId: game.lobbyMessageId!, wolves: allWolfIds,
     targets, votes: {}, deadline,
     petiteFilleThreadId: game.petiteFilleThreadId,
-    couple: game.couple, allRoles: game.roles, allPlayers: livingPlayers,
+    couple: game.couple, allRoles: game.roles,
+    allPlayers: [...livingPlayers, ...bots.filter((b) => b.alive).map((b) => b.id)],
+    wolfNames,
   };
 
   const wolfThread: any = await createThread(token, game.gameChannelId, {
@@ -2676,7 +2950,8 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
   game.wolfChannelId = wolfThread.id;
   voteState.wolfChannelId = wolfThread.id;
 
-  for (const wolfId of wolfIds) {
+  // Only add human wolves to thread (bots don't need thread access)
+  for (const wolfId of humanWolfIds) {
     await addThreadMember(token, wolfThread.id, wolfId);
   }
 
@@ -2699,15 +2974,25 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     });
 
     // Tell the gateway to mirror wolf thread messages to spy thread
-    const wolfIndices = wolfIds.map((id, i) => ({ id, index: i + 1 }));
+    const wolfIndices = humanWolfIds.map((id, i) => ({ id, index: i + 1 }));
     ctx.waitUntil(gatewayTrackThread(env, wolfThread.id, spyThread.id, wolfIndices).catch(() => {}));
   }
 
-  const wolfMentions = wolfIds.map(id => `<@${id}>`).join(" ");
+  const wolfMentions = humanWolfIds.map(id => `<@${id}>`).join(" ");
   await sendMessage(token, wolfThread.id, {
     content: `${wolfMentions}\n\n🌙 **La nuit est tombée!** Choisissez votre victime ci-dessous.`,
   });
   const voteMsg: any = await sendMessage(token, wolfThread.id, buildVoteEmbed(voteState));
+
+  // Schedule bot wolf votes with random delays
+  for (const botWolf of bots.filter((b) => b.alive && botWolfIds.includes(b.id))) {
+    const delay = botDelay(NIGHT_VOTE_SECONDS);
+    ctx.waitUntil(
+      sleep(delay).then(() =>
+        executeBotWolfVote(token, env, botWolf, bots, wolfThread.id, voteMsg.id, game.gameNumber, ctx)
+      )
+    );
+  }
 
   ctx.waitUntil(
     fetch(WORKER_URL, {
