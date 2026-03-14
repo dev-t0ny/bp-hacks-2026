@@ -54,14 +54,9 @@ export default new Conversation({
     // Use message.text (ADK convenience) or fall back to payload.text
     const text = ((message as any).text ?? (message.payload as any)?.text ?? "").trim();
 
-    // Debug: log everything to diagnose issues
-    console.log("[GAROU] Handler invoked:", JSON.stringify({
-      type: message.type,
-      text,
-      payload: message.payload,
-      messageKeys: Object.keys(message),
-      tags: message.tags,
-    }));
+    // Only respond if the bot is mentioned (@Garou)
+    const BOT_DISCORD_ID = "1482380236522787008";
+    if (!text.includes(`<@${BOT_DISCORD_ID}>`) && !text.includes(`<@!${BOT_DISCORD_ID}>`)) return;
 
     // Lenient match: look for "loupgarou" followed by a number anywhere in the text
     const match = text.match(/loupgarou\s*(\d+)/i);

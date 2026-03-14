@@ -433,8 +433,21 @@ async function handleJoin(interaction: any, env: Env): Promise<Response> {
   return json({
     type: 4,
     data: {
-      content: `✅ Tu as rejoint la Partie #${game.gameNumber}! Regarde le salon <#${game.gameChannelId}>`,
+      content: `✅ Tu as rejoint la Partie #${game.gameNumber}!`,
       flags: 64,
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 2,
+              style: 5,
+              label: "🐺 Aller au salon",
+              url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}`,
+            },
+          ],
+        },
+      ],
     },
   });
 }
