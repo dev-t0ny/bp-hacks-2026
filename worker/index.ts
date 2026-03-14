@@ -794,59 +794,9 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   game.players.forEach((id, i) => { rolesMap[id] = roleKeys[i]!; });
   game.roles = rolesMap;
 
-  const playerRoles = game.players.map((id) => ({ id, roleKey: rolesMap[id]!, role: ROLES[rolesMap[id]!]! }));
-
-  // ── Create hidden wolf channel ──
-  const wolfPlayerIds = playerRoles.filter((p) => p.role.team === "loups").map((p) => p.id);
-  const botUser: any = await getBotUser(token);
-  const categoryId = await findOrCreateCategory(token, game.guildId);
-
-  const wolfChannel: any = await createChannel(token, game.guildId, {
-    name: `taniere-partie-${game.gameNumber}`,
-    type: 0,
-    parent_id: categoryId,
-    topic: `🐺 Canal secret des Loups-Garous — Partie #${game.gameNumber}`,
-    permission_overwrites: [
-      { id: game.guildId, type: 0, deny: String(1 << 10) },
-      { id: botUser.id, type: 1, allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)) },
-      ...wolfPlayerIds.map((id) => ({
-        id,
-        type: 1 as const,
-        allow: String(1 << 10),
-        deny: String(1 << 11),
-      })),
-    ],
-  });
-  game.wolfChannelId = wolfChannel.id;
-
-  await sendMessage(token, wolfChannel.id, {
-    embeds: [{
-      title: "🐺 Bienvenue dans la Tanière",
-      description: [
-        "```",
-        "  🌑  Canal secret des Loups-Garous",
-        "  👁️  Invisible aux villageois",
-        "```",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        ...wolfPlayerIds.map((id) => `🐺 <@${id}>`),
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        "Complotez ici en toute discrétion.",
-        "Personne d'autre ne peut voir ce canal.",
-      ].join("\n"),
-      color: EMBED_COLOR_NIGHT,
-      image: { url: WEREWOLF_IMAGE },
-      footer: { text: `Partie #${game.gameNumber} — Les villageois dorment` },
-      timestamp: new Date().toISOString(),
-    }],
-  });
-
   await sleep(3000);
 
-  // ── Phase 3: Role check ──
+  // ── Phase 3: Role check (channels are created lazily when players reveal) ──
   game.seen = [];
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
 
@@ -1035,7 +985,7 @@ async function runCountdown(token: string, game: GameState, ctx: ExecutionContex
     if (isGameStarted(title)) return;
     const currentGame = parseGameFromEmbed(msg);
     if (!currentGame || currentGame.players.length < MIN_PLAYERS) return;
-    await startGame(token, currentGame, ctx, env);
+    triggerPhase(ctx, env, "start_game", currentGame);
   } catch (err) {
     console.error("Countdown auto-start failed:", err);
   }
@@ -1374,18 +1324,81 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
     try {
       const latestMsg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
       const latest = parseGameFromEmbed(latestMsg);
-      if (latest) game.seen = latest.seen ?? [];
+      if (latest) {
+        game.seen = latest.seen ?? [];
+        if (latest.wolfChannelId) game.wolfChannelId = latest.wolfChannelId;
+      }
     } catch {}
   }
   if (!game.seen) game.seen = [];
   if (!game.seen.includes(userId)) {
     game.seen.push(userId);
-    if (game.lobbyMessageId) {
-      try {
-        await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
-      } catch {}
-    }
   }
+
+  // ── Lazy channel creation for special roles ──
+  // Channels only appear for players who have revealed their role
+  if (roleKey === "loup") {
+    if (!game.wolfChannelId) {
+      // First wolf to reveal → create the wolf channel (bot-only at first)
+      const botUser: any = await getBotUser(token);
+      const categoryId = await findOrCreateCategory(token, game.guildId);
+      const wolfChannel: any = await createChannel(token, game.guildId, {
+        name: `taniere-partie-${game.gameNumber}`,
+        type: 0,
+        parent_id: categoryId,
+        topic: `🐺 Canal secret des Loups-Garous — Partie #${game.gameNumber}`,
+        permission_overwrites: [
+          { id: game.guildId, type: 0, deny: String(1 << 10) },
+          { id: botUser.id, type: 1, allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)) },
+        ],
+      });
+      game.wolfChannelId = wolfChannel.id;
+
+      // Send welcome message
+      const wolfPlayerIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
+      await sendMessage(token, wolfChannel.id, {
+        embeds: [{
+          title: "🐺 Bienvenue dans la Tanière",
+          description: [
+            "```",
+            "  🌑  Canal secret des Loups-Garous",
+            "  👁️  Invisible aux villageois",
+            "```",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "",
+            ...wolfPlayerIds.map((id) => `🐺 <@${id}>`),
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "",
+            "Complotez ici en toute discrétion.",
+            "Personne d'autre ne peut voir ce canal.",
+            "",
+            "*Ce canal sera visible à chaque loup après qu'il ait découvert son rôle.*",
+          ].join("\n"),
+          color: EMBED_COLOR_NIGHT,
+          image: { url: WEREWOLF_IMAGE },
+          footer: { text: `Partie #${game.gameNumber} — Les villageois dorment` },
+          timestamp: new Date().toISOString(),
+        }],
+      });
+    }
+
+    // Grant this wolf access to the channel (read-only until night)
+    await setChannelPermission(token, game.wolfChannelId, userId, {
+      allow: String(1 << 10),
+      deny: String(1 << 11),
+      type: 1,
+    });
+  }
+
+  // Update role check embed with latest seen list + wolfChannelId
+  if (game.lobbyMessageId) {
+    try {
+      await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
+    } catch {}
+  }
+
   // All players seen → run countdown + night directly in background
   if (game.seen.length >= game.players.length) {
     try {
@@ -1495,7 +1508,8 @@ export default {
       const token = env.DISCORD_BOT_TOKEN;
       const work = (async () => {
         try {
-          if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
+          if (phase === "start_game") await startGame(token, payload.game, ctx, env);
+          else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
           else console.error("Unknown phase:", phase);
         } catch (err) {
           console.error(`Phase ${phase} failed:`, err);
