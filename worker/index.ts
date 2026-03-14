@@ -25,6 +25,8 @@ interface Env {
   DISCORD_BOT_TOKEN: string;
   ACTIVE_PLAYERS: KVNamespace;
   PRESETS_KV?: KVNamespace;
+  VOICE_SERVICE_URL?: string;
+  VOICE_SERVICE_TOKEN?: string;
 }
 
 const PLAYER_TTL = 86400;
@@ -307,6 +309,18 @@ const ROLES: Record<string, Role> = {
     team: "village",
     description: "Au début de la partie, liez deux joueurs par l'amour. Si l'un meurt, l'autre aussi.",
   },
+  petite_fille: {
+    name: "Petite Fille",
+    emoji: "👧",
+    team: "village",
+    description: "Vous espionnez les loups-garous chaque nuit. Vous voyez leurs messages, mais ils ne savent pas que vous êtes là.",
+  },
+  chasseur: {
+    name: "Chasseur",
+    emoji: "🏹",
+    team: "village",
+    description: "Quand vous mourez, vous emportez quelqu'un avec vous. Choisissez bien votre dernière cible.",
+  },
   villageois: {
     name: "Villageois",
     emoji: "🧑‍🌾",
@@ -343,6 +357,11 @@ interface GameState {
   wolfChannelId?: string;
   roles?: Record<string, string>; // playerId → roleKey (set after game starts)
   seen?: string[]; // player IDs who have viewed their role
+  couple?: [string, string]; // cupidon's coupled player IDs
+  petiteFilleThreadId?: string; // permanent spy thread for petite fille
+  nightCount?: number; // how many nights have passed (cupidon acts night 1 only)
+  dead?: string[]; // dead player IDs
+  voiceChannelId?: string; // voice channel for sound effects
 }
 
 function encodeState(game: GameState): string {
@@ -361,6 +380,11 @@ function encodeState(game: GameState): string {
   };
   if (game.roles) compact.r = game.roles;
   if (game.seen?.length) compact.s = game.seen;
+  if (game.couple) compact.cp = game.couple;
+  if (game.petiteFilleThreadId) compact.pf = game.petiteFilleThreadId;
+  if (game.nightCount) compact.nc = game.nightCount;
+  if (game.dead?.length) compact.d = game.dead;
+  if (game.voiceChannelId) compact.vc = game.voiceChannelId;
   return btoa(JSON.stringify(compact));
 }
 
@@ -383,6 +407,11 @@ function decodeState(url: string): GameState | null {
       wolfChannelId: compact.wc,
       roles: compact.r,
       seen: compact.s ?? [],
+      couple: compact.cp,
+      petiteFilleThreadId: compact.pf,
+      nightCount: compact.nc ?? 0,
+      dead: compact.d ?? [],
+      voiceChannelId: compact.vc,
     };
   } catch {
     return null;
@@ -1095,9 +1124,54 @@ function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, game: Game
   );
 }
 
+// ── Voice Service ────────────────────────────────────────────────────
+
+const VOICE_SERVICE_TIMEOUT_MS = 10_000;
+
+async function triggerStartSound(env: Env, game: GameState): Promise<void> {
+  if (!env.VOICE_SERVICE_URL || !game.voiceChannelId) {
+    if (!env.VOICE_SERVICE_URL) console.log("[garou] Voice service skipped: VOICE_SERVICE_URL not set");
+    else console.log("[garou] Voice service skipped: no voiceChannelId");
+    return;
+  }
+  const endpoint = `${env.VOICE_SERVICE_URL.replace(/\/+$/, "")}/play-start-sfx`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (env.VOICE_SERVICE_TOKEN) headers.Authorization = `Bearer ${env.VOICE_SERVICE_TOKEN}`;
+  console.log(`[garou] Triggering start sound: guildId=${game.guildId} voiceChannelId=${game.voiceChannelId}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), VOICE_SERVICE_TIMEOUT_MS);
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ guildId: game.guildId, voiceChannelId: game.voiceChannelId }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[garou] Voice service error ${res.status}: ${body}`);
+    } else {
+      const data: any = await res.json();
+      if (data.skipped) console.log("[garou] Voice service skipped playback (e.g. no one in voice channel)");
+      else console.log("[garou] Start sound played successfully");
+    }
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err?.name === "AbortError") {
+      console.error("[garou] Voice service timeout");
+    } else {
+      console.error("[garou] Voice service fetch error:", err);
+    }
+  }
+}
+
 async function startGame(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.lobbyMessageId) return;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  // Play sound effect in voice channel (non-blocking)
+  triggerStartSound(env, game).catch(() => {});
 
   // ── Phase 1: Night falls ──
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
@@ -1106,15 +1180,6 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
         title: "🌑 La nuit tombe sur le village...",
         url: stateUrl,
         description: [
-          "",
-          "```",
-          "     🌕",
-          "   ·  ✦  ·  ✧  ·",
-          " ✧    ·    ✦    ·",
-          "   ·  ✦  ·  ✧  ·",
-          "  🌲🌲🌲🌲🌲🌲🌲🌲",
-          "```",
-          "",
           "*Les villageois s'endorment...*",
           "*Quelque chose rôde dans l'ombre...*",
         ].join("\n"),
@@ -1134,20 +1199,12 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
         title: "🃏 Le destin se révèle...",
         url: stateUrl,
         description: [
-          "",
-          "```",
-          " ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐",
-          " │ 🐺  │ │ 🧪  │ │ 💘  │ │  ?  │",
-          " │     │ │     │ │     │ │     │",
-          " │ ??? │ │ ??? │ │ ??? │ │ ??? │",
-          " └─────┘ └─────┘ └─────┘ └─────┘",
-          "```",
-          "",
           `**${game.players.length} cartes** sont distribuées face cachée...`,
           "",
-          "*Chaque joueur reçoit son destin en message privé.*",
+          "*Chaque joueur reçoit son destin en secret.*",
         ].join("\n"),
         color: EMBED_COLOR_PURPLE,
+        image: { url: SCENE_IMAGES.game_start },
       },
     ],
     components: [],
@@ -1372,16 +1429,25 @@ interface VoteState {
   targets: { id: string; name: string }[];
   votes: Record<string, string>; // wolfId → targetId
   deadline: number; // Unix timestamp in seconds
+  petiteFilleThreadId?: string;
+  couple?: [string, string];
+  allRoles?: Record<string, string>; // all player roles (for chasseur check)
+  allPlayers?: string[]; // all living players
 }
 
 function encodeVoteState(vote: VoteState): string {
-  return btoa(JSON.stringify({
+  const o: Record<string, unknown> = {
     g: vote.gameNumber, gi: vote.guildId, gc: vote.gameChannelId,
     wc: vote.wolfChannelId, lm: vote.lobbyMessageId,
     w: vote.wolves,
     t: vote.targets.map((t) => [t.id, t.name]),
     v: vote.votes, dl: vote.deadline,
-  }));
+  };
+  if (vote.petiteFilleThreadId) o.pf = vote.petiteFilleThreadId;
+  if (vote.couple) o.cp = vote.couple;
+  if (vote.allRoles) o.ar = vote.allRoles;
+  if (vote.allPlayers) o.ap = vote.allPlayers;
+  return btoa(JSON.stringify(o));
 }
 
 function decodeVoteState(url: string): VoteState | null {
@@ -1395,6 +1461,10 @@ function decodeVoteState(url: string): VoteState | null {
       wolves: c.w,
       targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
       votes: c.v ?? {}, deadline: c.dl,
+      petiteFilleThreadId: c.pf,
+      couple: c.cp,
+      allRoles: c.ar,
+      allPlayers: c.ap,
     };
   } catch { return null; }
 }
@@ -1458,7 +1528,7 @@ function buildVoteEmbed(vote: VoteState) {
 }
 
 async function startNightPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  if (!game.wolfChannelId || !game.roles) return;
+  if (!game.roles) return;
 
   const wolfIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
   const targetIds = game.players.filter((id) => !wolfIds.includes(id));
@@ -1484,12 +1554,26 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
     deadline,
   };
 
-  // Tag wolves and send vote embed in wolf channel
+  // Create a fresh private thread for this night
+  const wolfThread: any = await createThread(token, game.gameChannelId, {
+    name: "🐺 Tanière",
+    type: 12, // GUILD_PRIVATE_THREAD
+    auto_archive_duration: 1440,
+  });
+  game.wolfChannelId = wolfThread.id;
+  voteState.wolfChannelId = wolfThread.id;
+
+  // Add all wolves to the thread
+  for (const wolfId of wolfIds) {
+    await addThreadMember(token, wolfThread.id, wolfId);
+  }
+
+  // Tag wolves and send vote embed in wolf thread
   const wolfMentions = wolfIds.map((id) => `<@${id}>`).join(" ");
-  await sendMessage(token, game.wolfChannelId, {
+  await sendMessage(token, wolfThread.id, {
     content: `${wolfMentions}\n\n🌙 **La nuit est tombée!** Choisissez votre victime ci-dessous.`,
   });
-  const voteMsg: any = await sendMessage(token, game.wolfChannelId, buildVoteEmbed(voteState));
+  const voteMsg: any = await sendMessage(token, wolfThread.id, buildVoteEmbed(voteState));
 
   // Schedule vote timer via self-invocation (avoids 90s sleep killing the worker)
   ctx.waitUntil(
@@ -1585,6 +1669,9 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
     components: [],
   });
 
+  // Delete wolf thread — a new one will be created next night
+  try { await deleteChannel(token, vote.wolfChannelId); } catch {}
+
   // Announce in game channel
   await sendMessage(token, vote.gameChannelId, {
     embeds: [{
@@ -1595,7 +1682,7 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
         "*Un moment de silence pour la victime...*",
       ].join("\n"),
       color: EMBED_COLOR,
-      image: { url: SCENE_IMAGES.night_kill },
+      image: { url: SCENE_IMAGES.dawn_breaks },
     }],
   });
 }
@@ -1659,87 +1746,47 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
   if (!roleKey) return json({ type: 4, data: { content: "❌ Aucun rôle trouvé pour toi.", flags: 64 } });
 
   const role = ROLES[roleKey]!;
-
-  // Track that this player has seen their role
-  // Fetch latest message to avoid race condition (multiple players clicking at once)
   const token = env.DISCORD_BOT_TOKEN;
+
+  // Update seen list in background with retry loop to handle concurrent clicks
   if (game.lobbyMessageId) {
-    try {
-      const latestMsg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
-      const latest = parseGameFromEmbed(latestMsg);
-      if (latest) {
-        game.seen = latest.seen ?? [];
-        if (latest.wolfChannelId) game.wolfChannelId = latest.wolfChannelId;
+    ctx.waitUntil((async () => {
+      const lobbyId = game.lobbyMessageId!;
+      const channelId = game.gameChannelId;
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          // Always re-read the latest embed before writing
+          const latestMsg: any = await getMessage(token, channelId, lobbyId);
+          const latest = parseGameFromEmbed(latestMsg);
+          if (!latest) return;
+
+          const seen = latest.seen ?? [];
+          if (seen.includes(userId)) return; // Already saved by another attempt
+          seen.push(userId);
+          latest.seen = seen;
+
+          await editMessage(token, channelId, lobbyId, buildRoleCheckEmbed(latest));
+
+          // Verify our write persisted
+          await sleep(150);
+          const verifyMsg: any = await getMessage(token, channelId, lobbyId);
+          const verify = parseGameFromEmbed(verifyMsg);
+          if (verify?.seen?.includes(userId)) {
+            // All players seen → trigger countdown + night
+            if (verify.seen.length >= verify.players.length) {
+              const title: string = verifyMsg.embeds?.[0]?.title ?? "";
+              if (title.includes("Découvrez vos rôles")) {
+                await runCountdownAndNight(token, verify, ctx, env);
+              }
+            }
+            return; // Success
+          }
+          // Our write was overwritten — retry with backoff
+          await sleep(200 * (attempt + 1));
+        } catch {}
       }
-    } catch {}
-  }
-  if (!game.seen) game.seen = [];
-  if (!game.seen.includes(userId)) {
-    game.seen.push(userId);
-  }
-
-  // ── Lazy thread creation for special roles ──
-  // Private thread only appears for wolves who have revealed their role
-  if (roleKey === "loup") {
-    if (!game.wolfChannelId) {
-      // First wolf to reveal → create a private thread inside the game channel
-      const wolfThread: any = await createThread(token, game.gameChannelId, {
-        name: "🐺 Tanière",
-        type: 12, // GUILD_PRIVATE_THREAD
-        auto_archive_duration: 1440,
-      });
-      game.wolfChannelId = wolfThread.id;
-
-      // Send welcome message
-      const wolfPlayerIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
-      await sendMessage(token, wolfThread.id, {
-        embeds: [{
-          title: "🐺 Bienvenue dans la Tanière",
-          description: [
-            "```",
-            "  🌑  Fil secret des Loups-Garous",
-            "  👁️  Invisible aux villageois",
-            "```",
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-            ...wolfPlayerIds.map((id) => `🐺 <@${id}>`),
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-            "Complotez ici en toute discrétion.",
-            "Personne d'autre ne peut voir ce fil.",
-            "",
-            "*Ce fil sera visible à chaque loup après qu'il ait découvert son rôle.*",
-          ].join("\n"),
-          color: EMBED_COLOR_NIGHT,
-          image: { url: SCENE_IMAGES.night_falls },
-          footer: { text: `Partie #${game.gameNumber} — Les villageois dorment` },
-          timestamp: new Date().toISOString(),
-        }],
-      });
-    }
-
-    // Add this wolf to the private thread
-    await addThreadMember(token, game.wolfChannelId, userId);
-  }
-
-  // Update role check embed with latest seen list + wolfChannelId
-  if (game.lobbyMessageId) {
-    try {
-      await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
-    } catch {}
-  }
-
-  // All players seen → run countdown + night directly in background
-  if (game.seen.length >= game.players.length) {
-    try {
-      const checkMsg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
-      const title: string = checkMsg.embeds?.[0]?.title ?? "";
-      if (title.includes("Découvrez vos rôles")) {
-        ctx.waitUntil(runCountdownAndNight(token, game, ctx, env));
-      }
-    } catch {}
+    })());
   }
 
   // Build description lines
