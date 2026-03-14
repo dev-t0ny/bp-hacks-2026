@@ -12,39 +12,51 @@ export interface GameState {
   players: string[];
 }
 
+function encodeState(game: GameState): string {
+  const compact = {
+    g: game.gameNumber,
+    c: game.creatorId,
+    n: game.creatorName,
+    gi: game.guildId,
+    ch: game.gameChannelId,
+    m: game.maxPlayers,
+    p: game.players,
+  };
+  return btoa(JSON.stringify(compact));
+}
+
 export function buildGameEmbed(game: GameState) {
   const playerCount = game.players.length;
   const isFull = playerCount >= game.maxPlayers;
+  const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  const descriptionLines = [
+    `Créée par <@${game.creatorId}>`,
+    "",
+    `**Joueurs:** ${playerCount}/${game.maxPlayers}`,
+  ];
+
+  if (playerCount > 0) {
+    descriptionLines.push("");
+    descriptionLines.push(game.players.map((id) => `> <@${id}>`).join("\n"));
+  }
+
+  descriptionLines.push("");
+  descriptionLines.push(
+    isFull ? "**La partie est pleine!**" : "Cliquez sur le bouton ci-dessous pour rejoindre!"
+  );
 
   return {
     embeds: [
       {
         title: `🐺 Partie de Loup-Garou #${game.gameNumber}`,
-        description: [
-          `Créée par **${game.creatorName}**`,
-          "",
-          `**Joueurs:** ${playerCount}/${game.maxPlayers}`,
-          "",
-          isFull
-            ? "**La partie est pleine!**"
-            : "Cliquez sur le bouton pour rejoindre!",
-        ].join("\n"),
+        url: stateUrl,
+        description: descriptionLines.join("\n"),
         color: EMBED_COLOR,
         image: { url: WEREWOLF_IMAGE },
         footer: {
-          text: isFull
-            ? "La partie va commencer!"
-            : `Minimum ${MIN_PLAYERS} joueurs pour lancer`,
+          text: isFull ? "La partie va commencer!" : `Minimum ${MIN_PLAYERS} joueurs pour lancer`,
         },
-        fields: [
-          { name: "__gameNumber", value: String(game.gameNumber), inline: true },
-          { name: "__creatorId", value: game.creatorId, inline: true },
-          { name: "__creatorName", value: game.creatorName, inline: true },
-          { name: "__guildId", value: game.guildId, inline: true },
-          { name: "__gameChannelId", value: game.gameChannelId, inline: true },
-          { name: "__maxPlayers", value: String(game.maxPlayers), inline: true },
-          { name: "__players", value: game.players.join(",") || "none", inline: false },
-        ],
       },
     ],
     components: isFull
@@ -67,31 +79,21 @@ export function buildGameEmbed(game: GameState) {
 
 export function parseGameFromEmbed(message: any): GameState | null {
   const embed = message.embeds?.[0];
-  if (!embed?.fields) return null;
-
-  const field = (name: string): string | undefined =>
-    embed.fields.find((f: any) => f.name === name)?.value;
-
-  const gameNumber = Number(field("__gameNumber"));
-  const creatorId = field("__creatorId");
-  const creatorName = field("__creatorName");
-  const guildId = field("__guildId");
-  const gameChannelId = field("__gameChannelId");
-  const maxPlayers = Number(field("__maxPlayers"));
-  const playersRaw = field("__players");
-
-  if (!creatorId || !guildId || !gameChannelId || !creatorName) return null;
-
-  const players =
-    playersRaw && playersRaw !== "none" ? playersRaw.split(",") : [];
-
-  return {
-    gameNumber,
-    creatorId,
-    creatorName,
-    guildId,
-    gameChannelId,
-    maxPlayers,
-    players,
-  };
+  if (!embed?.url) return null;
+  try {
+    const b64 = embed.url.split("/s/")[1];
+    if (!b64) return null;
+    const compact = JSON.parse(atob(b64));
+    return {
+      gameNumber: compact.g,
+      creatorId: compact.c,
+      creatorName: compact.n,
+      guildId: compact.gi,
+      gameChannelId: compact.ch,
+      maxPlayers: compact.m,
+      players: compact.p ?? [],
+    };
+  } catch {
+    return null;
+  }
 }
