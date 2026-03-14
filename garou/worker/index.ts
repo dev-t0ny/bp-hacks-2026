@@ -730,81 +730,92 @@ async function startGame(token: string, game: GameState) {
 
 // ── Countdown when game is full ──────────────────────────────────────
 
+function isGameStarted(title: string): boolean {
+  return title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin");
+}
+
 async function runCountdown(token: string, game: GameState) {
   if (!game.lobbyMessageId) return;
+  const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
-  for (let remaining = COUNTDOWN_SECONDS; remaining > 0; remaining -= 5) {
-    // Re-fetch embed to check if game was already started or state changed
+  for (let remaining = COUNTDOWN_SECONDS; remaining >= 0; remaining--) {
+    // Check current state every tick
     try {
       const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
       const title: string = msg.embeds?.[0]?.title ?? "";
-      // If game already started (skip button was pressed), stop countdown
-      if (title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin")) return;
-      // If game is no longer full (someone quit), stop countdown
+      if (isGameStarted(title)) return;
       const currentGame = parseGameFromEmbed(msg);
       if (!currentGame || currentGame.players.length < currentGame.maxPlayers) return;
     } catch {
       return;
     }
 
-    const bar = "▓".repeat(Math.ceil((remaining / COUNTDOWN_SECONDS) * 10)) +
-                "░".repeat(10 - Math.ceil((remaining / COUNTDOWN_SECONDS) * 10));
-    const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+    if (remaining === 0) break; // Don't edit at 0, go straight to startGame
 
-    await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
-      embeds: [
-        {
-          title: `⏳ La partie commence dans ${remaining}s...`,
-          url: stateUrl,
-          description: [
-            "",
-            `\`${bar}\` **${remaining}s**`,
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-            ...game.players.map((id) => {
-              const icon = id === game.creatorId ? "👑" : "🐺";
-              return `${icon} <@${id}>`;
-            }),
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-            `🟢 **${game.players.length}/${game.maxPlayers}** — Tous les joueurs sont prêts!`,
-          ].join("\n"),
-          color: EMBED_COLOR_ORANGE,
-          thumbnail: { url: WEREWOLF_IMAGE },
-          footer: { text: `Le créateur peut lancer immédiatement` },
-        },
-      ],
-      components: [
-        {
-          type: 1,
-          components: [
+    // Edit embed every 5 seconds OR on the last 5 seconds (every second)
+    if (remaining <= 5 || remaining % 5 === 0) {
+      const filled = Math.round((remaining / COUNTDOWN_SECONDS) * 20);
+      const bar = "▓".repeat(filled) + "░".repeat(20 - filled);
+
+      try {
+        await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+          embeds: [
             {
-              type: 2,
-              style: 3,
-              label: "⏩ Commencer maintenant",
-              custom_id: `skip_countdown_${game.gameNumber}`,
-            },
-            {
-              type: 2,
-              style: 4,
-              label: "🚪 Quitter la partie",
-              custom_id: `quit_game_${game.gameNumber}`,
+              title: `⏳ La partie commence dans ${remaining}s...`,
+              url: stateUrl,
+              description: [
+                "",
+                `\`${bar}\` **${remaining}s**`,
+                "",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "",
+                ...game.players.map((id) => {
+                  const icon = id === game.creatorId ? "👑" : "🐺";
+                  return `${icon} <@${id}>`;
+                }),
+                "",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "",
+                `🟢 **${game.players.length}/${game.maxPlayers}** — Tous les joueurs sont prêts!`,
+              ].join("\n"),
+              color: EMBED_COLOR_ORANGE,
+              thumbnail: { url: WEREWOLF_IMAGE },
+              footer: { text: `👑 Le créateur peut lancer immédiatement` },
             },
           ],
-        },
-      ],
-    });
+          components: [
+            {
+              type: 1,
+              components: [
+                {
+                  type: 2,
+                  style: 3,
+                  label: `⏩ Commencer maintenant`,
+                  custom_id: `skip_countdown_${game.gameNumber}`,
+                },
+                {
+                  type: 2,
+                  style: 4,
+                  label: "🚪 Quitter la partie",
+                  custom_id: `quit_game_${game.gameNumber}`,
+                },
+              ],
+            },
+          ],
+        });
+      } catch (err) {
+        console.error("Countdown edit failed:", err);
+      }
+    }
 
-    await sleep(5000);
+    await sleep(1000);
   }
 
-  // Final check before auto-starting
+  // Auto-start: final safety check
   try {
     const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
     const title: string = msg.embeds?.[0]?.title ?? "";
-    if (title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin")) return;
+    if (isGameStarted(title)) return;
     const currentGame = parseGameFromEmbed(msg);
     if (!currentGame || currentGame.players.length < MIN_PLAYERS) return;
     await startGame(token, currentGame);
