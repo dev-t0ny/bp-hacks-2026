@@ -889,6 +889,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
       }
 
       await markPlayerActive(env.ACTIVE_PLAYERS, userId, gameNumber, gameChannel.id);
+      await env.ACTIVE_PLAYERS.put(`gp:${gameNumber}:${userId}`, "1", { expirationTtl: PLAYER_TTL });
 
       const gameState: GameState = {
         gameNumber,
@@ -984,83 +985,119 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
-  const token = env.DISCORD_BOT_TOKEN;
-
-  // Parse initial state from the interaction message (may be stale if another join is in-flight)
   const initialGame = parseGameFromEmbed(interaction.message);
   if (!initialGame) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
 
-  // Re-read the latest state from the LOBBY embed to avoid race conditions.
-  // Then MERGE player lists from both sources — the interaction message (announce embed)
-  // may have a newer list than the lobby if the lobby edit hasn't propagated yet, or vice versa.
-  let game = initialGame;
-  if (initialGame.lobbyMessageId) {
+  // ACK immediately (deferred ephemeral) — prevents "interaction failed" on slow API calls
+  const appId = interaction.application_id;
+  const interactionToken = interaction.token;
+  const deferredResponse = json({ type: 5, data: { flags: 64 } });
+
+  const work = (async () => {
+    const token = env.DISCORD_BOT_TOKEN;
+    const kv = env.ACTIVE_PLAYERS;
+    const gn = initialGame.gameNumber;
+
     try {
-      const latestMsg: any = await getMessage(token, initialGame.gameChannelId, initialGame.lobbyMessageId);
-      const latestGame = parseGameFromEmbed(latestMsg);
-      if (latestGame) {
-        // Merge: keep every player that appears in EITHER source
-        const mergedPlayers = [...new Set([...initialGame.players, ...latestGame.players])];
-        game = latestGame;
-        game.players = mergedPlayers;
+      // ── Step 1: Atomic KV write (no race condition — each player writes their own key) ──
+      const playerKey = `gp:${gn}:${userId}`;
+      const alreadyIn = await kv.get(playerKey);
+      if (alreadyIn) {
+        await editOriginalInteractionResponse(appId, interactionToken, {
+          content: "❌ Tu es déjà dans cette partie!",
+        });
+        return;
       }
-    } catch {}
-  }
 
-  if (game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu es déjà dans cette partie!", flags: 64 } });
-  if (game.players.length >= game.maxPlayers) return json({ type: 4, data: { content: "❌ La partie est pleine!", flags: 64 } });
+      // Check if in another game
+      const activeGame = await getActiveGame(kv, token, userId);
+      if (activeGame !== null) {
+        await editOriginalInteractionResponse(appId, interactionToken, {
+          content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en rejoindre une autre.`,
+        });
+        return;
+      }
 
-  // Check if player is already in another game
-  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
-  if (activeGame !== null) {
-    return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en rejoindre une autre.`, flags: 64 } });
-  }
+      // Write this player's key atomically
+      await kv.put(playerKey, "1", { expirationTtl: PLAYER_TTL });
 
-  game.players.push(userId);
+      // ── Step 2: Rebuild player list from KV (source of truth) ──
+      const kvList = await kv.list({ prefix: `gp:${gn}:` });
+      const kvPlayers = kvList.keys.map((k) => k.name.replace(`gp:${gn}:`, ""));
 
-  await markPlayerActive(env.ACTIVE_PLAYERS, userId, game.gameNumber, game.gameChannelId);
+      // ── Step 3: Re-fetch lobby for game metadata ──
+      let game = initialGame;
+      if (initialGame.lobbyMessageId) {
+        try {
+          const latestMsg: any = await getMessage(token, initialGame.gameChannelId, initialGame.lobbyMessageId);
+          const latestGame = parseGameFromEmbed(latestMsg);
+          if (latestGame) game = latestGame;
+        } catch {}
+      }
 
-  await setChannelPermission(token, game.gameChannelId, userId, {
-    allow: String(1 << 10),
-    deny: String(1 << 11),
-    type: 1,
-  });
+      // Replace player list with KV truth (merge with embed in case KV list is stale)
+      game.players = [...new Set([...kvPlayers, ...game.players])];
 
-  // Grant access to voice channel (VIEW_CHANNEL + CONNECT)
-  if (game.voiceChannelId) {
-    try {
-      await setChannelPermission(token, game.voiceChannelId, userId, {
-        allow: ((1n << 10n) | (1n << 20n)).toString(),
+      if (game.players.length > game.maxPlayers) {
+        // Too many players — undo
+        await kv.delete(playerKey);
+        await editOriginalInteractionResponse(appId, interactionToken, {
+          content: "❌ La partie est pleine!",
+        });
+        return;
+      }
+
+      // ── Step 4: Permissions + embeds ──
+      await markPlayerActive(kv, userId, gn, game.gameChannelId);
+
+      await setChannelPermission(token, game.gameChannelId, userId, {
+        allow: String(1 << 10),
+        deny: String(1 << 11),
         type: 1,
       });
-    } catch {}
-  }
 
-  const member: any = await getGuildMember(token, game.guildId, userId);
-  const playerName = member.nick || member.user.global_name || member.user.username;
+      if (game.voiceChannelId) {
+        try {
+          await setChannelPermission(token, game.voiceChannelId, userId, {
+            allow: ((1n << 10n) | (1n << 20n)).toString(),
+            type: 1,
+          });
+        } catch {}
+      }
 
-  await updateAllEmbeds(token, game, `${playerName} a rejoint la partie`);
+      const member: any = await getGuildMember(token, game.guildId, userId);
+      const playerName = member.nick || member.user.global_name || member.user.username;
 
-  // Game is full → start countdown
-  if (game.players.length >= game.maxPlayers) {
-    ctx.waitUntil(runCountdown(token, game, ctx, env));
-  }
+      await updateAllEmbeds(token, game, `${playerName} a rejoint la partie`);
 
-  return json({
-    type: 4,
-    data: {
-      content: `✅ Tu as rejoint la Partie #${game.gameNumber}!`,
-      flags: 64,
-      components: [
-        {
-          type: 1,
-          components: [
-            { type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` },
-          ],
-        },
-      ],
-    },
-  });
+      // Game is full → start countdown
+      if (game.players.length >= game.maxPlayers) {
+        ctx.waitUntil(runCountdown(token, game, ctx, env));
+      }
+
+      await editOriginalInteractionResponse(appId, interactionToken, {
+        content: `✅ Tu as rejoint la Partie #${game.gameNumber}!`,
+        components: [
+          {
+            type: 1,
+            components: [
+              { type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` },
+            ],
+          },
+        ],
+      });
+    } catch (err) {
+      console.error("handleJoin background error:", err);
+      try {
+        await editOriginalInteractionResponse(appId, interactionToken, {
+          content: "❌ Une erreur est survenue en rejoignant la partie.",
+        });
+      } catch {}
+    }
+  })();
+
+  ctx.waitUntil(work);
+  return deferredResponse;
 }
 
 // ── Quit ────────────────────────────────────────────────────────────
@@ -1088,8 +1125,9 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
 
   game.players = game.players.filter((id) => id !== userId);
 
-  // Clear player from active games
+  // Clear player from active games + KV game player key
   await clearPlayerActive(env.ACTIVE_PLAYERS, userId);
+  try { await env.ACTIVE_PLAYERS.delete(`gp:${game.gameNumber}:${userId}`); } catch {}
 
   try { await deleteChannelPermission(token, game.gameChannelId, userId); } catch {}
   if (game.voiceChannelId) {
