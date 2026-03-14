@@ -25,6 +25,8 @@ interface Env {
   DISCORD_BOT_TOKEN: string;
   ACTIVE_PLAYERS: KVNamespace;
   PRESETS_KV?: KVNamespace;
+  VOICE_SERVICE_URL?: string;
+  VOICE_SERVICE_TOKEN?: string;
 }
 
 const PLAYER_TTL = 86400;
@@ -255,6 +257,18 @@ const ROLES: Record<string, Role> = {
     team: "village",
     description: "Au début de la partie, liez deux joueurs par l'amour. Si l'un meurt, l'autre aussi.",
   },
+  petite_fille: {
+    name: "Petite Fille",
+    emoji: "👧",
+    team: "village",
+    description: "Vous espionnez les loups-garous chaque nuit. Vous voyez leurs messages, mais ils ne savent pas que vous êtes là.",
+  },
+  chasseur: {
+    name: "Chasseur",
+    emoji: "🏹",
+    team: "village",
+    description: "Quand vous mourez, vous emportez quelqu'un avec vous. Choisissez bien votre dernière cible.",
+  },
   villageois: {
     name: "Villageois",
     emoji: "🧑‍🌾",
@@ -291,6 +305,11 @@ interface GameState {
   wolfChannelId?: string;
   roles?: Record<string, string>; // playerId → roleKey (set after game starts)
   seen?: string[]; // player IDs who have viewed their role
+  couple?: [string, string]; // cupidon's coupled player IDs
+  petiteFilleThreadId?: string; // permanent spy thread for petite fille
+  nightCount?: number; // how many nights have passed (cupidon acts night 1 only)
+  dead?: string[]; // dead player IDs
+  voiceChannelId?: string; // voice channel for sound effects
 }
 
 function encodeState(game: GameState): string {
@@ -309,6 +328,11 @@ function encodeState(game: GameState): string {
   };
   if (game.roles) compact.r = game.roles;
   if (game.seen?.length) compact.s = game.seen;
+  if (game.couple) compact.cp = game.couple;
+  if (game.petiteFilleThreadId) compact.pf = game.petiteFilleThreadId;
+  if (game.nightCount) compact.nc = game.nightCount;
+  if (game.dead?.length) compact.d = game.dead;
+  if (game.voiceChannelId) compact.vc = game.voiceChannelId;
   return btoa(JSON.stringify(compact));
 }
 
@@ -331,6 +355,11 @@ function decodeState(url: string): GameState | null {
       wolfChannelId: compact.wc,
       roles: compact.r,
       seen: compact.s ?? [],
+      couple: compact.cp,
+      petiteFilleThreadId: compact.pf,
+      nightCount: compact.nc ?? 0,
+      dead: compact.d ?? [],
+      voiceChannelId: compact.vc,
     };
   } catch {
     return null;
@@ -1043,9 +1072,54 @@ function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, game: Game
   );
 }
 
+// ── Voice Service ────────────────────────────────────────────────────
+
+const VOICE_SERVICE_TIMEOUT_MS = 10_000;
+
+async function triggerStartSound(env: Env, game: GameState): Promise<void> {
+  if (!env.VOICE_SERVICE_URL || !game.voiceChannelId) {
+    if (!env.VOICE_SERVICE_URL) console.log("[garou] Voice service skipped: VOICE_SERVICE_URL not set");
+    else console.log("[garou] Voice service skipped: no voiceChannelId");
+    return;
+  }
+  const endpoint = `${env.VOICE_SERVICE_URL.replace(/\/+$/, "")}/play-start-sfx`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (env.VOICE_SERVICE_TOKEN) headers.Authorization = `Bearer ${env.VOICE_SERVICE_TOKEN}`;
+  console.log(`[garou] Triggering start sound: guildId=${game.guildId} voiceChannelId=${game.voiceChannelId}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), VOICE_SERVICE_TIMEOUT_MS);
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ guildId: game.guildId, voiceChannelId: game.voiceChannelId }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[garou] Voice service error ${res.status}: ${body}`);
+    } else {
+      const data: any = await res.json();
+      if (data.skipped) console.log("[garou] Voice service skipped playback (e.g. no one in voice channel)");
+      else console.log("[garou] Start sound played successfully");
+    }
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err?.name === "AbortError") {
+      console.error("[garou] Voice service timeout");
+    } else {
+      console.error("[garou] Voice service fetch error:", err);
+    }
+  }
+}
+
 async function startGame(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.lobbyMessageId) return;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  // Play sound effect in voice channel (non-blocking)
+  triggerStartSound(env, game).catch(() => {});
 
   // ── Phase 1: Night falls ──
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
@@ -1303,16 +1377,25 @@ interface VoteState {
   targets: { id: string; name: string }[];
   votes: Record<string, string>; // wolfId → targetId
   deadline: number; // Unix timestamp in seconds
+  petiteFilleThreadId?: string;
+  couple?: [string, string];
+  allRoles?: Record<string, string>; // all player roles (for chasseur check)
+  allPlayers?: string[]; // all living players
 }
 
 function encodeVoteState(vote: VoteState): string {
-  return btoa(JSON.stringify({
+  const o: Record<string, unknown> = {
     g: vote.gameNumber, gi: vote.guildId, gc: vote.gameChannelId,
     wc: vote.wolfChannelId, lm: vote.lobbyMessageId,
     w: vote.wolves,
     t: vote.targets.map((t) => [t.id, t.name]),
     v: vote.votes, dl: vote.deadline,
-  }));
+  };
+  if (vote.petiteFilleThreadId) o.pf = vote.petiteFilleThreadId;
+  if (vote.couple) o.cp = vote.couple;
+  if (vote.allRoles) o.ar = vote.allRoles;
+  if (vote.allPlayers) o.ap = vote.allPlayers;
+  return btoa(JSON.stringify(o));
 }
 
 function decodeVoteState(url: string): VoteState | null {
@@ -1326,6 +1409,10 @@ function decodeVoteState(url: string): VoteState | null {
       wolves: c.w,
       targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
       votes: c.v ?? {}, deadline: c.dl,
+      petiteFilleThreadId: c.pf,
+      couple: c.cp,
+      allRoles: c.ar,
+      allPlayers: c.ap,
     };
   } catch { return null; }
 }
