@@ -992,8 +992,6 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
   if (!initialGame) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
 
   // Re-read the latest state from the LOBBY embed to avoid race conditions.
-  // Without this, two players clicking "Rejoindre" at the same time both read
-  // the old state from interaction.message and the second join overwrites the first.
   let game = initialGame;
   if (initialGame.lobbyMessageId) {
     try {
@@ -1081,6 +1079,7 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   }
 
   if (!game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu n'es pas dans cette partie.", flags: 64 } });
+
   game.players = game.players.filter((id) => id !== userId);
 
   // Clear player from active games
