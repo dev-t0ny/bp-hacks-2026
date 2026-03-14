@@ -1,9 +1,30 @@
 import nacl from "tweetnacl";
+import {
+  ALL_ROLES,
+  VILLAGEOIS_GROUP_1,
+  VILLAGEOIS_GROUP_2,
+  LOUPS_ROLES,
+  SOLITAIRE_ROLES,
+  DEFAULT_PRESETS,
+  rolesToBitmask,
+  bitmaskToRoles,
+  type PresetConfig,
+} from "./roles";
+import {
+  type ConfigState,
+  encodeConfigState,
+  decodeConfigState,
+  buildStep1Embed,
+  buildStep2Embed,
+  findPreset,
+  updateRolesForGroup,
+} from "./config-embed";
 
 interface Env {
   DISCORD_PUBLIC_KEY: string;
   DISCORD_BOT_TOKEN: string;
   ACTIVE_PLAYERS: KVNamespace;
+  PRESETS_KV?: KVNamespace;
 }
 
 const PLAYER_TTL = 86400;
@@ -535,36 +556,240 @@ async function updateAllEmbeds(token: string, game: GameState, lastEvent?: strin
   await Promise.all(promises);
 }
 
-// ── /loupgarou ──────────────────────────────────────────────────────
+// ── Custom Presets (KV) ──────────────────────────────────────────────
 
-async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function loadCustomPresets(env: Env, guildId: string): Promise<PresetConfig[]> {
+  if (!env.PRESETS_KV) return [];
+  try {
+    const val = await env.PRESETS_KV.get(`presets:${guildId}`);
+    if (!val) return [];
+    return JSON.parse(val) as PresetConfig[];
+  } catch {
+    return [];
+  }
+}
+
+async function saveCustomPreset(env: Env, guildId: string, preset: PresetConfig): Promise<void> {
+  if (!env.PRESETS_KV) return;
+  const existing = await loadCustomPresets(env, guildId);
+  const idx = existing.findIndex((p) => p.name === preset.name);
+  if (idx >= 0) existing[idx] = preset;
+  else existing.push(preset);
+  await env.PRESETS_KV.put(`presets:${guildId}`, JSON.stringify(existing.slice(0, 20)));
+}
+
+// ── Config Helpers ───────────────────────────────────────────────────
+
+function getConfigFromInteraction(interaction: any): ConfigState | null {
+  const embed = interaction.message?.embeds?.[0];
+  if (!embed?.url) return null;
+  return decodeConfigState(embed.url);
+}
+
+// ── Config Select Menu Handler ───────────────────────────────────────
+
+async function handleConfigSelect(interaction: any, env: Env): Promise<Response> {
+  const config = getConfigFromInteraction(interaction);
+  if (!config) return json({ type: 4, data: { content: "❌ Erreur: configuration introuvable.", flags: 64 } });
+
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (userId !== config.creatorId) {
+    return json({ type: 4, data: { content: "❌ Seul le créateur peut modifier la configuration.", flags: 64 } });
+  }
+
+  const customId: string = interaction.data?.custom_id || "";
+  const values: string[] = interaction.data?.values || [];
+
+  if (customId === "cfg_preset") {
+    const presetName = values[0] || "none";
+    if (presetName === "none") {
+      config.presetName = "";
+    } else {
+      const customPresets = await loadCustomPresets(env, config.guildId);
+      const preset = findPreset(presetName, customPresets);
+      if (preset) {
+        config.presetName = preset.name;
+        config.selectedRoles = [...preset.roles];
+        config.anonymousVotes = preset.anonymousVotes;
+        config.discussionTime = preset.discussionTime;
+        config.voteTime = preset.voteTime;
+      }
+    }
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
+
+  if (customId === "cfg_votes") {
+    config.anonymousVotes = values[0] === "anonyme";
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
+
+  if (customId === "cfg_disc_time") {
+    config.discussionTime = parseInt(values[0] || "120", 10);
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
+
+  if (customId === "cfg_vote_time") {
+    config.voteTime = parseInt(values[0] || "60", 10);
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
+
+  // Role selection menus (step 2)
+  const selectedIds = values.map((v) => parseInt(v, 10));
+
+  if (customId === "cfg_roles_v1") {
+    const groupIds = VILLAGEOIS_GROUP_1.map((r) => r.id);
+    config.selectedRoles = updateRolesForGroup(config.selectedRoles, groupIds, selectedIds);
+    return json({ type: 7, data: buildStep2Embed(config) });
+  }
+  if (customId === "cfg_roles_v2") {
+    const groupIds = VILLAGEOIS_GROUP_2.map((r) => r.id);
+    config.selectedRoles = updateRolesForGroup(config.selectedRoles, groupIds, selectedIds);
+    return json({ type: 7, data: buildStep2Embed(config) });
+  }
+  if (customId === "cfg_roles_loups") {
+    const groupIds = LOUPS_ROLES.map((r) => r.id);
+    config.selectedRoles = updateRolesForGroup(config.selectedRoles, groupIds, selectedIds);
+    return json({ type: 7, data: buildStep2Embed(config) });
+  }
+  if (customId === "cfg_roles_solo") {
+    const groupIds = SOLITAIRE_ROLES.map((r) => r.id);
+    config.selectedRoles = updateRolesForGroup(config.selectedRoles, groupIds, selectedIds);
+    return json({ type: 7, data: buildStep2Embed(config) });
+  }
+
+  return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
+}
+
+// ── Config Button Handler ────────────────────────────────────────────
+
+async function handleConfigButton(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const config = getConfigFromInteraction(interaction);
+  if (!config) return json({ type: 4, data: { content: "❌ Erreur: configuration introuvable.", flags: 64 } });
+
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (userId !== config.creatorId) {
+    return json({ type: 4, data: { content: "❌ Seul le créateur peut modifier la configuration.", flags: 64 } });
+  }
+
+  const customId: string = interaction.data?.custom_id || "";
+
+  if (customId === "cfg_next") {
+    return json({ type: 7, data: buildStep2Embed(config) });
+  }
+
+  if (customId === "cfg_back") {
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
+
+  if (customId === "cfg_create") {
+    if (config.selectedRoles.length === 0) {
+      return json({ type: 4, data: { content: "❌ Sélectionne au moins un rôle avant de créer la partie.", flags: 64 } });
+    }
+    return handleCreateGame(interaction, config, env, ctx);
+  }
+
+  if (customId === "cfg_save") {
+    // Show modal for preset name
+    return json({
+      type: 9,
+      data: {
+        custom_id: "cfg_save_modal",
+        title: "Sauvegarder le preset",
+        components: [
+          {
+            type: 1,
+            components: [
+              {
+                type: 4,
+                custom_id: "preset_name",
+                label: "Nom du preset",
+                style: 1,
+                min_length: 1,
+                max_length: 50,
+                placeholder: "Mon preset personnalisé",
+                required: true,
+              },
+            ],
+          },
+        ],
+      },
+    });
+  }
+
+  return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
+}
+
+// ── Modal Submit Handler ─────────────────────────────────────────────
+
+async function handleModalSubmit(interaction: any, env: Env): Promise<Response> {
+  const customId: string = interaction.data?.custom_id || "";
+
+  if (customId === "cfg_save_modal") {
+    // Extract preset name from modal
+    const presetName = interaction.data?.components?.[0]?.components?.[0]?.value?.trim();
+    if (!presetName) {
+      return json({ type: 4, data: { content: "❌ Nom de preset invalide.", flags: 64 } });
+    }
+
+    // Get config from the message the modal was triggered from
+    const config = getConfigFromInteraction(interaction);
+    if (!config) {
+      return json({ type: 4, data: { content: "❌ Erreur: configuration introuvable.", flags: 64 } });
+    }
+
+    if (!env.PRESETS_KV) {
+      return json({ type: 4, data: { content: "⚠️ Les presets personnalisés ne sont pas activés sur ce serveur.", flags: 64 } });
+    }
+
+    const preset: PresetConfig = {
+      name: presetName,
+      roles: config.selectedRoles,
+      anonymousVotes: config.anonymousVotes,
+      discussionTime: config.discussionTime,
+      voteTime: config.voteTime,
+    };
+
+    await saveCustomPreset(env, config.guildId, preset);
+
+    config.presetName = presetName;
+    const customPresets = await loadCustomPresets(env, config.guildId);
+
+    // Return updated step 2 embed
+    return json({ type: 7, data: buildStep2Embed(config) });
+  }
+
+  return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
+}
+
+// ── Create Game from Config ──────────────────────────────────────────
+
+async function handleCreateGame(interaction: any, config: ConfigState, env: Env, ctx: ExecutionContext): Promise<Response> {
   const token = env.DISCORD_BOT_TOKEN;
   const appId = interaction.application_id;
   const interactionToken = interaction.token;
-  const guildId = interaction.guild_id;
-  const channelId = interaction.channel_id;
-  const userId = interaction.member?.user?.id;
+  const userId = config.creatorId;
+  const guildId = config.guildId;
+  const channelId = config.channelId;
+  const maxPlayers = config.selectedRoles.length;
 
-  if (!guildId || !channelId || !userId) {
-    return json({ type: 4, data: { content: "❌ Cette commande ne fonctionne que dans un serveur Discord.", flags: 64 } });
-  }
-
-  const maxPlayers = interaction.data?.options?.find((o: any) => o.name === "joueurs")?.value;
-  if (!maxPlayers || maxPlayers < MIN_PLAYERS || maxPlayers > MAX_PLAYERS) {
-    return json({ type: 4, data: { content: `❌ Le nombre de joueurs doit être entre ${MIN_PLAYERS} et ${MAX_PLAYERS}.`, flags: 64 } });
-  }
-
-  // Check if creator is already in a game
-  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
-  if (activeGame !== null) {
-    return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en créer une nouvelle.`, flags: 64 } });
-  }
-
-  const deferredResponse = json({ type: 5 });
+  // ACK with deferred update (remove the config embed)
+  const deferredResponse = json({ type: 5, data: { flags: 64 } });
 
   const backgroundWork = (async () => {
     try {
-      // Mark creator as active (channel ID set below after creation)
+      // Check if creator is already in a game
+      const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
+      if (activeGame !== null) {
+        await editOriginalInteractionResponse(appId, interactionToken, {
+          content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en créer une nouvelle.`,
+        });
+        return;
+      }
 
       const member: any = await getGuildMember(token, guildId, userId);
       const creatorName = member.nick || member.user.global_name || member.user.username;
@@ -583,7 +808,6 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
         ],
       });
 
-      // Mark creator as active with game channel
       await markPlayerActive(env.ACTIVE_PLAYERS, userId, gameNumber, gameChannel.id);
 
       const gameState: GameState = {
@@ -601,23 +825,28 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
       const lobbyMsg: any = await sendMessage(token, gameChannel.id, buildLobbyEmbed(gameState));
       gameState.lobbyMessageId = lobbyMsg.id;
 
-      // Edit deferred response with announce embed
-      await editOriginalInteractionResponse(appId, interactionToken, buildAnnounceEmbed(gameState));
+      // Send announce embed in the original channel (public)
+      const announceMsg: any = await sendMessage(token, channelId, buildAnnounceEmbed(gameState));
+      gameState.announceMessageId = announceMsg.id;
 
-      // Get announce message ID
-      const origRes = await fetch(
-        `${DISCORD_API}/webhooks/${appId}/${interactionToken}/messages/@original`,
-        { headers: { "Content-Type": "application/json" } }
-      );
-      if (origRes.ok) {
-        const origMsg: any = await origRes.json();
-        gameState.announceMessageId = origMsg.id;
-      }
+      // Update ephemeral message to confirm
+      await editOriginalInteractionResponse(appId, interactionToken, {
+        content: `✅ Partie #${gameNumber} créée! (${maxPlayers} joueurs)`,
+        embeds: [],
+        components: [
+          {
+            type: 1,
+            components: [
+              { type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${guildId}/${gameChannel.id}` },
+            ],
+          },
+        ],
+      });
 
       // Re-edit both with complete state (now includes all message IDs)
       await updateAllEmbeds(token, gameState);
     } catch (err) {
-      console.error("Error in /loupgarou handler:", err);
+      console.error("Error in handleCreateGame:", err);
       try {
         await editOriginalInteractionResponse(appId, interactionToken, {
           content: "❌ Une erreur est survenue lors de la création de la partie.",
@@ -628,6 +857,44 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
 
   ctx.waitUntil(backgroundWork);
   return deferredResponse;
+}
+
+// ── /loupgarou ──────────────────────────────────────────────────────
+
+async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const guildId = interaction.guild_id;
+  const channelId = interaction.channel_id;
+  const userId = interaction.member?.user?.id;
+
+  if (!guildId || !channelId || !userId) {
+    return json({ type: 4, data: { content: "❌ Cette commande ne fonctionne que dans un serveur Discord.", flags: 64 } });
+  }
+
+  // Check if creator is already in a game
+  const token = env.DISCORD_BOT_TOKEN;
+  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
+  if (activeGame !== null) {
+    return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en créer une nouvelle.`, flags: 64 } });
+  }
+
+  // Build initial config state with default preset
+  const defaultPreset = DEFAULT_PRESETS[0]!;
+  const config: ConfigState = {
+    step: 1,
+    creatorId: userId,
+    guildId,
+    channelId,
+    presetName: defaultPreset.name,
+    anonymousVotes: defaultPreset.anonymousVotes,
+    discussionTime: defaultPreset.discussionTime,
+    voteTime: defaultPreset.voteTime,
+    selectedRoles: [...defaultPreset.roles],
+  };
+
+  const customPresets = await loadCustomPresets(env, guildId);
+
+  // Return ephemeral config embed
+  return json({ type: 4, data: { ...buildStep1Embed(config, customPresets), flags: 64 } });
 }
 
 // ── Join ────────────────────────────────────────────────────────────
@@ -1574,6 +1841,13 @@ export default {
     if (interaction.type === 3) {
       const customId: string = interaction.data?.custom_id || "";
 
+      // Config interactions (select menus & buttons)
+      if (customId.startsWith("cfg_")) {
+        const componentType = interaction.data?.component_type;
+        if (componentType === 3) return handleConfigSelect(interaction, env);
+        if (componentType === 2) return handleConfigButton(interaction, env, ctx);
+      }
+
       if (customId.startsWith("join_game_")) return handleJoin(interaction, env, ctx);
 
       if (customId.startsWith("quit_game_")) return handleQuit(interaction, env);
@@ -1586,6 +1860,11 @@ export default {
         const handler = customId.startsWith("skip_countdown_") ? handleSkipCountdown : handleStart;
         return handler(interaction, env, ctx);
       }
+    }
+
+    // Modal submit (type 5)
+    if (interaction.type === 5) {
+      return handleModalSubmit(interaction, env);
     }
 
     console.error("Unknown interaction:", JSON.stringify({ type: interaction.type, customId: interaction.data?.custom_id, component_type: interaction.data?.component_type }));
