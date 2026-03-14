@@ -154,24 +154,27 @@ function decodeState(url: string): GameState | null {
 
 // ── Embed Builders ──────────────────────────────────────────────────
 
+function progressBar(current: number, max: number): string {
+  return "🌕".repeat(current) + "🌑".repeat(max - current);
+}
+
 function buildAnnounceEmbed(game: GameState) {
   const playerCount = game.players.length;
   const isFull = playerCount >= game.maxPlayers;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
-  const descriptionLines = [
-    `Créée par <@${game.creatorId}>`,
+  const lines = [
+    progressBar(playerCount, game.maxPlayers),
+    `**${playerCount}/${game.maxPlayers}** joueurs`,
     "",
-    `**Joueurs:** ${playerCount}/${game.maxPlayers}`,
   ];
 
   if (playerCount > 0) {
-    descriptionLines.push("");
-    descriptionLines.push(game.players.map((id) => `> <@${id}>`).join("\n"));
+    lines.push(game.players.map((id) => `> <@${id}>`).join("\n"));
+    lines.push("");
   }
 
-  descriptionLines.push("");
-  descriptionLines.push(
+  lines.push(
     isFull ? "**La partie est pleine!**" : "Cliquez sur le bouton ci-dessous pour rejoindre!"
   );
 
@@ -180,12 +183,11 @@ function buildAnnounceEmbed(game: GameState) {
       {
         title: `🐺 Partie de Loup-Garou #${game.gameNumber}`,
         url: stateUrl,
-        description: descriptionLines.join("\n"),
-        color: EMBED_COLOR,
+        description: lines.join("\n"),
+        color: isFull ? EMBED_COLOR_GREEN : EMBED_COLOR,
         image: { url: WEREWOLF_IMAGE },
-        footer: {
-          text: isFull ? "La partie est pleine!" : `Minimum ${MIN_PLAYERS} joueurs pour lancer`,
-        },
+        footer: { text: `Créée par ${game.creatorName}` },
+        timestamp: new Date().toISOString(),
       },
     ],
     components: isFull
@@ -206,27 +208,40 @@ function buildAnnounceEmbed(game: GameState) {
   };
 }
 
-function buildLobbyEmbed(game: GameState) {
+function buildLobbyEmbed(game: GameState, lastEvent?: string) {
   const playerCount = game.players.length;
   const isFull = playerCount >= game.maxPlayers;
   const canStart = playerCount >= MIN_PLAYERS;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
-  const playerList =
-    game.players.length > 0
-      ? game.players
-          .map((id, i) => {
-            const prefix = id === game.creatorId ? "👑" : `${i + 1}.`;
-            return `${prefix} <@${id}>`;
-          })
-          .join("\n")
-      : "*Aucun joueur pour l'instant...*";
+  // Player list with empty slots
+  const playerLines = game.players.map((id) => {
+    const icon = id === game.creatorId ? "👑" : "🐺";
+    return `${icon} <@${id}>`;
+  });
+  for (let i = playerCount; i < game.maxPlayers; i++) {
+    playerLines.push("⬜ *En attente...*");
+  }
 
-  const statusLine = isFull
-    ? "🟢 **La partie est pleine!** Prêt à lancer."
+  const statusEmoji = isFull ? "🟢" : canStart ? "🟡" : "🔴";
+  const statusText = isFull
+    ? "La partie est pleine! Prêt à lancer."
     : canStart
-      ? `🟡 **${playerCount}/${game.maxPlayers}** — Prêt à lancer ou en attente de joueurs...`
-      : `🔴 **${playerCount}/${game.maxPlayers}** — En attente de joueurs (min. ${MIN_PLAYERS})`;
+      ? "Prêt à lancer ou en attente de joueurs..."
+      : `En attente de joueurs (min. ${MIN_PLAYERS})`;
+
+  const lines = [
+    progressBar(playerCount, game.maxPlayers),
+    `${statusEmoji} **${playerCount}/${game.maxPlayers}** — ${statusText}`,
+    "",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    ...playerLines,
+  ];
+
+  if (lastEvent) {
+    lines.push("", "━━━━━━━━━━━━━━━━━━━━", "", `📋 *${lastEvent}*`);
+  }
 
   const buttons: any[] = [];
   if (canStart) {
@@ -249,12 +264,11 @@ function buildLobbyEmbed(game: GameState) {
       {
         title: `🐺 Salle d'attente — Partie #${game.gameNumber}`,
         url: stateUrl,
-        description: [statusLine, "", "**Joueurs:**", playerList].join("\n"),
+        description: lines.join("\n"),
         color: canStart ? (isFull ? EMBED_COLOR_GREEN : EMBED_COLOR_ORANGE) : EMBED_COLOR,
         thumbnail: { url: WEREWOLF_IMAGE },
-        footer: {
-          text: `Créée par ${game.creatorName} · ${playerCount}/${game.maxPlayers} joueurs`,
-        },
+        footer: { text: `Créée par ${game.creatorName}` },
+        timestamp: new Date().toISOString(),
       },
     ],
     components: [{ type: 1, components: buttons }],
@@ -311,10 +325,10 @@ async function getNextGameNumber(token: string, guildId: string, categoryId: str
   return gameChannels.length + 1;
 }
 
-async function updateAllEmbeds(token: string, game: GameState) {
+async function updateAllEmbeds(token: string, game: GameState, lastEvent?: string) {
   const promises: Promise<any>[] = [];
   if (game.lobbyMessageId) {
-    promises.push(editMessage(token, game.gameChannelId, game.lobbyMessageId, buildLobbyEmbed(game)));
+    promises.push(editMessage(token, game.gameChannelId, game.lobbyMessageId, buildLobbyEmbed(game, lastEvent)));
   }
   if (game.announceChannelId && game.announceMessageId) {
     promises.push(editMessage(token, game.announceChannelId, game.announceMessageId, buildAnnounceEmbed(game)));
@@ -425,13 +439,10 @@ async function handleJoin(interaction: any, env: Env): Promise<Response> {
     type: 1,
   });
 
-  await updateAllEmbeds(token, game);
-
   const member: any = await getGuildMember(token, game.guildId, userId);
   const playerName = member.nick || member.user.global_name || member.user.username;
-  await sendMessage(token, game.gameChannelId, {
-    content: `**${playerName}** a rejoint la partie! (${game.players.length}/${game.maxPlayers})`,
-  });
+
+  await updateAllEmbeds(token, game, `${playerName} a rejoint la partie`);
 
   return json({
     type: 4,
@@ -478,22 +489,18 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   }
 
   // Creator left → transfer
+  let lastEvent: string;
   if (userId === game.creatorId) {
     const newCreatorId = game.players[Math.floor(Math.random() * game.players.length)]!;
     game.creatorId = newCreatorId;
     const newCreatorMember: any = await getGuildMember(token, game.guildId, newCreatorId);
     game.creatorName = newCreatorMember.nick || newCreatorMember.user.global_name || newCreatorMember.user.username;
-
-    await sendMessage(token, game.gameChannelId, {
-      content: `👑 **${playerName}** a quitté la partie. **${game.creatorName}** est maintenant le créateur!`,
-    });
+    lastEvent = `${playerName} a quitté — ${game.creatorName} est le nouveau créateur`;
   } else {
-    await sendMessage(token, game.gameChannelId, {
-      content: `🚪 **${playerName}** a quitté la partie. (${game.players.length}/${game.maxPlayers})`,
-    });
+    lastEvent = `${playerName} a quitté la partie`;
   }
 
-  await updateAllEmbeds(token, game);
+  await updateAllEmbeds(token, game, lastEvent);
 
   return json({ type: 4, data: { content: `🚪 Tu as quitté la Partie #${game.gameNumber}.`, flags: 64 } });
 }

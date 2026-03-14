@@ -117,6 +117,15 @@ export default new Conversation({
     const categoryId = await findOrCreateCategory(guildId);
     const gameChannelId = await createGameChannel(guildId, categoryId, gameNumber, botUser.id);
 
+    // Creator auto-joins as the first player
+    const players = [creatorDiscordId];
+
+    // Give creator access to the game channel
+    await discord.setChannelPermission(gameChannelId, creatorDiscordId, {
+      type: 1,
+      allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)),
+    });
+
     // Build and send embed with button
     const gameState: GameState = {
       gameNumber,
@@ -125,7 +134,7 @@ export default new Conversation({
       guildId,
       gameChannelId,
       maxPlayers,
-      players: [],
+      players,
     };
     const embedPayload = buildGameEmbed(gameState);
     await discord.sendMessage(channelId, embedPayload);
@@ -139,7 +148,7 @@ export default new Conversation({
             `Créée par **${creatorName}**`,
             `**Joueurs max:** ${maxPlayers}`,
             "",
-            "En attente de joueurs...",
+            `🐺 <@${creatorDiscordId}> a rejoint la partie!`,
           ].join("\n"),
           color: EMBED_COLOR,
         },
