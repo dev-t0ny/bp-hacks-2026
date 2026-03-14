@@ -3,7 +3,7 @@
 // Or: npx tsx worker/register-command.ts
 
 const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const APP_ID = "1482405258746663084";
+const APP_ID = "1482380236522787008";
 
 if (!BOT_TOKEN) {
   console.error("❌ Set DISCORD_BOT_TOKEN environment variable");
