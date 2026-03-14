@@ -861,37 +861,38 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
     });
   }
 
-  // Hand off to role_check phase (polls every 5s, stays under 30s per invocation)
-  triggerPhase(ctx, env, "role_check", game);
+  // Countdown is triggered by handleRevealRole when all players have seen their role.
+  // Schedule a fallback: if not all seen after ROLE_CHECK_TIMEOUT, start countdown anyway.
+  triggerPhase(ctx, env, "role_check_timeout", game);
 }
 
-// ── Phase: role_check — poll until all players seen, then trigger countdown ──
-async function phaseRoleCheck(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  const start = Date.now();
-  const maxDuration = 25000; // stay under 30s
-  while (Date.now() - start < maxDuration) {
-    await sleep(5000);
-    try {
-      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
-      const current = parseGameFromEmbed(msg);
-      if (current?.seen?.length === game.players.length) {
-        triggerPhase(ctx, env, "countdown", game);
-        return;
-      }
-    } catch { break; }
-  }
-  // Not all seen yet and still under ROLE_CHECK_TIMEOUT? Re-invoke self.
-  // Check elapsed time from game state (use embed title to detect if still in role check phase)
+// ── Phase: role_check_timeout — fallback if not all players check roles in time ──
+async function phaseRoleCheckTimeout(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  // Wait 25s, then check. Re-invoke until ROLE_CHECK_TIMEOUT total (~120s = ~5 invocations).
+  await sleep(25000);
   try {
     const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
     const title: string = msg.embeds?.[0]?.title ?? "";
-    if (title.includes("Découvrez vos rôles")) {
-      // Still in role check — re-invoke
-      triggerPhase(ctx, env, "role_check", game);
+    // If no longer in role check phase, countdown was already triggered by handleRevealRole
+    if (!title.includes("Découvrez vos rôles")) return;
+    const current = parseGameFromEmbed(msg);
+    if (current?.seen?.length === game.players.length) {
+      // All seen but countdown wasn't triggered (shouldn't happen, but safety)
+      triggerPhase(ctx, env, "countdown", current);
+      return;
     }
   } catch {
-    // Timeout or error — just start the countdown anyway
     triggerPhase(ctx, env, "countdown", game);
+    return;
+  }
+  // Decrement remaining timeout checks (max ~5 rounds of 25s ≈ 120s)
+  const round = ((game as any)._timeoutRound ?? 0) + 1;
+  if (round >= 5) {
+    // Timeout — force start countdown
+    triggerPhase(ctx, env, "countdown", game);
+  } else {
+    // Re-invoke
+    triggerPhase(ctx, env, "role_check_timeout", { ...game, _timeoutRound: round } as any);
   }
 }
 
@@ -1387,7 +1388,7 @@ async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext)
 
 // ── Reveal Role (ephemeral) ──────────────────────────────────────────
 
-async function handleRevealRole(interaction: any, env: Env): Promise<Response> {
+async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
@@ -1415,12 +1416,17 @@ async function handleRevealRole(interaction: any, env: Env): Promise<Response> {
     } catch {}
   }
   if (!game.seen) game.seen = [];
-  if (!game.seen.includes(userId)) {
+  const alreadySeen = game.seen.includes(userId);
+  if (!alreadySeen) {
     game.seen.push(userId);
     if (game.lobbyMessageId) {
       try {
         await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
       } catch {}
+    }
+    // All players have seen their role → trigger countdown
+    if (game.seen.length === game.players.length) {
+      triggerPhase(ctx, env, "countdown", game);
     }
   }
 
@@ -1522,7 +1528,7 @@ export default {
       const token = env.DISCORD_BOT_TOKEN;
       const work = (async () => {
         try {
-          if (phase === "role_check") await phaseRoleCheck(token, payload.game, ctx, env);
+          if (phase === "role_check_timeout") await phaseRoleCheckTimeout(token, payload.game, ctx, env);
           else if (phase === "countdown") await phaseCountdown(token, payload.game, ctx, env);
           else if (phase === "night_village_sleeps") await phaseVillageSleeps(token, payload.game, ctx, env);
           else if (phase === "night_wolf_vote") await phaseWolfVote(token, payload.game, ctx, env);
@@ -1562,7 +1568,7 @@ export default {
 
       if (customId.startsWith("quit_game_")) return handleQuit(interaction, env);
 
-      if (customId.startsWith("reveal_role_")) return handleRevealRole(interaction, env);
+      if (customId.startsWith("reveal_role_")) return handleRevealRole(interaction, env, ctx);
 
       if (customId.startsWith("vote_kill_")) return handleVoteKill(interaction, env, ctx);
 
