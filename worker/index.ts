@@ -395,6 +395,10 @@ function assignRoles(
 
   if (selectedRoleIds?.length) {
     roleKeys = selectedRoleIds.map(roleIdToKey);
+    // Ensure at least 1 loup
+    if (!roleKeys.some(r => r === "loup" || r === "loup_blanc")) {
+      roleKeys.push("loup");
+    }
     while (roleKeys.length < totalCount) roleKeys.push("villageois");
     while (roleKeys.length > totalCount) {
       const lastVillageois = roleKeys.lastIndexOf("villageois");
@@ -746,10 +750,42 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ── LLM Call (for bot decisions) ────────────────────────────────────
+// ── LLM Call via Botpress ADK (for bot decisions) ───────────────────
 
 async function callLLM(prompt: string, env: Env): Promise<string> {
-  if (!env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
+  // Use Botpress ADK action (zai) for AI generation
+  if (env.BOTPRESS_PAT && env.BOTPRESS_BOT_ID) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const res = await fetch("https://api.botpress.cloud/v1/chat/actions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${env.BOTPRESS_PAT}`,
+          "x-bot-id": env.BOTPRESS_BOT_ID,
+        },
+        body: JSON.stringify({
+          action: "botAiResponse",
+          input: { prompt, structured: false },
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        console.error(`[callLLM] Botpress API ${res.status}: ${await res.text()}`);
+        throw new Error(`Botpress API ${res.status}`);
+      }
+      const data: any = await res.json();
+      return data.output?.text ?? "";
+    } catch (err) {
+      clearTimeout(timeoutId);
+      console.error("[callLLM] Botpress call failed, falling back:", err);
+    }
+  }
+
+  // Fallback: direct Anthropic call
+  if (!env.ANTHROPIC_API_KEY) throw new Error("No AI configured (set BOTPRESS_PAT+BOTPRESS_BOT_ID or ANTHROPIC_API_KEY)");
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10_000);
   try {
