@@ -1,14 +1,14 @@
-import { Action, z, actions } from "@botpress/runtime";
+import { Action, z } from "@botpress/runtime";
 
 const SceneType = z.enum([
-  "night_falls",      // La nuit tombe sur le village
-  "dawn_breaks",      // L'aube se lève — quelqu'un est mort
-  "night_kill",       // Scène de la victime de nuit
-  "day_elimination",  // Le village élimine un suspect
-  "victory_wolves",   // Les loups gagnent
-  "victory_village",  // Le village gagne
-  "snipe_reveal",     // Un bot est démasqué
-  "game_start",       // Début de partie — intro du village
+  "night_falls",
+  "dawn_breaks",
+  "night_kill",
+  "day_elimination",
+  "victory_wolves",
+  "victory_village",
+  "snipe_reveal",
+  "game_start",
 ]);
 
 const STYLE_PREFIX = `Dark pixel art illustration in 32-bit style, wide cinematic banner format. Gothic medieval fantasy atmosphere inspired by Darkest Dungeon and Castlevania. Deep shadows, muted earth tones with blood red and pale moonlight blue accents. Detailed pixel art with visible pixels but rich in atmosphere. No text, no UI elements, no watermarks.`;
@@ -32,6 +32,8 @@ const SCENE_PROMPTS: Record<z.infer<typeof SceneType>, (ctx: string) => string> 
     `A villager's face glitching and dissolving into pixels, revealing they were never real. ${ctx}`,
 };
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
+
 export default new Action({
   name: "generateSceneImage",
   description: "Generates a cinematic banner image for a Werewolf game scene",
@@ -50,13 +52,28 @@ export default new Action({
     const scenePrompt = SCENE_PROMPTS[input.scene](sceneContext);
     const fullPrompt = `${STYLE_PREFIX} ${scenePrompt}`;
 
-    const result = await actions.dalle.generateImage({
-      prompt: fullPrompt,
-      size: "1792x1024",
-      quality: "hd",
-      model: "dall-e-3",
+    const response = await fetch("https://api.openai.com/v1/images/generations", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "dall-e-3",
+        prompt: fullPrompt,
+        size: "1792x1024",
+        quality: "hd",
+        n: 1,
+      }),
     });
 
-    return { imageUrl: result.url };
+    if (!response.ok) {
+      const error = await response.text();
+      console.error("[DALL-E] API error:", response.status, error);
+      throw new Error(`DALL-E API error: ${response.status}`);
+    }
+
+    const data = (await response.json()) as { data: { url: string }[] };
+    return { imageUrl: data.data[0]!.url };
   },
 });
