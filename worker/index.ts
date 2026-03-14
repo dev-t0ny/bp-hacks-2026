@@ -3,6 +3,23 @@ import nacl from "tweetnacl";
 interface Env {
   DISCORD_PUBLIC_KEY: string;
   DISCORD_BOT_TOKEN: string;
+  ACTIVE_PLAYERS: KVNamespace;
+}
+
+const PLAYER_TTL = 86400;
+
+async function markPlayerActive(kv: KVNamespace, userId: string, gameNumber: number) {
+  await kv.put(`player:${userId}`, String(gameNumber), { expirationTtl: PLAYER_TTL });
+}
+async function clearPlayerActive(kv: KVNamespace, userId: string) {
+  await kv.delete(`player:${userId}`);
+}
+async function getActiveGame(kv: KVNamespace, userId: string): Promise<number | null> {
+  const val = await kv.get(`player:${userId}`);
+  return val ? parseInt(val, 10) : null;
+}
+async function clearAllPlayersForGame(kv: KVNamespace, playerIds: string[]) {
+  await Promise.all(playerIds.map((id) => clearPlayerActive(kv, id)));
 }
 
 // ── Discord REST API ────────────────────────────────────────────────
@@ -452,7 +469,7 @@ async function updateAllEmbeds(token: string, game: GameState, lastEvent?: strin
 
 // ── /loupgarou ──────────────────────────────────────────────────────
 
-async function handleSlashCommand(interaction: any, env: Env): Promise<Response> {
+async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const token = env.DISCORD_BOT_TOKEN;
   const appId = interaction.application_id;
   const interactionToken = interaction.token;
@@ -469,10 +486,19 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
     return json({ type: 4, data: { content: `❌ Le nombre de joueurs doit être entre ${MIN_PLAYERS} et ${MAX_PLAYERS}.`, flags: 64 } });
   }
 
+  // Check if creator is already in a game
+  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, userId);
+  if (activeGame !== null) {
+    return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en créer une nouvelle.`, flags: 64 } });
+  }
+
   const deferredResponse = json({ type: 5 });
 
   const backgroundWork = (async () => {
     try {
+      // Mark creator as active
+      await markPlayerActive(env.ACTIVE_PLAYERS, userId, 0); // will update with real game number below
+
       const member: any = await getGuildMember(token, guildId, userId);
       const creatorName = member.nick || member.user.global_name || member.user.username;
       const categoryId = await findOrCreateCategory(token, guildId);
@@ -489,6 +515,9 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
           { id: userId, type: 1, allow: String(1 << 10) },
         ],
       });
+
+      // Update KV with real game number
+      await markPlayerActive(env.ACTIVE_PLAYERS, userId, gameNumber);
 
       const gameState: GameState = {
         gameNumber,
@@ -530,7 +559,7 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
     }
   })();
 
-  (globalThis as any).__backgroundWork = backgroundWork;
+  ctx.waitUntil(backgroundWork);
   return deferredResponse;
 }
 
@@ -545,8 +574,16 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
   if (game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu es déjà dans cette partie!", flags: 64 } });
   if (game.players.length >= game.maxPlayers) return json({ type: 4, data: { content: "❌ La partie est pleine!", flags: 64 } });
 
+  // Check if player is already in another game
+  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, userId);
+  if (activeGame !== null) {
+    return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en rejoindre une autre.`, flags: 64 } });
+  }
+
   const token = env.DISCORD_BOT_TOKEN;
   game.players.push(userId);
+
+  await markPlayerActive(env.ACTIVE_PLAYERS, userId, game.gameNumber);
 
   await setChannelPermission(token, game.gameChannelId, userId, {
     allow: String(1 << 10),
@@ -561,7 +598,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
 
   // Game is full → start countdown
   if (game.players.length >= game.maxPlayers) {
-    ctx.waitUntil(runCountdown(token, game));
+    ctx.waitUntil(runCountdown(token, game, ctx, env));
   }
 
   return json({
@@ -594,6 +631,9 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   const token = env.DISCORD_BOT_TOKEN;
   game.players = game.players.filter((id) => id !== userId);
 
+  // Clear player from active games
+  await clearPlayerActive(env.ACTIVE_PLAYERS, userId);
+
   try { await deleteChannelPermission(token, game.gameChannelId, userId); } catch {}
 
   const member: any = await getGuildMember(token, game.guildId, userId);
@@ -601,6 +641,8 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
 
   // No players left → delete everything
   if (game.players.length === 0) {
+    // Clear all remaining players (safety)
+    await clearAllPlayersForGame(env.ACTIVE_PLAYERS, [userId]);
     try { await deleteChannel(token, game.gameChannelId); } catch {}
     if (game.wolfChannelId) {
       try { await deleteChannel(token, game.wolfChannelId); } catch {}
@@ -634,7 +676,24 @@ const COUNTDOWN_SECONDS = 30;
 const EMBED_COLOR_NIGHT = 0x0d1b2a;
 const EMBED_COLOR_PURPLE = 0x6c3483;
 
-async function startGame(token: string, game: GameState) {
+// ── Self-invoke: call the worker itself to run the next phase ──
+// Each phase stays under 30s to respect Cloudflare free plan waitUntil limits.
+const WORKER_URL = "https://garou-interactions.gabgingras.workers.dev";
+
+function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, game: GameState) {
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Internal": env.DISCORD_BOT_TOKEN,
+      },
+      body: JSON.stringify({ phase, game }),
+    }).catch((err) => console.error(`Phase ${phase} trigger failed:`, err))
+  );
+}
+
+async function startGame(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.lobbyMessageId) return;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
@@ -692,7 +751,7 @@ async function startGame(token: string, game: GameState) {
     components: [],
   });
 
-  // ── Assign roles (stored in embed state, revealed via ephemeral button) ──
+  // ── Assign roles ──
   const roleKeys = assignRoles(game.players.length);
   const rolesMap: Record<string, string> = {};
   game.players.forEach((id, i) => { rolesMap[id] = roleKeys[i]!; });
@@ -716,50 +775,44 @@ async function startGame(token: string, game: GameState) {
       ...wolfPlayerIds.map((id) => ({
         id,
         type: 1 as const,
-        allow: String(1 << 10),       // VIEW_CHANNEL only — read-only until night vote
-        deny: String(1 << 11),        // deny SEND_MESSAGES
+        allow: String(1 << 10),
+        deny: String(1 << 11),
       })),
     ],
   });
   game.wolfChannelId = wolfChannel.id;
 
-  // Send welcome embed in wolf channel
   await sendMessage(token, wolfChannel.id, {
-    embeds: [
-      {
-        title: "🐺 Bienvenue dans la Tanière",
-        description: [
-          "```",
-          "  🌑  Canal secret des Loups-Garous",
-          "  👁️  Invisible aux villageois",
-          "```",
-          "",
-          "━━━━━━━━━━━━━━━━━━━━",
-          "",
-          ...wolfPlayerIds.map((id) => `🐺 <@${id}>`),
-          "",
-          "━━━━━━━━━━━━━━━━━━━━",
-          "",
-          "Complotez ici en toute discrétion.",
-          "Personne d'autre ne peut voir ce canal.",
-          "",
-          `*Choisissez votre victime pour la nuit...*`,
-        ].join("\n"),
-        color: EMBED_COLOR_NIGHT,
-        image: { url: WEREWOLF_IMAGE },
-        footer: { text: `Partie #${game.gameNumber} — Les villageois dorment` },
-        timestamp: new Date().toISOString(),
-      },
-    ],
+    embeds: [{
+      title: "🐺 Bienvenue dans la Tanière",
+      description: [
+        "```",
+        "  🌑  Canal secret des Loups-Garous",
+        "  👁️  Invisible aux villageois",
+        "```",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...wolfPlayerIds.map((id) => `🐺 <@${id}>`),
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "Complotez ici en toute discrétion.",
+        "Personne d'autre ne peut voir ce canal.",
+      ].join("\n"),
+      color: EMBED_COLOR_NIGHT,
+      image: { url: WEREWOLF_IMAGE },
+      footer: { text: `Partie #${game.gameNumber} — Les villageois dorment` },
+      timestamp: new Date().toISOString(),
+    }],
   });
 
   await sleep(3000);
 
-  // ── Phase 3: Role check — players discover their roles ──
+  // ── Phase 3: Role check ──
   game.seen = [];
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
 
-  // Update announce embed
   if (game.announceChannelId && game.announceMessageId) {
     await editMessage(token, game.announceChannelId, game.announceMessageId, {
       embeds: [{
@@ -774,45 +827,84 @@ async function startGame(token: string, game: GameState) {
     });
   }
 
-  // ── Wait for all players to check their roles (max 2 min) ──
-  const roleCheckEnd = Date.now() + ROLE_CHECK_TIMEOUT * 1000;
-  while (Date.now() < roleCheckEnd) {
+  // Hand off to role_check phase (polls every 5s, stays under 30s per invocation)
+  triggerPhase(ctx, env, "role_check", game);
+}
+
+// ── Phase: role_check — poll until all players seen, then trigger countdown ──
+async function phaseRoleCheck(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  const start = Date.now();
+  const maxDuration = 25000; // stay under 30s
+  while (Date.now() - start < maxDuration) {
     await sleep(5000);
     try {
-      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
       const current = parseGameFromEmbed(msg);
-      if (current?.seen?.length === game.players.length) break; // All seen!
+      if (current?.seen?.length === game.players.length) {
+        triggerPhase(ctx, env, "countdown", game);
+        return;
+      }
     } catch { break; }
   }
+  // Not all seen yet and still under ROLE_CHECK_TIMEOUT? Re-invoke self.
+  // Check elapsed time from game state (use embed title to detect if still in role check phase)
+  try {
+    const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
+    const title: string = msg.embeds?.[0]?.title ?? "";
+    if (title.includes("Découvrez vos rôles")) {
+      // Still in role check — re-invoke
+      triggerPhase(ctx, env, "role_check", game);
+    }
+  } catch {
+    // Timeout or error — just start the countdown anyway
+    triggerPhase(ctx, env, "countdown", game);
+  }
+}
 
-  // ── "La partie débute dans 10s" ──
+// ── Phase: countdown — 10s visible countdown then trigger night ──
+async function phaseCountdown(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  // Re-read latest game state from embed (seen might have updated)
+  try {
+    const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
+    const latest = parseGameFromEmbed(msg);
+    if (latest) game = latest;
+  } catch {}
+
   const nightStateUrl = `https://garou.bot/s/${encodeState(game)}`;
-  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
-    embeds: [{
-      title: `⏳ La partie débute dans ${GAME_START_DELAY}s — Partie #${game.gameNumber}`,
-      url: nightStateUrl,
-      description: [
-        "✅ Les rôles ont été distribués!",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        ...game.players.map((id) => `🎭 <@${id}>`),
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        "*Préparez-vous...*",
-      ].join("\n"),
-      color: EMBED_COLOR_ORANGE,
-      thumbnail: { url: WEREWOLF_IMAGE },
-      footer: { text: "🤫 Ne révèle ton rôle à personne!" },
-    }],
-    components: [],
-  });
+  for (let remaining = GAME_START_DELAY; remaining > 0; remaining--) {
+    try {
+      const bar = "█".repeat(remaining) + "░".repeat(GAME_START_DELAY - remaining);
+      await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
+        embeds: [{
+          title: `⏳ La partie débute dans ${remaining}s — Partie #${game.gameNumber}`,
+          url: nightStateUrl,
+          description: [
+            "✅ Les rôles ont été distribués!",
+            "",
+            `\`${bar}\` **${remaining}s**`,
+            "",
+            "*Préparez-vous...*",
+          ].join("\n"),
+          color: EMBED_COLOR_ORANGE,
+          thumbnail: { url: WEREWOLF_IMAGE },
+          footer: { text: "🤫 Ne révèle ton rôle à personne!" },
+        }],
+        components: [],
+      });
+    } catch (err) {
+      console.error("Countdown edit failed:", err);
+    }
+    await sleep(1000);
+  }
 
-  await sleep(GAME_START_DELAY * 1000);
+  // Trigger the night phase
+  triggerPhase(ctx, env, "night_village_sleeps", game);
+}
 
-  // ── "Le village s'endort..." ──
-  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+// ── Phase: night_village_sleeps — "Le village s'endort" then trigger wolves wake ──
+async function phaseVillageSleeps(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  const nightStateUrl = `https://garou.bot/s/${encodeState(game)}`;
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
     embeds: [{
       title: `🌙 Le village s'endort... — Partie #${game.gameNumber}`,
       url: nightStateUrl,
@@ -828,8 +920,8 @@ async function startGame(token: string, game: GameState) {
 
   await sleep(3000);
 
-  // ── "Les loups-garous se réveillent" ──
-  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+  // "Les loups-garous se réveillent"
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
     embeds: [{
       title: `🐺 Les loups-garous se réveillent... — Partie #${game.gameNumber}`,
       url: nightStateUrl,
@@ -845,17 +937,24 @@ async function startGame(token: string, game: GameState) {
     components: [],
   });
 
-  // ── Start Night Phase (unlock tanière, ping wolves, vote) ──
+  // Trigger the wolf vote phase
+  triggerPhase(ctx, env, "night_wolf_vote", game);
+}
+
+// ── Phase: night_wolf_vote — unlock tanière, ping wolves, wait for votes ──
+async function phaseWolfVote(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   await startNightPhase(token, game);
 }
 
 // ── Countdown when game is full ──────────────────────────────────────
 
 function isGameStarted(title: string): boolean {
-  return title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin");
+  return title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin")
+    || title.includes("Le village s'endort") || title.includes("Les loups-garous se réveillent")
+    || title.includes("Découvrez vos rôles") || title.includes("La partie débute");
 }
 
-async function runCountdown(token: string, game: GameState) {
+async function runCountdown(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.lobbyMessageId) return;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
@@ -939,7 +1038,7 @@ async function runCountdown(token: string, game: GameState) {
     if (isGameStarted(title)) return;
     const currentGame = parseGameFromEmbed(msg);
     if (!currentGame || currentGame.players.length < MIN_PLAYERS) return;
-    await startGame(token, currentGame);
+    await startGame(token, currentGame, ctx, env);
   } catch (err) {
     console.error("Countdown auto-start failed:", err);
   }
@@ -1188,7 +1287,7 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
   });
 }
 
-async function handleVoteKill(interaction: any, env: Env): Promise<Response> {
+async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
@@ -1221,7 +1320,7 @@ async function handleVoteKill(interaction: any, env: Env): Promise<Response> {
   if (allSameTarget) {
     // Unanimous! Resolve in background
     const token = env.DISCORD_BOT_TOKEN;
-    (globalThis as any).__backgroundWork = resolveNightVote(token, vote, interaction.message.id);
+    ctx.waitUntil(resolveNightVote(token, vote, interaction.message.id));
     return json({ type: 7, data: buildVoteEmbed(vote) });
   }
 
@@ -1312,7 +1411,7 @@ async function handleRevealRole(interaction: any, env: Env): Promise<Response> {
 
 // ── Start (manual or skip countdown) ─────────────────────────────────
 
-async function handleStart(interaction: any, env: Env): Promise<Response> {
+async function handleStart(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
@@ -1329,12 +1428,11 @@ async function handleStart(interaction: any, env: Env): Promise<Response> {
   const token = env.DISCORD_BOT_TOKEN;
 
   // Use deferred response + background for the animation
-  const deferredResponse = json({ type: 6 }); // ACK with no message (update deferred)
-  (globalThis as any).__backgroundWork = startGame(token, game);
-  return deferredResponse;
+  ctx.waitUntil(startGame(token, game, ctx, env));
+  return json({ type: 6 }); // ACK
 }
 
-async function handleSkipCountdown(interaction: any, env: Env): Promise<Response> {
+async function handleSkipCountdown(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
@@ -1346,7 +1444,7 @@ async function handleSkipCountdown(interaction: any, env: Env): Promise<Response
   }
 
   const token = env.DISCORD_BOT_TOKEN;
-  (globalThis as any).__backgroundWork = startGame(token, game);
+  ctx.waitUntil(startGame(token, game, ctx, env));
   return json({ type: 6 }); // ACK
 }
 
@@ -1358,6 +1456,24 @@ export default {
       return new Response("🐺 Garou Interaction Server", { status: 200 });
     }
 
+    // ── Internal phase calls (self-invocation for long-running flows) ──
+    const internalToken = req.headers.get("X-Internal");
+    if (internalToken === env.DISCORD_BOT_TOKEN) {
+      const { phase, game } = await req.json() as { phase: string; game: GameState };
+      const token = env.DISCORD_BOT_TOKEN;
+      try {
+        if (phase === "role_check") await phaseRoleCheck(token, game, ctx, env);
+        else if (phase === "countdown") await phaseCountdown(token, game, ctx, env);
+        else if (phase === "night_village_sleeps") await phaseVillageSleeps(token, game, ctx, env);
+        else if (phase === "night_wolf_vote") await phaseWolfVote(token, game, ctx, env);
+        else console.error("Unknown phase:", phase);
+      } catch (err) {
+        console.error(`Phase ${phase} failed:`, err);
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    // ── Discord interaction handling ──
     const signature = req.headers.get("x-signature-ed25519");
     const timestamp = req.headers.get("x-signature-timestamp");
     const body = await req.text();
@@ -1372,13 +1488,7 @@ export default {
 
     if (interaction.type === 2) {
       if (interaction.data?.name === "loupgarou") {
-        const response = await handleSlashCommand(interaction, env);
-        const bgWork = (globalThis as any).__backgroundWork;
-        if (bgWork) {
-          ctx.waitUntil(bgWork);
-          (globalThis as any).__backgroundWork = null;
-        }
-        return response;
+        return handleSlashCommand(interaction, env, ctx);
       }
     }
 
@@ -1391,25 +1501,11 @@ export default {
 
       if (customId.startsWith("reveal_role_")) return handleRevealRole(interaction, env);
 
-      if (customId.startsWith("vote_kill_")) {
-        const response = await handleVoteKill(interaction, env);
-        const bgWork = (globalThis as any).__backgroundWork;
-        if (bgWork) {
-          ctx.waitUntil(bgWork);
-          (globalThis as any).__backgroundWork = null;
-        }
-        return response;
-      }
+      if (customId.startsWith("vote_kill_")) return handleVoteKill(interaction, env, ctx);
 
       if (customId.startsWith("start_game_") || customId.startsWith("skip_countdown_")) {
         const handler = customId.startsWith("skip_countdown_") ? handleSkipCountdown : handleStart;
-        const response = await handler(interaction, env);
-        const bgWork = (globalThis as any).__backgroundWork;
-        if (bgWork) {
-          ctx.waitUntil(bgWork);
-          (globalThis as any).__backgroundWork = null;
-        }
-        return response;
+        return handler(interaction, env, ctx);
       }
     }
 
