@@ -1054,15 +1054,6 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
         title: "🌑 La nuit tombe sur le village...",
         url: stateUrl,
         description: [
-          "",
-          "```",
-          "     🌕",
-          "   ·  ✦  ·  ✧  ·",
-          " ✧    ·    ✦    ·",
-          "   ·  ✦  ·  ✧  ·",
-          "  🌲🌲🌲🌲🌲🌲🌲🌲",
-          "```",
-          "",
           "*Les villageois s'endorment...*",
           "*Quelque chose rôde dans l'ombre...*",
         ].join("\n"),
@@ -1082,20 +1073,12 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
         title: "🃏 Le destin se révèle...",
         url: stateUrl,
         description: [
-          "",
-          "```",
-          " ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐",
-          " │ 🐺  │ │ 🧪  │ │ 💘  │ │  ?  │",
-          " │     │ │     │ │     │ │     │",
-          " │ ??? │ │ ??? │ │ ??? │ │ ??? │",
-          " └─────┘ └─────┘ └─────┘ └─────┘",
-          "```",
-          "",
           `**${game.players.length} cartes** sont distribuées face cachée...`,
           "",
-          "*Chaque joueur reçoit son destin en message privé.*",
+          "*Chaque joueur reçoit son destin en secret.*",
         ].join("\n"),
         color: EMBED_COLOR_PURPLE,
+        image: { url: SCENE_IMAGES.game_start },
       },
     ],
     components: [],
@@ -1178,7 +1161,7 @@ async function runCountdownAndNight(token: string, game: GameState, ctx: Executi
         "*Le silence envahit le village...*",
       ].join("\n"),
       color: EMBED_COLOR_NIGHT,
-      thumbnail: { url: WEREWOLF_IMAGE },
+      image: { url: SCENE_IMAGES.night_falls },
     }],
     components: [],
   });
@@ -1197,7 +1180,7 @@ async function runCountdownAndNight(token: string, game: GameState, ctx: Executi
         `⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour décider.`,
       ].join("\n"),
       color: EMBED_COLOR_NIGHT,
-      thumbnail: { url: WEREWOLF_IMAGE },
+      image: { url: getRoleImage("loup") },
     }],
     components: [],
   });
@@ -1399,14 +1382,14 @@ function buildVoteEmbed(vote: VoteState) {
         "*Vote unanime = résolution immédiate*",
       ].join("\n"),
       color: EMBED_COLOR_NIGHT,
-      thumbnail: { url: WEREWOLF_IMAGE },
+      thumbnail: { url: getRoleImage("loup") },
     }],
     components: buttonRows,
   };
 }
 
 async function startNightPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  if (!game.wolfChannelId || !game.roles) return;
+  if (!game.roles) return;
 
   const wolfIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
   const targetIds = game.players.filter((id) => !wolfIds.includes(id));
@@ -1432,12 +1415,26 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
     deadline,
   };
 
-  // Tag wolves and send vote embed in wolf channel
+  // Create a fresh private thread for this night
+  const wolfThread: any = await createThread(token, game.gameChannelId, {
+    name: "🐺 Tanière",
+    type: 12, // GUILD_PRIVATE_THREAD
+    auto_archive_duration: 1440,
+  });
+  game.wolfChannelId = wolfThread.id;
+  voteState.wolfChannelId = wolfThread.id;
+
+  // Add all wolves to the thread
+  for (const wolfId of wolfIds) {
+    await addThreadMember(token, wolfThread.id, wolfId);
+  }
+
+  // Tag wolves and send vote embed in wolf thread
   const wolfMentions = wolfIds.map((id) => `<@${id}>`).join(" ");
-  await sendMessage(token, game.wolfChannelId, {
+  await sendMessage(token, wolfThread.id, {
     content: `${wolfMentions}\n\n🌙 **La nuit est tombée!** Choisissez votre victime ci-dessous.`,
   });
-  const voteMsg: any = await sendMessage(token, game.wolfChannelId, buildVoteEmbed(voteState));
+  const voteMsg: any = await sendMessage(token, wolfThread.id, buildVoteEmbed(voteState));
 
   // Schedule vote timer via self-invocation (avoids 90s sleep killing the worker)
   ctx.waitUntil(
@@ -1528,10 +1525,13 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
         "*Le vote est terminé.*",
       ].join("\n"),
       color: EMBED_COLOR,
-      thumbnail: { url: WEREWOLF_IMAGE },
+      image: { url: SCENE_IMAGES.night_kill },
     }],
     components: [],
   });
+
+  // Delete wolf thread — a new one will be created next night
+  try { await deleteChannel(token, vote.wolfChannelId); } catch {}
 
   // Announce in game channel
   await sendMessage(token, vote.gameChannelId, {
@@ -1543,7 +1543,7 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
         "*Un moment de silence pour la victime...*",
       ].join("\n"),
       color: EMBED_COLOR,
-      image: { url: SCENE_IMAGES.night_kill },
+      image: { url: SCENE_IMAGES.dawn_breaks },
     }],
   });
 }
@@ -1626,53 +1626,8 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
     game.seen.push(userId);
   }
 
-  // ── Lazy thread creation for special roles ──
-  // Private thread only appears for wolves who have revealed their role
-  if (roleKey === "loup") {
-    if (!game.wolfChannelId) {
-      // First wolf to reveal → create a private thread inside the game channel
-      const wolfThread: any = await createThread(token, game.gameChannelId, {
-        name: "🐺 Tanière",
-        type: 12, // GUILD_PRIVATE_THREAD
-        auto_archive_duration: 1440,
-      });
-      game.wolfChannelId = wolfThread.id;
+  // Update role check embed with latest seen list
 
-      // Send welcome message
-      const wolfPlayerIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
-      await sendMessage(token, wolfThread.id, {
-        embeds: [{
-          title: "🐺 Bienvenue dans la Tanière",
-          description: [
-            "```",
-            "  🌑  Fil secret des Loups-Garous",
-            "  👁️  Invisible aux villageois",
-            "```",
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-            ...wolfPlayerIds.map((id) => `🐺 <@${id}>`),
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-            "Complotez ici en toute discrétion.",
-            "Personne d'autre ne peut voir ce fil.",
-            "",
-            "*Ce fil sera visible à chaque loup après qu'il ait découvert son rôle.*",
-          ].join("\n"),
-          color: EMBED_COLOR_NIGHT,
-          image: { url: SCENE_IMAGES.night_falls },
-          footer: { text: `Partie #${game.gameNumber} — Les villageois dorment` },
-          timestamp: new Date().toISOString(),
-        }],
-      });
-    }
-
-    // Add this wolf to the private thread
-    await addThreadMember(token, game.wolfChannelId, userId);
-  }
-
-  // Update role check embed with latest seen list + wolfChannelId
   if (game.lobbyMessageId) {
     try {
       await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
