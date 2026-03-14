@@ -156,7 +156,40 @@ function editOriginalInteractionResponse(appId: string, interactionToken: string
 const EMBED_COLOR = 0x8b0000;
 const EMBED_COLOR_GREEN = 0x2ecc71;
 const EMBED_COLOR_ORANGE = 0xe67e22;
-const WEREWOLF_IMAGE = "https://i.imgur.com/JfOLPcY.png";
+const ASSET_BASE = "https://raw.githubusercontent.com/dev-t0ny/bp-hacks-2026/main/garou/assets";
+const WEREWOLF_IMAGE = `${ASSET_BASE}/scenes/game_start.png`;
+
+// Scene images
+const SCENE_IMAGES = {
+  game_start: `${ASSET_BASE}/scenes/game_start.png`,
+  night_falls: `${ASSET_BASE}/scenes/night_falls.png`,
+  dawn_breaks: `${ASSET_BASE}/scenes/dawn_breaks.png`,
+  night_kill: `${ASSET_BASE}/scenes/night_kill.png`,
+  day_elimination: `${ASSET_BASE}/scenes/day_elimination.png`,
+  victory_wolves: `${ASSET_BASE}/scenes/victory_wolves.png`,
+  victory_village: `${ASSET_BASE}/scenes/victory_village.png`,
+  snipe_reveal: `${ASSET_BASE}/scenes/snipe_reveal.png`,
+} as const;
+
+// Role images — key must match ROLES keys
+function getRoleImage(roleKey: string): string {
+  const roleImageMap: Record<string, string> = {
+    loup: "loup_garou",
+    sorciere: "sorciere",
+    cupidon: "cupidon",
+    villageois: "villageois",
+    chasseur: "chasseur",
+    voyante: "voyante",
+    petite_fille: "petite_fille",
+    salvateur: "salvateur",
+    ancien: "ancien",
+    idiot_du_village: "idiot_du_village",
+    corbeau: "corbeau",
+    renard: "renard",
+  };
+  const file = roleImageMap[roleKey] ?? "villageois";
+  return `${ASSET_BASE}/roles/${file}.png`;
+}
 const MIN_PLAYERS = 4;
 const MAX_PLAYERS = 20;
 
@@ -754,7 +787,7 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
           "*Quelque chose rôde dans l'ombre...*",
         ].join("\n"),
         color: EMBED_COLOR_NIGHT,
-        image: { url: WEREWOLF_IMAGE },
+        image: { url: SCENE_IMAGES.night_falls },
       },
     ],
     components: [],
@@ -1252,7 +1285,7 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
         "*Un moment de silence pour la victime...*",
       ].join("\n"),
       color: EMBED_COLOR,
-      image: { url: WEREWOLF_IMAGE },
+      image: { url: SCENE_IMAGES.night_kill },
     }],
   });
 }
@@ -1377,7 +1410,7 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
             "*Ce canal sera visible à chaque loup après qu'il ait découvert son rôle.*",
           ].join("\n"),
           color: EMBED_COLOR_NIGHT,
-          image: { url: WEREWOLF_IMAGE },
+          image: { url: SCENE_IMAGES.night_falls },
           footer: { text: `Partie #${game.gameNumber} — Les villageois dorment` },
           timestamp: new Date().toISOString(),
         }],
@@ -1443,7 +1476,7 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
           title: `${role.emoji} Tu es ${role.name}`,
           description: descLines.join("\n"),
           color: role.team === "loups" ? EMBED_COLOR : EMBED_COLOR_GREEN,
-          thumbnail: { url: WEREWOLF_IMAGE },
+          image: { url: getRoleImage(roleKey) },
           footer: { text: "🤫 Ne révèle ton rôle à personne!" },
         },
       ],
