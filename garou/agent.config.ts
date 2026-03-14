@@ -26,6 +26,11 @@ export default defineConfig({
         enabled: true,
         config: { botToken: process.env.DISCORD_BOT_TOKEN! },
       },
+      dalle: {
+        version: "simplygreatbots/dalle@0.3.1",
+        enabled: true,
+        config: { apiKey: process.env.OPENAI_API_KEY! },
+      },
     },
   },
 });
