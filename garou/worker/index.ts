@@ -364,6 +364,14 @@ function json(data: any, status = 200): Response {
   });
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function getMessage(token: string, channelId: string, messageId: string) {
+  return discordFetch(token, `/channels/${channelId}/messages/${messageId}`);
+}
+
 async function findOrCreateCategory(token: string, guildId: string): Promise<string> {
   const channels: any[] = await getGuildChannels(token, guildId);
   const existing = channels.find(
@@ -429,6 +437,7 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
         permission_overwrites: [
           { id: guildId, type: 0, deny: String(1 << 10) },
           { id: botUser.id, type: 1, allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)) },
+          { id: userId, type: 1, allow: String(1 << 10) },
         ],
       });
 
@@ -439,7 +448,7 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
         guildId,
         gameChannelId: gameChannel.id,
         maxPlayers,
-        players: [],
+        players: [userId],
         announceChannelId: channelId,
       };
 
@@ -478,7 +487,7 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
 
 // ── Join ────────────────────────────────────────────────────────────
 
-async function handleJoin(interaction: any, env: Env): Promise<Response> {
+async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
@@ -500,6 +509,11 @@ async function handleJoin(interaction: any, env: Env): Promise<Response> {
   const playerName = member.nick || member.user.global_name || member.user.username;
 
   await updateAllEmbeds(token, game, `${playerName} a rejoint la partie`);
+
+  // Game is full → start countdown
+  if (game.players.length >= game.maxPlayers) {
+    ctx.waitUntil(runCountdown(token, game));
+  }
 
   return json({
     type: 4,
@@ -562,7 +576,244 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   return json({ type: 4, data: { content: `🚪 Tu as quitté la Partie #${game.gameNumber}.`, flags: 64 } });
 }
 
-// ── Start ───────────────────────────────────────────────────────────
+// ── Game Start (animated role reveal) ────────────────────────────────
+
+const COUNTDOWN_SECONDS = 30;
+const EMBED_COLOR_NIGHT = 0x0d1b2a;
+const EMBED_COLOR_PURPLE = 0x6c3483;
+
+async function startGame(token: string, game: GameState) {
+  if (!game.lobbyMessageId) return;
+  const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  // ── Phase 1: Night falls ──
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+    embeds: [
+      {
+        title: "🌑 La nuit tombe sur le village...",
+        url: stateUrl,
+        description: [
+          "",
+          "```",
+          "     🌕",
+          "   ·  ✦  ·  ✧  ·",
+          " ✧    ·    ✦    ·",
+          "   ·  ✦  ·  ✧  ·",
+          "  🌲🌲🌲🌲🌲🌲🌲🌲",
+          "```",
+          "",
+          "*Les villageois s'endorment...*",
+          "*Quelque chose rôde dans l'ombre...*",
+        ].join("\n"),
+        color: EMBED_COLOR_NIGHT,
+        image: { url: WEREWOLF_IMAGE },
+      },
+    ],
+    components: [],
+  });
+
+  await sleep(3000);
+
+  // ── Phase 2: Distributing roles ──
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+    embeds: [
+      {
+        title: "🃏 Le destin se révèle...",
+        url: stateUrl,
+        description: [
+          "",
+          "```",
+          " ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐",
+          " │ 🐺  │ │ 🧪  │ │ 💘  │ │  ?  │",
+          " │     │ │     │ │     │ │     │",
+          " │ ??? │ │ ??? │ │ ??? │ │ ??? │",
+          " └─────┘ └─────┘ └─────┘ └─────┘",
+          "```",
+          "",
+          `**${game.players.length} cartes** sont distribuées face cachée...`,
+          "",
+          "*Chaque joueur reçoit son destin en message privé.*",
+        ].join("\n"),
+        color: EMBED_COLOR_PURPLE,
+      },
+    ],
+    components: [],
+  });
+
+  // ── Assign & DM roles ──
+  const roleKeys = assignRoles(game.players.length);
+  const playerRoles = game.players.map((id, i) => ({ id, roleKey: roleKeys[i]!, role: ROLES[roleKeys[i]!]! }));
+
+  const dmPromises = playerRoles.map(async ({ id, role }) => {
+    try {
+      const dm: any = await createDM(token, id);
+      await sendMessage(token, dm.id, {
+        embeds: [
+          {
+            title: `${role.emoji} Tu es ${role.name}`,
+            description: [
+              "",
+              `> ${role.description}`,
+              "",
+              "━━━━━━━━━━━━━━━━━━━━",
+              "",
+              `🎮 **Partie #${game.gameNumber}**`,
+              `👥 **${game.players.length} joueurs**`,
+              `⚔️ Équipe: **${role.team === "loups" ? "Loups-Garous 🐺" : "Village 🏘️"}**`,
+            ].join("\n"),
+            color: role.team === "loups" ? EMBED_COLOR : EMBED_COLOR_GREEN,
+            thumbnail: { url: WEREWOLF_IMAGE },
+            footer: { text: "🤫 Ne révèle ton rôle à personne!" },
+          },
+        ],
+      });
+    } catch (err) {
+      console.error(`Failed to DM role to ${id}:`, err);
+    }
+  });
+  await Promise.all(dmPromises);
+
+  await sleep(3000);
+
+  // ── Phase 3: Roles sent — final state ──
+  const loupCount = playerRoles.filter((p) => p.role.team === "loups").length;
+  const villageCount = playerRoles.filter((p) => p.role.team === "village").length;
+
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+    embeds: [
+      {
+        title: `🐺 Partie #${game.gameNumber} — La chasse commence!`,
+        url: stateUrl,
+        description: [
+          "```",
+          "  ✉️  Les rôles ont été envoyés!",
+          "  📬  Vérifiez vos messages privés.",
+          "```",
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+          "",
+          ...game.players.map((id) => `> 🎭 <@${id}>`),
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+          "",
+          `🐺 **${loupCount}** loup${loupCount > 1 ? "s-garous rôdent" : "-garou rôde"} parmi vous`,
+          `🏘️ **${villageCount}** membre${villageCount > 1 ? "s" : ""} du village ${villageCount > 1 ? "doivent" : "doit"} survivre`,
+          "",
+          "*La première nuit commence...*",
+        ].join("\n"),
+        color: EMBED_COLOR,
+        thumbnail: { url: WEREWOLF_IMAGE },
+        footer: { text: "Que le meilleur camp gagne!" },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+    components: [],
+  });
+
+  // Update announce embed
+  if (game.announceChannelId && game.announceMessageId) {
+    await editMessage(token, game.announceChannelId, game.announceMessageId, {
+      embeds: [
+        {
+          title: `🎮 Partie #${game.gameNumber} — En cours!`,
+          url: stateUrl,
+          description: [`Lancée par <@${game.creatorId}>`, "", `**${game.players.length} joueurs** — Les rôles sont distribués!`].join("\n"),
+          color: EMBED_COLOR_GREEN,
+          image: { url: WEREWOLF_IMAGE },
+          footer: { text: "La partie est en cours!" },
+        },
+      ],
+      components: [],
+    });
+  }
+}
+
+// ── Countdown when game is full ──────────────────────────────────────
+
+async function runCountdown(token: string, game: GameState) {
+  if (!game.lobbyMessageId) return;
+
+  for (let remaining = COUNTDOWN_SECONDS; remaining > 0; remaining -= 5) {
+    // Re-fetch embed to check if game was already started or state changed
+    try {
+      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+      const title: string = msg.embeds?.[0]?.title ?? "";
+      // If game already started (skip button was pressed), stop countdown
+      if (title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin")) return;
+      // If game is no longer full (someone quit), stop countdown
+      const currentGame = parseGameFromEmbed(msg);
+      if (!currentGame || currentGame.players.length < currentGame.maxPlayers) return;
+    } catch {
+      return;
+    }
+
+    const bar = "▓".repeat(Math.ceil((remaining / COUNTDOWN_SECONDS) * 10)) +
+                "░".repeat(10 - Math.ceil((remaining / COUNTDOWN_SECONDS) * 10));
+    const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+    await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+      embeds: [
+        {
+          title: `⏳ La partie commence dans ${remaining}s...`,
+          url: stateUrl,
+          description: [
+            "",
+            `\`${bar}\` **${remaining}s**`,
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "",
+            ...game.players.map((id) => {
+              const icon = id === game.creatorId ? "👑" : "🐺";
+              return `${icon} <@${id}>`;
+            }),
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "",
+            `🟢 **${game.players.length}/${game.maxPlayers}** — Tous les joueurs sont prêts!`,
+          ].join("\n"),
+          color: EMBED_COLOR_ORANGE,
+          thumbnail: { url: WEREWOLF_IMAGE },
+          footer: { text: `Le créateur peut lancer immédiatement` },
+        },
+      ],
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 2,
+              style: 3,
+              label: "⏩ Commencer maintenant",
+              custom_id: `skip_countdown_${game.gameNumber}`,
+            },
+            {
+              type: 2,
+              style: 4,
+              label: "🚪 Quitter la partie",
+              custom_id: `quit_game_${game.gameNumber}`,
+            },
+          ],
+        },
+      ],
+    });
+
+    await sleep(5000);
+  }
+
+  // Final check before auto-starting
+  try {
+    const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+    const title: string = msg.embeds?.[0]?.title ?? "";
+    if (title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin")) return;
+    const currentGame = parseGameFromEmbed(msg);
+    if (!currentGame || currentGame.players.length < MIN_PLAYERS) return;
+    await startGame(token, currentGame);
+  } catch (err) {
+    console.error("Countdown auto-start failed:", err);
+  }
+}
+
+// ── Start (manual or skip countdown) ─────────────────────────────────
 
 async function handleStart(interaction: any, env: Env): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
@@ -579,102 +830,27 @@ async function handleStart(interaction: any, env: Env): Promise<Response> {
   }
 
   const token = env.DISCORD_BOT_TOKEN;
-  const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
-  // Assign roles
-  const roleKeys = assignRoles(game.players.length);
-  const playerRoles = game.players.map((id, i) => ({ id, roleKey: roleKeys[i]!, role: ROLES[roleKeys[i]!]! }));
+  // Use deferred response + background for the animation
+  const deferredResponse = json({ type: 6 }); // ACK with no message (update deferred)
+  (globalThis as any).__backgroundWork = startGame(token, game);
+  return deferredResponse;
+}
 
-  // DM each player their role
-  const dmPromises = playerRoles.map(async ({ id, role }) => {
-    try {
-      const dm: any = await createDM(token, id);
-      await sendMessage(token, dm.id, {
-        embeds: [
-          {
-            title: `${role.emoji} Tu es **${role.name}**`,
-            description: [
-              role.description,
-              "",
-              "━━━━━━━━━━━━━━━━━━━━",
-              "",
-              `🎮 **Partie #${game.gameNumber}**`,
-              `👥 **${game.players.length} joueurs**`,
-              `⚔️ Équipe: **${role.team === "loups" ? "Loups-Garous" : "Village"}**`,
-            ].join("\n"),
-            color: role.team === "loups" ? EMBED_COLOR : EMBED_COLOR_GREEN,
-            thumbnail: { url: WEREWOLF_IMAGE },
-            footer: { text: "Ne révèle ton rôle à personne!" },
-          },
-        ],
-      });
-    } catch (err) {
-      console.error(`Failed to DM role to ${id}:`, err);
-    }
-  });
-  await Promise.all(dmPromises);
+async function handleSkipCountdown(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
-  // Build role summary for game channel (no spoilers — just team counts)
-  const loupCount = playerRoles.filter((p) => p.role.team === "loups").length;
-  const villageCount = playerRoles.filter((p) => p.role.team === "village").length;
+  const game = parseGameFromEmbed(interaction.message);
+  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
 
-  // Update lobby embed — remove buttons, show "started"
-  if (game.lobbyMessageId) {
-    await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
-      embeds: [
-        {
-          title: `🎮 Partie #${game.gameNumber} — En cours!`,
-          url: stateUrl,
-          description: [
-            `**${game.players.length} joueurs:**`,
-            "",
-            ...game.players.map((id) => `🐺 <@${id}>`),
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-            `🐺 **${loupCount}** loup${loupCount > 1 ? "s" : ""} rôdent parmi vous...`,
-            `🏘️ **${villageCount}** villageois doivent survivre.`,
-          ].join("\n"),
-          color: EMBED_COLOR_GREEN,
-          thumbnail: { url: WEREWOLF_IMAGE },
-          footer: { text: "Les rôles ont été distribués en DM!" },
-        },
-      ],
-      components: [],
-    });
+  if (userId !== game.creatorId) {
+    return json({ type: 4, data: { content: `❌ Seul le créateur (<@${game.creatorId}>) peut sauter le compte à rebours.`, flags: 64 } });
   }
 
-  // Update announce embed — remove join button
-  if (game.announceChannelId && game.announceMessageId) {
-    await editMessage(token, game.announceChannelId, game.announceMessageId, {
-      embeds: [
-        {
-          title: `🎮 Partie #${game.gameNumber} — En cours!`,
-          url: stateUrl,
-          description: [`Lancée par <@${game.creatorId}>`, "", `**${game.players.length} joueurs**`].join("\n"),
-          color: EMBED_COLOR_GREEN,
-          image: { url: WEREWOLF_IMAGE },
-          footer: { text: "La partie est en cours!" },
-        },
-      ],
-      components: [],
-    });
-  }
-
-  await sendMessage(token, game.gameChannelId, {
-    content: [
-      "# 🌕 La nuit tombe sur le village...",
-      "",
-      `**${game.players.length} joueurs** ont reçu leur rôle en message privé.`,
-      "",
-      `> 🐺 **${loupCount}** loup${loupCount > 1 ? "s-garous se cachent" : "-garou se cache"} parmi vous`,
-      `> 🏘️ **${villageCount}** membres du village doivent les démasquer`,
-      "",
-      "*Consultez vos DMs pour découvrir votre rôle!*",
-    ].join("\n"),
-  });
-
-  return json({ type: 4, data: { content: `🎮 La Partie #${game.gameNumber} a été lancée! Vérifie tes DMs pour ton rôle.`, flags: 64 } });
+  const token = env.DISCORD_BOT_TOKEN;
+  (globalThis as any).__backgroundWork = startGame(token, game);
+  return json({ type: 6 }); // ACK
 }
 
 // ── Worker Entry Point ──────────────────────────────────────────────
@@ -711,9 +887,21 @@ export default {
 
     if (interaction.type === 3) {
       const customId: string = interaction.data?.custom_id || "";
-      if (customId.startsWith("join_game_")) return handleJoin(interaction, env);
+
+      if (customId.startsWith("join_game_")) return handleJoin(interaction, env, ctx);
+
       if (customId.startsWith("quit_game_")) return handleQuit(interaction, env);
-      if (customId.startsWith("start_game_")) return handleStart(interaction, env);
+
+      if (customId.startsWith("start_game_") || customId.startsWith("skip_countdown_")) {
+        const handler = customId.startsWith("skip_countdown_") ? handleSkipCountdown : handleStart;
+        const response = await handler(interaction, env);
+        const bgWork = (globalThis as any).__backgroundWork;
+        if (bgWork) {
+          ctx.waitUntil(bgWork);
+          (globalThis as any).__backgroundWork = null;
+        }
+        return response;
+      }
     }
 
     return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
