@@ -227,7 +227,7 @@ function getRoleImage(roleKey: string): string {
   const file = roleImageMap[roleKey] ?? "villageois";
   return `${ASSET_BASE}/roles/${file}.png`;
 }
-const MIN_PLAYERS = 4;
+const MIN_PLAYERS = 2;
 const MAX_PLAYERS = 20;
 
 // ── Roles ───────────────────────────────────────────────────────────
@@ -251,6 +251,12 @@ const ROLES: Record<string, Role> = {
     emoji: "🧪",
     team: "village",
     description: "Vous avez une potion de vie et une potion de mort. Utilisez-les avec sagesse.",
+  },
+  voyante: {
+    name: "Voyante",
+    emoji: "🔮",
+    team: "village",
+    description: "Chaque nuit, vous pouvez espionner un joueur et découvrir son véritable rôle.",
   },
   cupidon: {
     name: "Cupidon",
@@ -285,12 +291,12 @@ const ROLES: Record<string, Role> = {
 };
 
 function assignRoles(playerCount: number): string[] {
-  // Fixed: 2 loups, 1 sorcière, 1 cupidon, reste = villageois
-  // >= 8 players: add 1 loup_blanc (replaces 1 villageois)
-  const roles: string[] = ["loup", "loup", "sorciere", "cupidon"];
-  if (playerCount >= 8) {
-    roles.push("loup_blanc");
-  }
+  // Base: 2 loups, 1 voyante, 1 sorcière, 1 cupidon
+  // >= 6: +chasseur, >= 7: +petite_fille, >= 8: +loup_blanc
+  const roles: string[] = ["loup", "loup", "voyante", "sorciere", "cupidon"];
+  if (playerCount >= 6) roles.push("chasseur");
+  if (playerCount >= 7) roles.push("petite_fille");
+  if (playerCount >= 8) roles.push("loup_blanc");
   for (let i = roles.length; i < playerCount; i++) {
     roles.push("villageois");
   }
@@ -321,6 +327,7 @@ interface GameState {
   nightCount?: number; // how many nights have passed (cupidon acts night 1 only)
   dead?: string[]; // dead player IDs
   voiceChannelId?: string; // voice channel for sound effects
+  witchPotions?: { life: boolean; death: boolean }; // true = available
 }
 
 function encodeState(game: GameState): string {
@@ -344,6 +351,7 @@ function encodeState(game: GameState): string {
   if (game.nightCount) compact.nc = game.nightCount;
   if (game.dead?.length) compact.d = game.dead;
   if (game.voiceChannelId) compact.vc = game.voiceChannelId;
+  if (game.witchPotions) compact.wp = game.witchPotions;
   return btoa(JSON.stringify(compact));
 }
 
@@ -371,6 +379,7 @@ function decodeState(url: string): GameState | null {
       nightCount: compact.nc ?? 0,
       dead: compact.d ?? [],
       voiceChannelId: compact.vc,
+      witchPotions: compact.wp,
     };
   } catch {
     return null;
@@ -976,13 +985,28 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
-  const game = parseGameFromEmbed(interaction.message);
-  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+  const token = env.DISCORD_BOT_TOKEN;
+
+  // Parse initial state from the interaction message (may be stale if another join is in-flight)
+  const initialGame = parseGameFromEmbed(interaction.message);
+  if (!initialGame) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+
+  // Re-read the latest state from the LOBBY embed to avoid race conditions.
+  // Without this, two players clicking "Rejoindre" at the same time both read
+  // the old state from interaction.message and the second join overwrites the first.
+  let game = initialGame;
+  if (initialGame.lobbyMessageId) {
+    try {
+      const latestMsg: any = await getMessage(token, initialGame.gameChannelId, initialGame.lobbyMessageId);
+      const latestGame = parseGameFromEmbed(latestMsg);
+      if (latestGame) game = latestGame;
+    } catch {}
+  }
+
   if (game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu es déjà dans cette partie!", flags: 64 } });
   if (game.players.length >= game.maxPlayers) return json({ type: 4, data: { content: "❌ La partie est pleine!", flags: 64 } });
 
   // Check if player is already in another game
-  const token = env.DISCORD_BOT_TOKEN;
   const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
   if (activeGame !== null) {
     return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en rejoindre une autre.`, flags: 64 } });
@@ -1041,11 +1065,22 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
-  const game = parseGameFromEmbed(interaction.message);
-  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
-  if (!game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu n'es pas dans cette partie.", flags: 64 } });
-
   const token = env.DISCORD_BOT_TOKEN;
+
+  // Re-read the latest state from the lobby embed (same race condition fix as handleJoin)
+  const initialGame = parseGameFromEmbed(interaction.message);
+  if (!initialGame) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+
+  let game = initialGame;
+  if (initialGame.lobbyMessageId) {
+    try {
+      const latestMsg: any = await getMessage(token, initialGame.gameChannelId, initialGame.lobbyMessageId);
+      const latestGame = parseGameFromEmbed(latestMsg);
+      if (latestGame) game = latestGame;
+    } catch {}
+  }
+
+  if (!game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu n'es pas dans cette partie.", flags: 64 } });
   game.players = game.players.filter((id) => id !== userId);
 
   // Clear player from active games
@@ -1103,7 +1138,7 @@ const EMBED_COLOR_PURPLE = 0x6c3483;
 // Each phase stays under 30s to respect Cloudflare free plan waitUntil limits.
 const WORKER_URL = "https://garou-interactions.gabgingras.workers.dev";
 
-function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, game: GameState) {
+function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, data: Record<string, unknown>) {
   ctx.waitUntil(
     fetch(WORKER_URL, {
       method: "POST",
@@ -1111,7 +1146,7 @@ function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, game: Game
         "Content-Type": "application/json",
         "X-Internal": env.DISCORD_BOT_TOKEN,
       },
-      body: JSON.stringify({ phase, game }),
+      body: JSON.stringify({ phase, ...data }),
     }).then(async (res) => {
       if (!res.ok) console.error(`Phase ${phase} HTTP ${res.status}: ${await res.text()}`);
       else console.log(`Phase ${phase} triggered OK`);
@@ -1210,6 +1245,7 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   const rolesMap: Record<string, string> = {};
   game.players.forEach((id, i) => { rolesMap[id] = roleKeys[i]!; });
   game.roles = rolesMap;
+  game.witchPotions = { life: true, death: true };
 
   await sleep(3000);
 
@@ -1289,25 +1325,8 @@ async function runCountdownAndNight(token: string, game: GameState, ctx: Executi
 
   await sleep(3000);
 
-  // "Les loups-garous se réveillent"
-  await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
-    embeds: [{
-      title: `🐺 Les loups-garous se réveillent... — Partie #${game.gameNumber}`,
-      url: nightStateUrl,
-      description: [
-        "*Des ombres se faufilent dans la nuit...*",
-        "*Les loups-garous ouvrent les yeux et choisissent leur victime.*",
-        "",
-        `⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour décider.`,
-      ].join("\n"),
-      color: EMBED_COLOR_NIGHT,
-      image: { url: getRoleImage("loup") },
-    }],
-    components: [],
-  });
-
-  // Start night vote (unlock tanière, ping wolves, send vote buttons)
-  await startNightPhase(token, game, ctx, env);
+  // Trigger night orchestrator (cupidon night 1 → voyante → wolves → sorciere → dawn)
+  triggerPhase(ctx, env, "night_start", { game });
 }
 
 // ── Countdown when game is full ──────────────────────────────────────
@@ -1315,7 +1334,8 @@ async function runCountdownAndNight(token: string, game: GameState, ctx: Executi
 function isGameStarted(title: string): boolean {
   return title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin")
     || title.includes("Le village s'endort") || title.includes("Les loups-garous se réveillent")
-    || title.includes("Découvrez vos rôles") || title.includes("La partie débute");
+    || title.includes("Découvrez vos rôles") || title.includes("La partie débute")
+    || title.includes("Vision de la Voyante") || title.includes("Sorcière");
 }
 
 async function runCountdown(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
@@ -1402,7 +1422,7 @@ async function runCountdown(token: string, game: GameState, ctx: ExecutionContex
     if (isGameStarted(title)) return;
     const currentGame = parseGameFromEmbed(msg);
     if (!currentGame || currentGame.players.length < MIN_PLAYERS) return;
-    triggerPhase(ctx, env, "start_game", currentGame);
+    triggerPhase(ctx, env, "start_game", { game: currentGame });
   } catch (err) {
     console.error("Countdown auto-start failed:", err);
   }
@@ -1470,6 +1490,237 @@ function parseVoteFromEmbed(message: any): VoteState | null {
   return decodeVoteState(embed.url);
 }
 
+// ── Voyante State ────────────────────────────────────────────────────
+
+const VOYANTE_TIMEOUT_SECONDS = 60;
+
+interface VoyanteState {
+  gameNumber: number;
+  guildId: string;
+  gameChannelId: string;
+  voyanteThreadId: string;
+  lobbyMessageId: string;
+  voyanteId: string;
+  targets: { id: string; name: string }[];
+  deadline: number;
+  allRoles: Record<string, string>;
+  resolved?: boolean;
+}
+
+function encodeVoyanteState(vy: VoyanteState): string {
+  return btoa(JSON.stringify({
+    g: vy.gameNumber, gi: vy.guildId, gc: vy.gameChannelId,
+    vt: vy.voyanteThreadId, lm: vy.lobbyMessageId, vi: vy.voyanteId,
+    t: vy.targets.map((t) => [t.id, t.name]),
+    dl: vy.deadline, ar: vy.allRoles, rs: vy.resolved,
+  }));
+}
+
+function decodeVoyanteState(url: string): VoyanteState | null {
+  try {
+    const b64 = url.split("/vy/")[1];
+    if (!b64) return null;
+    const c = JSON.parse(atob(b64));
+    return {
+      gameNumber: c.g, guildId: c.gi, gameChannelId: c.gc,
+      voyanteThreadId: c.vt, lobbyMessageId: c.lm, voyanteId: c.vi,
+      targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
+      deadline: c.dl, allRoles: c.ar, resolved: c.rs,
+    };
+  } catch { return null; }
+}
+
+function parseVoyanteFromEmbed(message: any): VoyanteState | null {
+  const embed = message.embeds?.[0];
+  if (!embed?.url?.includes("/vy/")) return null;
+  return decodeVoyanteState(embed.url);
+}
+
+function buildVoyanteEmbed(vy: VoyanteState) {
+  const stateUrl = `https://garou.bot/vy/${encodeVoyanteState(vy)}`;
+
+  const buttonRows: any[] = [];
+  let currentRow: any[] = [];
+  for (const target of vy.targets) {
+    currentRow.push({
+      type: 2,
+      style: 1,
+      label: `🔍 ${target.name}`,
+      custom_id: `voyante_see_${vy.gameNumber}_${target.id}`,
+    });
+    if (currentRow.length === 5) {
+      buttonRows.push({ type: 1, components: currentRow });
+      currentRow = [];
+    }
+  }
+  if (currentRow.length > 0) {
+    buttonRows.push({ type: 1, components: currentRow });
+  }
+
+  return {
+    embeds: [{
+      title: `🔮 Vision de la Voyante — Partie #${vy.gameNumber}`,
+      url: stateUrl,
+      description: [
+        "**Qui veux-tu espionner cette nuit?**",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "Choisis un joueur pour découvrir son rôle.",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        `⏰ Fin <t:${vy.deadline}:R>`,
+      ].join("\n"),
+      color: EMBED_COLOR_PURPLE,
+      thumbnail: { url: getRoleImage("voyante") },
+    }],
+    components: buttonRows,
+  };
+}
+
+// ── Sorciere State ───────────────────────────────────────────────────
+
+const SORCIERE_TIMEOUT_SECONDS = 60;
+
+interface SorciereState {
+  gameNumber: number;
+  guildId: string;
+  gameChannelId: string;
+  sorciereThreadId: string;
+  lobbyMessageId: string;
+  sorciereId: string;
+  wolfVictimId: string;
+  wolfVictimName: string;
+  potions: { life: boolean; death: boolean };
+  targets: { id: string; name: string }[];
+  deadline: number;
+  resolved?: boolean;
+  witchSaved?: boolean;
+  witchKillTargetId?: string;
+}
+
+function encodeSorciereState(so: SorciereState): string {
+  return btoa(JSON.stringify({
+    g: so.gameNumber, gi: so.guildId, gc: so.gameChannelId,
+    st: so.sorciereThreadId, lm: so.lobbyMessageId, si: so.sorciereId,
+    wv: so.wolfVictimId, wn: so.wolfVictimName,
+    po: so.potions,
+    t: so.targets.map((t) => [t.id, t.name]),
+    dl: so.deadline, rs: so.resolved,
+    ws: so.witchSaved, wk: so.witchKillTargetId,
+  }));
+}
+
+function decodeSorciereState(url: string): SorciereState | null {
+  try {
+    const b64 = url.split("/so/")[1];
+    if (!b64) return null;
+    const c = JSON.parse(atob(b64));
+    return {
+      gameNumber: c.g, guildId: c.gi, gameChannelId: c.gc,
+      sorciereThreadId: c.st, lobbyMessageId: c.lm, sorciereId: c.si,
+      wolfVictimId: c.wv, wolfVictimName: c.wn,
+      potions: c.po,
+      targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
+      deadline: c.dl, resolved: c.rs,
+      witchSaved: c.ws, witchKillTargetId: c.wk,
+    };
+  } catch { return null; }
+}
+
+function parseSorciereFromEmbed(message: any): SorciereState | null {
+  const embed = message.embeds?.[0];
+  if (!embed?.url?.includes("/so/")) return null;
+  return decodeSorciereState(embed.url);
+}
+
+function buildSorciereEmbed(so: SorciereState) {
+  const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
+
+  const buttons: any[] = [];
+  if (so.potions.life) {
+    buttons.push({
+      type: 2, style: 3,
+      label: "💚 Potion de Vie",
+      custom_id: `sorciere_life_${so.gameNumber}`,
+    });
+  }
+  if (so.potions.death) {
+    buttons.push({
+      type: 2, style: 4,
+      label: "💀 Potion de Mort",
+      custom_id: `sorciere_death_${so.gameNumber}`,
+    });
+  }
+  buttons.push({
+    type: 2, style: 2,
+    label: "⏭️ Passer",
+    custom_id: `sorciere_skip_${so.gameNumber}`,
+  });
+
+  return {
+    embeds: [{
+      title: `🧪 Sorcière — Partie #${so.gameNumber}`,
+      url: stateUrl,
+      description: [
+        `Les loups-garous ont choisi de dévorer **${so.wolfVictimName}** cette nuit.`,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        so.potions.life ? "💚 **Potion de Vie** — Sauvez la victime" : "~~💚 Potion de Vie~~ *(utilisée)*",
+        so.potions.death ? "💀 **Potion de Mort** — Éliminez quelqu'un" : "~~💀 Potion de Mort~~ *(utilisée)*",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        `⏰ Fin <t:${so.deadline}:R>`,
+      ].join("\n"),
+      color: EMBED_COLOR_PURPLE,
+      thumbnail: { url: getRoleImage("sorciere") },
+    }],
+    components: [{ type: 1, components: buttons }],
+  };
+}
+
+function buildSorciereTargetEmbed(so: SorciereState) {
+  const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
+
+  const buttonRows: any[] = [];
+  let currentRow: any[] = [];
+  for (const target of so.targets) {
+    if (target.id === so.sorciereId) continue; // can't poison yourself
+    currentRow.push({
+      type: 2, style: 4,
+      label: `☠️ ${target.name}`,
+      custom_id: `sorciere_target_${so.gameNumber}_${target.id}`,
+    });
+    if (currentRow.length === 5) {
+      buttonRows.push({ type: 1, components: currentRow });
+      currentRow = [];
+    }
+  }
+  if (currentRow.length > 0) {
+    buttonRows.push({ type: 1, components: currentRow });
+  }
+
+  return {
+    embeds: [{
+      title: `🧪 Potion de Mort — Partie #${so.gameNumber}`,
+      url: stateUrl,
+      description: [
+        "**Qui veux-tu empoisonner cette nuit?**",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        `⏰ Fin <t:${so.deadline}:R>`,
+      ].join("\n"),
+      color: EMBED_COLOR,
+      thumbnail: { url: getRoleImage("sorciere") },
+    }],
+    components: buttonRows,
+  };
+}
+
 function buildVoteEmbed(vote: VoteState) {
   const stateUrl = `https://garou.bot/v/${encodeVoteState(vote)}`;
 
@@ -1522,10 +1773,599 @@ function buildVoteEmbed(vote: VoteState) {
   };
 }
 
-async function startNightPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+// ── Cupidon State ────────────────────────────────────────────────────
+
+interface CupidonState {
+  gameNumber: number;
+  guildId: string;
+  gameChannelId: string;
+  lobbyMessageId: string;
+  cupidonId: string;
+  players: { id: string; name: string }[];
+  picks: string[];
+  deadline: number;
+  roles: Record<string, string>;
+  allPlayers: string[];
+}
+
+function encodeCupidonState(s: CupidonState): string {
+  return btoa(JSON.stringify({
+    g: s.gameNumber, gi: s.guildId, gc: s.gameChannelId, lm: s.lobbyMessageId,
+    cu: s.cupidonId, pl: s.players.map(p => [p.id, p.name]),
+    pk: s.picks, dl: s.deadline, r: s.roles, ap: s.allPlayers,
+  }));
+}
+
+function decodeCupidonState(url: string): CupidonState | null {
+  try {
+    const b64 = url.split("/cu/")[1];
+    if (!b64) return null;
+    const c = JSON.parse(atob(b64));
+    return {
+      gameNumber: c.g, guildId: c.gi, gameChannelId: c.gc, lobbyMessageId: c.lm,
+      cupidonId: c.cu,
+      players: (c.pl as [string, string][]).map(([id, name]) => ({ id, name })),
+      picks: c.pk ?? [], deadline: c.dl, roles: c.r, allPlayers: c.ap,
+    };
+  } catch { return null; }
+}
+
+function parseCupidonFromEmbed(message: any): CupidonState | null {
+  const embed = message.embeds?.[0];
+  if (!embed?.url?.includes("/cu/")) return null;
+  return decodeCupidonState(embed.url);
+}
+
+function buildCupidonEmbed(s: CupidonState) {
+  const stateUrl = `https://garou.bot/cu/${encodeCupidonState(s)}`;
+  const buttonRows: any[] = [];
+  let currentRow: any[] = [];
+  for (const p of s.players) {
+    const selected = s.picks.includes(p.id);
+    currentRow.push({
+      type: 2, style: selected ? 3 : 2,
+      label: `${selected ? "💘 " : ""}${p.name}`,
+      custom_id: `cupidon_pick_${s.gameNumber}_${p.id}`,
+    });
+    if (currentRow.length === 5) {
+      buttonRows.push({ type: 1, components: currentRow });
+      currentRow = [];
+    }
+  }
+  if (currentRow.length > 0) buttonRows.push({ type: 1, components: currentRow });
+
+  if (s.picks.length === 2) {
+    const names = s.picks.map(id => s.players.find(p => p.id === id)?.name ?? "?");
+    buttonRows.push({ type: 1, components: [{
+      type: 2, style: 1,
+      label: `✅ Confirmer: ${names[0]} & ${names[1]}`,
+      custom_id: `cupidon_confirm_${s.gameNumber}`,
+    }] });
+  }
+
+  return {
+    embeds: [{
+      title: `💘 Cupidon — Choisis le couple — Partie #${s.gameNumber}`,
+      url: stateUrl,
+      description: [
+        "**Lie deux joueurs par l'amour.**",
+        "Si l'un meurt, l'autre meurt aussi.",
+        "", "━━━━━━━━━━━━━━━━━━━━", "",
+        s.picks.length === 0 ? "*Choisis 2 joueurs...*"
+          : s.picks.length === 1 ? `💘 <@${s.picks[0]}> + *...?*`
+          : `💘 <@${s.picks[0]}> & <@${s.picks[1]}>`,
+        "", "━━━━━━━━━━━━━━━━━━━━", "",
+        `⏰ Temps restant <t:${s.deadline}:R>`,
+      ].join("\n"),
+      color: 0xe91e63,
+      thumbnail: { url: getRoleImage("cupidon") },
+    }],
+    components: buttonRows,
+  };
+}
+
+async function handleCupidonPick(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const s = parseCupidonFromEmbed(interaction.message);
+  if (!s) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (userId !== s.cupidonId) return json({ type: 4, data: { content: "❌ Seul Cupidon peut choisir.", flags: 64 } });
+  if (Math.floor(Date.now() / 1000) > s.deadline) return json({ type: 4, data: { content: "⏰ Le temps est écoulé!", flags: 64 } });
+
+  const customId: string = interaction.data?.custom_id || "";
+  const targetId = customId.replace(`cupidon_pick_${s.gameNumber}_`, "");
+
+  if (s.picks.includes(targetId)) {
+    s.picks = s.picks.filter(id => id !== targetId);
+  } else {
+    if (s.picks.length >= 2) s.picks.shift();
+    s.picks.push(targetId);
+  }
+
+  return json({ type: 7, data: buildCupidonEmbed(s) });
+}
+
+async function finalizeCupidonAndStartWolves(token: string, s: CupidonState, couple: [string, string], cupidonThreadId: string, ctx: ExecutionContext, env: Env) {
+  const names = couple.map(id => s.players.find(p => p.id === id)?.name ?? "?");
+
+  for (const playerId of couple) {
+    const otherName = playerId === couple[0] ? names[1] : names[0];
+    const otherId = playerId === couple[0] ? couple[1] : couple[0];
+    try {
+      const dm: any = await createDM(token, playerId);
+      await sendMessage(token, dm.id, {
+        embeds: [{
+          title: "💘 Tu as été touché(e) par la flèche de Cupidon!",
+          description: [
+            `Tu es lié(e) à **${otherName}** (<@${otherId}>).`,
+            "", "Si l'un de vous meurt, l'autre mourra aussi de chagrin.",
+            "", "*Protégez-vous mutuellement...*",
+          ].join("\n"),
+          color: 0xe91e63, thumbnail: { url: getRoleImage("cupidon") },
+        }],
+      });
+    } catch (err) { console.error(`Failed to DM couple member ${playerId}:`, err); }
+  }
+
+  try { await deleteChannel(token, cupidonThreadId); } catch {}
+
+  let game: GameState | null = null;
+  try {
+    const lobbyMsg: any = await getMessage(token, s.gameChannelId, s.lobbyMessageId);
+    game = parseGameFromEmbed(lobbyMsg);
+  } catch {}
+  if (!game) {
+    game = {
+      gameNumber: s.gameNumber, guildId: s.guildId, gameChannelId: s.gameChannelId,
+      lobbyMessageId: s.lobbyMessageId, maxPlayers: s.allPlayers.length,
+      players: s.allPlayers, roles: s.roles, couple, nightCount: 1, dead: [],
+      creatorId: s.allPlayers[0]!, creatorName: "",
+    };
+  } else {
+    game.couple = couple;
+  }
+
+  if (game.lobbyMessageId) {
+    const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+    try {
+      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+      const embed = msg.embeds?.[0];
+      if (embed) {
+        embed.url = stateUrl;
+        await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
+      }
+    } catch {}
+  }
+
+  // Chain to voyante phase (which chains to wolf_phase)
+  triggerPhase(ctx, env, "voyante_phase", { game });
+}
+
+async function handleCupidonConfirm(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const s = parseCupidonFromEmbed(interaction.message);
+  if (!s) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (userId !== s.cupidonId) return json({ type: 4, data: { content: "❌ Seul Cupidon peut confirmer.", flags: 64 } });
+  if (s.picks.length !== 2) return json({ type: 4, data: { content: "❌ Choisis exactement 2 joueurs.", flags: 64 } });
+
+  const token = env.DISCORD_BOT_TOKEN;
+  const couple = s.picks as [string, string];
+  const names = couple.map(id => s.players.find(p => p.id === id)?.name ?? "?");
+
+  const ackResponse = json({ type: 7, data: {
+    embeds: [{
+      title: `💘 Le couple est formé! — Partie #${s.gameNumber}`,
+      url: `https://garou.bot/cu/${encodeCupidonState(s)}`,
+      description: `**${names[0]}** & **${names[1]}** sont liés par l'amour.\n\n*Si l'un meurt, l'autre mourra de chagrin.*`,
+      color: 0xe91e63, thumbnail: { url: getRoleImage("cupidon") },
+    }],
+    components: [],
+  } });
+
+  const cupidonThreadId = interaction.channel_id;
+  ctx.waitUntil(finalizeCupidonAndStartWolves(token, s, couple, cupidonThreadId, ctx, env));
+
+  return ackResponse;
+}
+
+const CUPIDON_TIMEOUT_SECONDS = 60;
+
+async function phaseCupidonTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { cupidonMessageId, cupidonThreadId } = data;
+  if (!cupidonMessageId || !cupidonThreadId) return;
+
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await sleep(5000);
+    try {
+      const msg: any = await getMessage(token, cupidonThreadId, cupidonMessageId);
+      if (!msg.components?.length) return;
+      const s = parseCupidonFromEmbed(msg);
+      if (!s) return;
+      if (Date.now() / 1000 >= s.deadline) {
+        const available = s.players.filter(p => p.id !== s.cupidonId);
+        const shuffled = [...available].sort(() => Math.random() - 0.5);
+        const couple: [string, string] = [shuffled[0]!.id, shuffled[1]!.id];
+        const names = couple.map(id => s.players.find(p => p.id === id)?.name ?? "?");
+
+        await editMessage(token, cupidonThreadId, cupidonMessageId, {
+          embeds: [{
+            title: `💘 Temps écoulé! Couple aléatoire — Partie #${s.gameNumber}`,
+            url: `https://garou.bot/cu/${encodeCupidonState(s)}`,
+            description: `**${names[0]}** & **${names[1]}** sont liés par l'amour.\n\n*Cupidon n'a pas choisi à temps...*`,
+            color: 0xe91e63,
+          }],
+          components: [],
+        });
+
+        await finalizeCupidonAndStartWolves(token, s, couple, cupidonThreadId, ctx, env);
+        return;
+      }
+    } catch { return; }
+  }
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "cupidon_timer", cupidonMessageId, cupidonThreadId }),
+    }).catch(err => console.error("Cupidon timer re-trigger failed:", err))
+  );
+}
+
+// ── Chasseur State ──────────────────────────────────────────────────
+
+interface ChasseurState {
+  gameNumber: number;
+  guildId: string;
+  gameChannelId: string;
+  lobbyMessageId: string;
+  chasseurId: string;
+  targets: { id: string; name: string }[];
+  deadline: number;
+  roles: Record<string, string>;
+  allPlayers: string[];
+  couple?: [string, string];
+  dead: string[];
+}
+
+function encodeChasseurState(s: ChasseurState): string {
+  return btoa(JSON.stringify({
+    g: s.gameNumber, gi: s.guildId, gc: s.gameChannelId, lm: s.lobbyMessageId,
+    ch: s.chasseurId, t: s.targets.map(t => [t.id, t.name]),
+    dl: s.deadline, r: s.roles, ap: s.allPlayers, cp: s.couple, d: s.dead,
+  }));
+}
+
+function decodeChasseurState(url: string): ChasseurState | null {
+  try {
+    const b64 = url.split("/hs/")[1];
+    if (!b64) return null;
+    const c = JSON.parse(atob(b64));
+    return {
+      gameNumber: c.g, guildId: c.gi, gameChannelId: c.gc, lobbyMessageId: c.lm,
+      chasseurId: c.ch,
+      targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
+      deadline: c.dl, roles: c.r, allPlayers: c.ap, couple: c.cp, dead: c.d ?? [],
+    };
+  } catch { return null; }
+}
+
+function parseChasseurFromEmbed(message: any): ChasseurState | null {
+  const embed = message.embeds?.[0];
+  if (!embed?.url?.includes("/hs/")) return null;
+  return decodeChasseurState(embed.url);
+}
+
+function buildChasseurEmbed(s: ChasseurState) {
+  const stateUrl = `https://garou.bot/hs/${encodeChasseurState(s)}`;
+  const buttonRows: any[] = [];
+  let currentRow: any[] = [];
+  for (const t of s.targets) {
+    currentRow.push({
+      type: 2, style: 4,
+      label: `🎯 ${t.name}`,
+      custom_id: `chasseur_shoot_${s.gameNumber}_${t.id}`,
+    });
+    if (currentRow.length === 5) {
+      buttonRows.push({ type: 1, components: currentRow });
+      currentRow = [];
+    }
+  }
+  if (currentRow.length > 0) buttonRows.push({ type: 1, components: currentRow });
+
+  return {
+    embeds: [{
+      title: `🏹 Chasseur — Dernier tir! — Partie #${s.gameNumber}`,
+      url: stateUrl,
+      description: [
+        "**Tu meurs... mais tu emportes quelqu'un avec toi!**",
+        "", "━━━━━━━━━━━━━━━━━━━━", "",
+        "Choisis ta dernière cible.",
+        "", "━━━━━━━━━━━━━━━━━━━━", "",
+        `⏰ Temps restant <t:${s.deadline}:R>`,
+      ].join("\n"),
+      color: 0xe67e22, thumbnail: { url: getRoleImage("chasseur") },
+    }],
+    components: buttonRows,
+  };
+}
+
+const CHASSEUR_TIMEOUT_SECONDS = 30;
+
+async function triggerChasseurShoot(token: string, game: GameState, chasseurId: string, ctx: ExecutionContext, env: Env) {
+  const dead = game.dead ?? [];
+  const livingTargets = game.players.filter(id => !dead.includes(id) && id !== chasseurId);
+  const targets = await Promise.all(
+    livingTargets.map(async (id) => {
+      const member: any = await getGuildMember(token, game.guildId, id);
+      return { id, name: member.nick || member.user.global_name || member.user.username };
+    })
+  );
+  if (targets.length === 0) return;
+
+  const deadline = Math.floor(Date.now() / 1000) + CHASSEUR_TIMEOUT_SECONDS;
+  const chasseurState: ChasseurState = {
+    gameNumber: game.gameNumber, guildId: game.guildId,
+    gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId!,
+    chasseurId, targets, deadline, roles: game.roles ?? {},
+    allPlayers: game.players, couple: game.couple, dead: [...dead],
+  };
+
+  const chasseurMsg: any = await sendMessage(token, game.gameChannelId, buildChasseurEmbed(chasseurState));
+
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "chasseur_timer", chasseurMessageId: chasseurMsg.id, gameChannelId: game.gameChannelId }),
+    }).catch(err => console.error("Chasseur timer trigger failed:", err))
+  );
+}
+
+async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const s = parseChasseurFromEmbed(interaction.message);
+  if (!s) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (userId !== s.chasseurId) return json({ type: 4, data: { content: "❌ Seul le chasseur peut tirer.", flags: 64 } });
+
+  const customId: string = interaction.data?.custom_id || "";
+  const targetId = customId.replace(`chasseur_shoot_${s.gameNumber}_`, "");
+  const target = s.targets.find(t => t.id === targetId);
+  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+
+  const token = env.DISCORD_BOT_TOKEN;
+
+  const ackResponse = json({ type: 7, data: {
+    embeds: [{
+      title: `🏹 Le chasseur tire! — Partie #${s.gameNumber}`,
+      url: `https://garou.bot/hs/${encodeChasseurState(s)}`,
+      description: `**${target.name}** (<@${target.id}>) est abattu(e) par le chasseur!`,
+      color: 0xe67e22, thumbnail: { url: getRoleImage("chasseur") },
+    }],
+    components: [],
+  } });
+
+  ctx.waitUntil((async () => {
+    await sendMessage(token, s.gameChannelId, {
+      embeds: [{
+        title: "🏹 Le chasseur tire une dernière flèche!",
+        description: `Dans un dernier souffle, le chasseur abat **${target.name}** (<@${target.id}>)!`,
+        color: 0xe67e22, image: { url: SCENE_IMAGES.snipe_reveal },
+      }],
+    });
+
+    let game: GameState | null = null;
+    try {
+      const lobbyMsg: any = await getMessage(token, s.gameChannelId, s.lobbyMessageId);
+      game = parseGameFromEmbed(lobbyMsg);
+    } catch {}
+    if (!game) return;
+    if (!game.dead) game.dead = [];
+    game.dead.push(target.id);
+
+    try {
+      await setChannelPermission(token, s.gameChannelId, target.id, {
+        allow: String(1 << 10), deny: String(1 << 11), type: 1,
+      });
+    } catch {}
+
+    if (game.couple && game.couple.includes(target.id)) {
+      const partnerId = target.id === game.couple[0] ? game.couple[1] : game.couple[0];
+      if (!game.dead.includes(partnerId)) {
+        game.dead.push(partnerId);
+        try { await setChannelPermission(token, s.gameChannelId, partnerId, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+        const pm: any = await getGuildMember(token, game.guildId, partnerId).catch(() => null);
+        const pName = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
+        await sendMessage(token, s.gameChannelId, {
+          embeds: [{ title: "💔 Le couple est brisé...", description: `**${pName}** (<@${partnerId}>) meurt de chagrin.`, color: 0xe91e63 }],
+        });
+      }
+    }
+
+    if (game.lobbyMessageId) {
+      const su = `https://garou.bot/s/${encodeState(game)}`;
+      try {
+        const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+        const emb = msg.embeds?.[0];
+        if (emb) { emb.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [emb], components: msg.components ?? [] }); }
+      } catch {}
+    }
+
+    const wr = checkWinCondition(game);
+    if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); }
+  })());
+
+  return ackResponse;
+}
+
+async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { chasseurMessageId, gameChannelId } = data;
+  if (!chasseurMessageId || !gameChannelId) return;
+
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await sleep(5000);
+    try {
+      const msg: any = await getMessage(token, gameChannelId, chasseurMessageId);
+      if (!msg.components?.length) return;
+      const s = parseChasseurFromEmbed(msg);
+      if (!s) return;
+      if (Date.now() / 1000 >= s.deadline) {
+        const target = s.targets[Math.floor(Math.random() * s.targets.length)]!;
+        await editMessage(token, gameChannelId, chasseurMessageId, {
+          embeds: [{
+            title: `🏹 Le chasseur tire! — Partie #${s.gameNumber}`,
+            url: `https://garou.bot/hs/${encodeChasseurState(s)}`,
+            description: `Temps écoulé... **${target.name}** est abattu(e) au hasard!`,
+            color: 0xe67e22,
+          }],
+          components: [],
+        });
+        await sendMessage(token, s.gameChannelId, {
+          embeds: [{
+            title: "🏹 Le chasseur tire une dernière flèche!",
+            description: `Dans un dernier souffle, le chasseur abat **${target.name}** (<@${target.id}>)!`,
+            color: 0xe67e22, image: { url: SCENE_IMAGES.snipe_reveal },
+          }],
+        });
+
+        let game: GameState | null = null;
+        try { const lm: any = await getMessage(token, s.gameChannelId, s.lobbyMessageId); game = parseGameFromEmbed(lm); } catch {}
+        if (!game) return;
+        if (!game.dead) game.dead = [];
+        game.dead.push(target.id);
+        try { await setChannelPermission(token, s.gameChannelId, target.id, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+
+        if (game.couple && game.couple.includes(target.id)) {
+          const pid = target.id === game.couple[0] ? game.couple[1] : game.couple[0];
+          if (!game.dead.includes(pid)) {
+            game.dead.push(pid);
+            try { await setChannelPermission(token, s.gameChannelId, pid, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+            const pm: any = await getGuildMember(token, game.guildId, pid).catch(() => null);
+            const pn = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
+            await sendMessage(token, s.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: `**${pn}** (<@${pid}>) meurt de chagrin.`, color: 0xe91e63 }] });
+          }
+        }
+
+        if (game.lobbyMessageId) {
+          const su = `https://garou.bot/s/${encodeState(game)}`;
+          try { const m: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId); const e = m.embeds?.[0]; if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); } } catch {}
+        }
+        const wr = checkWinCondition(game);
+        if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); }
+        return;
+      }
+    } catch { return; }
+  }
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "chasseur_timer", chasseurMessageId, gameChannelId }),
+    }).catch(err => console.error("Chasseur timer re-trigger failed:", err))
+  );
+}
+
+// ── Wolf Phase (extracted for reuse by cupidon flow) ────────────────
+
+async function startWolfPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.roles) return;
 
+  // Show wolf wake-up animation in game channel
+  if (game.lobbyMessageId) {
+    const nightStateUrl = `https://garou.bot/s/${encodeState(game)}`;
+    await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+      embeds: [{
+        title: `🐺 Les loups-garous se réveillent... — Partie #${game.gameNumber}`,
+        url: nightStateUrl,
+        description: [
+          "*Des ombres se faufilent dans la nuit...*",
+          "*Les loups-garous ouvrent les yeux et choisissent leur victime.*",
+          "",
+          `⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour décider.`,
+        ].join("\n"),
+        color: EMBED_COLOR_NIGHT,
+        image: { url: getRoleImage("loup") },
+      }],
+      components: [],
+    });
+  }
+
   const dead = game.dead ?? [];
+  const livingPlayers = game.players.filter(id => !dead.includes(id));
+  const wolfIds = livingPlayers.filter(id => {
+    const r = game.roles![id];
+    return r === "loup" || r === "loup_blanc";
+  });
+  const targetIds = livingPlayers.filter(id => !wolfIds.includes(id));
+
+  const targets = await Promise.all(
+    targetIds.map(async (id) => {
+      const member: any = await getGuildMember(token, game.guildId, id);
+      return { id, name: member.nick || member.user.global_name || member.user.username };
+    })
+  );
+
+  const deadline = Math.floor(Date.now() / 1000) + NIGHT_VOTE_SECONDS;
+
+  const voteState: VoteState = {
+    gameNumber: game.gameNumber, guildId: game.guildId,
+    gameChannelId: game.gameChannelId, wolfChannelId: "",
+    lobbyMessageId: game.lobbyMessageId!, wolves: wolfIds,
+    targets, votes: {}, deadline,
+    petiteFilleThreadId: game.petiteFilleThreadId,
+    couple: game.couple, allRoles: game.roles, allPlayers: livingPlayers,
+  };
+
+  const wolfThread: any = await createThread(token, game.gameChannelId, {
+    name: "🐺 Tanière", type: 12, auto_archive_duration: 1440,
+  });
+  game.wolfChannelId = wolfThread.id;
+  voteState.wolfChannelId = wolfThread.id;
+
+  for (const wolfId of wolfIds) {
+    await addThreadMember(token, wolfThread.id, wolfId);
+  }
+
+  // If petite fille is alive, create spy thread
+  const petiteFilleId = livingPlayers.find(id => game.roles![id] === "petite_fille");
+  if (petiteFilleId) {
+    const spyThread: any = await createThread(token, game.gameChannelId, {
+      name: "👧 Espionnage", type: 12, auto_archive_duration: 1440,
+    });
+    game.petiteFilleThreadId = spyThread.id;
+    voteState.petiteFilleThreadId = spyThread.id;
+
+    await addThreadMember(token, spyThread.id, petiteFilleId);
+    await sendMessage(token, spyThread.id, {
+      embeds: [{
+        title: "👧 Petite Fille — Espionnage nocturne",
+        description: "Tu espionnes les loups-garous cette nuit...\n\nTu verras leurs votes apparaître ici en temps réel.\nIls ne savent pas que tu les observes.\n\n*Fais attention à ne pas te faire repérer...*",
+        color: 0x9b59b6, thumbnail: { url: getRoleImage("petite_fille") },
+      }],
+    });
+  }
+
+  const wolfMentions = wolfIds.map(id => `<@${id}>`).join(" ");
+  await sendMessage(token, wolfThread.id, {
+    content: `${wolfMentions}\n\n🌙 **La nuit est tombée!** Choisissez votre victime ci-dessous.`,
+  });
+  const voteMsg: any = await sendMessage(token, wolfThread.id, buildVoteEmbed(voteState));
+
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "night_vote_timer", voteMessageId: voteMsg.id, wolfChannelId: wolfThread.id }),
+    }).catch(err => console.error("Vote timer trigger failed:", err))
+  );
+}
+
+// ── Night Phase Orchestrator ────────────────────────────────────────
+// Turn order: Night 1 → Cupidon picks couple → Voyante → Wolves
+//             Night 2+ → Voyante → Wolves directly
+
+async function startNightPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  if (!game.roles) return;
 
   // Increment night count and persist
   game.nightCount = (game.nightCount ?? 0) + 1;
@@ -1541,11 +2381,71 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
     } catch {}
   }
 
-  const wolfIds = Object.entries(game.roles)
-    .filter(([id, r]) => (r === "loup" || r === "loup_blanc") && !dead.includes(id))
-    .map(([id]) => id);
-  const targetIds = game.players.filter((id) => !wolfIds.includes(id) && !dead.includes(id));
+  // Night 1 + cupidon alive → cupidon picks couple first, then chains to voyante → wolves
+  if (game.nightCount === 1) {
+    const dead = game.dead ?? [];
+    const cupidonEntry = Object.entries(game.roles).find(([id, r]) => r === "cupidon" && !dead.includes(id));
+    if (cupidonEntry) {
+      const cupidonId = cupidonEntry[0];
+      const livingPlayers = game.players.filter(id => !dead.includes(id));
 
+      const playerTargets = await Promise.all(
+        livingPlayers.filter(id => id !== cupidonId).map(async (id) => {
+          const member: any = await getGuildMember(token, game.guildId, id);
+          return { id, name: member.nick || member.user.global_name || member.user.username };
+        })
+      );
+
+      const deadline = Math.floor(Date.now() / 1000) + CUPIDON_TIMEOUT_SECONDS;
+
+      const cupidonThread: any = await createThread(token, game.gameChannelId, {
+        name: "\u{1F498} Cupidon", type: 12, auto_archive_duration: 1440,
+      });
+      await addThreadMember(token, cupidonThread.id, cupidonId);
+
+      const cupidonState: CupidonState = {
+        gameNumber: game.gameNumber, guildId: game.guildId,
+        gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId!,
+        cupidonId, players: playerTargets, picks: [], deadline,
+        roles: game.roles, allPlayers: game.players,
+      };
+
+      await sendMessage(token, cupidonThread.id, {
+        content: `<@${cupidonId}>\n\n\u{1F498} **Cupidon se r\u00e9veille!** Choisis deux joueurs \u00e0 lier par l'amour.`,
+      });
+      const cupidonMsg: any = await sendMessage(token, cupidonThread.id, buildCupidonEmbed(cupidonState));
+
+      ctx.waitUntil(
+        fetch(WORKER_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+          body: JSON.stringify({ phase: "cupidon_timer", cupidonMessageId: cupidonMsg.id, cupidonThreadId: cupidonThread.id }),
+        }).catch(err => console.error("Cupidon timer trigger failed:", err))
+      );
+
+      return;
+    }
+  }
+
+  // No cupidon (or not night 1) → go to voyante phase which chains to wolf_phase
+  triggerPhase(ctx, env, "voyante_phase", { game });
+}
+
+// ── Voyante Phase ────────────────────────────────────────────────────
+
+async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  if (!game.roles) { triggerPhase(ctx, env, "wolf_phase", { game }); return; }
+  const dead = game.dead ?? [];
+
+  const voyanteEntry = Object.entries(game.roles).find(([id, r]) => r === "voyante" && !dead.includes(id));
+  if (!voyanteEntry) {
+    triggerPhase(ctx, env, "wolf_phase", { game });
+    return;
+  }
+  const voyanteId = voyanteEntry[0];
+
+  // Targets = all living players except voyante
+  const targetIds = game.players.filter((id) => id !== voyanteId && !dead.includes(id));
   const targets = await Promise.all(
     targetIds.map(async (id) => {
       const member: any = await getGuildMember(token, game.guildId, id);
@@ -1553,49 +2453,130 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
     })
   );
 
-  const deadline = Math.floor(Date.now() / 1000) + NIGHT_VOTE_SECONDS;
+  const deadline = Math.floor(Date.now() / 1000) + VOYANTE_TIMEOUT_SECONDS;
 
-  const voteState: VoteState = {
+  // Create private thread for voyante
+  const voyanteThread: any = await createThread(token, game.gameChannelId, {
+    name: "🔮 Vision",
+    type: 12,
+    auto_archive_duration: 1440,
+  });
+
+  await addThreadMember(token, voyanteThread.id, voyanteId);
+
+  const vyState: VoyanteState = {
     gameNumber: game.gameNumber,
     guildId: game.guildId,
     gameChannelId: game.gameChannelId,
-    wolfChannelId: game.wolfChannelId,
+    voyanteThreadId: voyanteThread.id,
     lobbyMessageId: game.lobbyMessageId!,
-    wolves: wolfIds,
+    voyanteId,
     targets,
-    votes: {},
     deadline,
+    allRoles: game.roles,
   };
 
-  // Create a fresh private thread for this night
-  const wolfThread: any = await createThread(token, game.gameChannelId, {
-    name: "🐺 Tanière",
-    type: 12, // GUILD_PRIVATE_THREAD
-    auto_archive_duration: 1440,
+  await sendMessage(token, voyanteThread.id, {
+    content: `<@${voyanteId}>\n\n🔮 **La Voyante se réveille!** Choisis un joueur à espionner.`,
   });
-  game.wolfChannelId = wolfThread.id;
-  voteState.wolfChannelId = wolfThread.id;
+  const vyMsg: any = await sendMessage(token, voyanteThread.id, buildVoyanteEmbed(vyState));
 
-  // Add all wolves to the thread
-  for (const wolfId of wolfIds) {
-    await addThreadMember(token, wolfThread.id, wolfId);
-  }
-
-  // Tag wolves and send vote embed in wolf thread
-  const wolfMentions = wolfIds.map((id) => `<@${id}>`).join(" ");
-  await sendMessage(token, wolfThread.id, {
-    content: `${wolfMentions}\n\n🌙 **La nuit est tombée!** Choisissez votre victime ci-dessous.`,
-  });
-  const voteMsg: any = await sendMessage(token, wolfThread.id, buildVoteEmbed(voteState));
-
-  // Schedule vote timer via self-invocation (avoids 90s sleep killing the worker)
+  // Schedule timer
   ctx.waitUntil(
     fetch(WORKER_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "night_vote_timer", voteMessageId: voteMsg.id, wolfChannelId: game.wolfChannelId }),
-    }).catch((err) => console.error("Vote timer trigger failed:", err))
+      body: JSON.stringify({ phase: "voyante_timer", voyanteMessageId: vyMsg.id, voyanteThreadId: voyanteThread.id, game }),
+    }).catch((err) => console.error("Voyante timer trigger failed:", err))
   );
+}
+
+async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { voyanteMessageId, voyanteThreadId, game } = data;
+  if (!voyanteMessageId || !voyanteThreadId) return;
+
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await sleep(5000);
+    try {
+      const msg: any = await getMessage(token, voyanteThreadId, voyanteMessageId);
+      if (!msg.components?.length) {
+        // Resolved — delete thread, move to wolf phase
+        try { await deleteChannel(token, voyanteThreadId); } catch {}
+        triggerPhase(ctx, env, "wolf_phase", { game });
+        return;
+      }
+      const vy = parseVoyanteFromEmbed(msg);
+      if (!vy) return;
+      if (Date.now() / 1000 >= vy.deadline) {
+        // Timeout — remove buttons, delete thread, move on
+        await editMessage(token, voyanteThreadId, voyanteMessageId, {
+          embeds: [{
+            title: `🔮 Vision de la Voyante — Temps écoulé`,
+            description: "La Voyante n'a pas choisi à temps.",
+            color: EMBED_COLOR_PURPLE,
+            thumbnail: { url: getRoleImage("voyante") },
+          }],
+          components: [],
+        });
+        await sleep(2000);
+        try { await deleteChannel(token, voyanteThreadId); } catch {}
+        triggerPhase(ctx, env, "wolf_phase", { game });
+        return;
+      }
+    } catch { return; }
+  }
+  // Re-invoke
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "voyante_timer", voyanteMessageId, voyanteThreadId, game }),
+    }).catch((err) => console.error("Voyante timer re-trigger failed:", err))
+  );
+}
+
+async function handleVoyanteSee(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur.", flags: 64 } });
+
+  const vy = parseVoyanteFromEmbed(interaction.message);
+  if (!vy) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (userId !== vy.voyanteId) return json({ type: 4, data: { content: "❌ Seule la Voyante peut utiliser ce pouvoir.", flags: 64 } });
+
+  const customId: string = interaction.data?.custom_id || "";
+  const targetId = customId.replace(`voyante_see_${vy.gameNumber}_`, "");
+  const target = vy.targets.find((t) => t.id === targetId);
+  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+
+  const roleKey = vy.allRoles[targetId] ?? "villageois";
+  const role = ROLES[roleKey] ?? ROLES.villageois!;
+
+  // Mark resolved
+  vy.resolved = true;
+  const stateUrl = `https://garou.bot/vy/${encodeVoyanteState(vy)}`;
+
+  return json({
+    type: 7,
+    data: {
+      embeds: [{
+        title: `🔮 Vision de la Voyante — Partie #${vy.gameNumber}`,
+        url: stateUrl,
+        description: [
+          `Tu as espionné **${target.name}**...`,
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+          "",
+          `${role.emoji} **${target.name}** est **${role.name}**!`,
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+        ].join("\n"),
+        color: EMBED_COLOR_PURPLE,
+        image: { url: getRoleImage(roleKey) },
+      }],
+      components: [],
+    },
+  });
 }
 
 // ── Phase: night_vote_timer — poll until deadline then auto-resolve ──
@@ -1789,89 +2770,22 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
   // Delete wolf thread — a new one will be created next night
   try { await deleteChannel(token, vote.wolfChannelId); } catch {}
 
-  // ── Eliminate victim: update game state ──
-  let game: GameState | null = null;
-  if (vote.lobbyMessageId && vote.gameChannelId) {
-    try {
-      const lobbyMsg: any = await getMessage(token, vote.gameChannelId, vote.lobbyMessageId);
-      game = parseGameFromEmbed(lobbyMsg);
-    } catch {}
-  }
-
-  if (game) {
-    if (!game.dead) game.dead = [];
-    game.dead.push(victimId);
-
-    // Set victim as spectator (can see but not send messages)
-    try {
-      await setChannelPermission(token, vote.gameChannelId, victimId, {
-        allow: String(1 << 10), // VIEW_CHANNEL
-        deny: String(1 << 11), // SEND_MESSAGES
-        type: 1,
-      });
-    } catch {}
-
-    // Persist updated state to lobby embed
-    if (game.lobbyMessageId) {
-      const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+  // Recover game state and chain to post_wolf
+  if (ctx && env) {
+    let game: GameState | null = null;
+    if (vote.lobbyMessageId && vote.gameChannelId) {
       try {
-        const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
-        const embed = msg.embeds?.[0];
-        if (embed) {
-          embed.url = stateUrl;
-          await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
-        }
+        const lobbyMsg: any = await getMessage(token, vote.gameChannelId, vote.lobbyMessageId);
+        game = parseGameFromEmbed(lobbyMsg);
       } catch {}
     }
-
-    // Check win conditions
-    if (env) {
-      const winResult = checkWinCondition(game);
-      if (winResult) {
-        // Announce death first, then victory
-        await sendMessage(token, vote.gameChannelId, {
-          embeds: [{
-            title: "☀️ Le jour se lève...",
-            description: [
-              `Les villageois découvrent avec horreur que **${victim.name}** (<@${victim.id}>) a été dévoré(e) par les loups-garous cette nuit.`,
-              "",
-              "*Un moment de silence pour la victime...*",
-            ].join("\n"),
-            color: EMBED_COLOR,
-            image: { url: SCENE_IMAGES.dawn_breaks },
-          }],
-        });
-        await sleep(3000);
-        await announceVictory(token, game, winResult, env);
-        return;
-      }
-    }
-
-    // Trigger loup_blanc vote on even nights if loup_blanc is alive
-    if (ctx && env && game.nightCount && game.nightCount % 2 === 0) {
-      const dead = game.dead;
-      const loupBlancId = Object.entries(game.roles ?? {}).find(([id, r]) => r === "loup_blanc" && !dead.includes(id));
-      if (loupBlancId) {
-        // Announce death first, then trigger loup_blanc phase
-        await sendMessage(token, vote.gameChannelId, {
-          embeds: [{
-            title: "☀️ Le jour se lève...",
-            description: [
-              `Les villageois découvrent avec horreur que **${victim.name}** (<@${victim.id}>) a été dévoré(e) par les loups-garous cette nuit.`,
-              "",
-              "*Mais la nuit n'est pas encore terminée pour tout le monde...*",
-            ].join("\n"),
-            color: EMBED_COLOR,
-            image: { url: SCENE_IMAGES.dawn_breaks },
-          }],
-        });
-        triggerPhase(ctx, env, "loup_blanc_vote", game);
-        return;
-      }
+    if (game) {
+      triggerPhase(ctx, env, "post_wolf", { game, _wolfVictimId: victimId, _wolfVictimName: victim.name });
+      return;
     }
   }
 
-  // Announce in game channel (default path when no game state recovered or no special conditions)
+  // Fallback: announce death directly if no ctx/env (should not happen in practice)
   await sendMessage(token, vote.gameChannelId, {
     embeds: [{
       title: "☀️ Le jour se lève...",
@@ -1883,6 +2797,416 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
       color: EMBED_COLOR,
       image: { url: SCENE_IMAGES.dawn_breaks },
     }],
+  });
+}
+
+// ── Post-Wolf Routing ────────────────────────────────────────────────
+
+async function phasePostWolf(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { game, _wolfVictimId, _wolfVictimName } = data as { game: GameState; _wolfVictimId: string; _wolfVictimName: string };
+  if (!game) return;
+
+  const dead = game.dead ?? [];
+
+  // Check if sorciere is alive and has any potions
+  const sorciereEntry = Object.entries(game.roles ?? {}).find(([id, r]) => r === "sorciere" && !dead.includes(id));
+  const potions = game.witchPotions ?? { life: false, death: false };
+  const hasPotions = potions.life || potions.death;
+
+  if (sorciereEntry && hasPotions) {
+    triggerPhase(ctx, env, "sorciere_phase", { game, _wolfVictimId, _wolfVictimName });
+  } else {
+    triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false, _witchKillId: undefined });
+  }
+}
+
+// ── Dawn Phase ───────────────────────────────────────────────────────
+
+async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { game, _wolfVictimId, _wolfVictimName, _witchSaved, _witchKillId } = data as {
+    game: GameState; _wolfVictimId: string; _wolfVictimName: string;
+    _witchSaved?: boolean; _witchKillId?: string;
+  };
+  if (!game) return;
+
+  if (!game.dead) game.dead = [];
+  const deaths: { id: string; name: string; cause: string }[] = [];
+
+  // Wolf kill (unless witch saved)
+  if (!_witchSaved && _wolfVictimId) {
+    if (!game.dead.includes(_wolfVictimId)) {
+      game.dead.push(_wolfVictimId);
+      deaths.push({ id: _wolfVictimId, name: _wolfVictimName, cause: "dévoré(e) par les loups-garous" });
+      try {
+        await setChannelPermission(token, game.gameChannelId, _wolfVictimId, {
+          allow: String(1 << 10), deny: String(1 << 11), type: 1,
+        });
+      } catch {}
+    }
+  }
+
+  // Witch kill
+  if (_witchKillId) {
+    if (!game.dead.includes(_witchKillId)) {
+      game.dead.push(_witchKillId);
+      let killName = _witchKillId;
+      try {
+        const member: any = await getGuildMember(token, game.guildId, _witchKillId);
+        killName = member.nick || member.user.global_name || member.user.username;
+      } catch {}
+      deaths.push({ id: _witchKillId, name: killName, cause: "empoisonné(e) pendant la nuit" });
+      try {
+        await setChannelPermission(token, game.gameChannelId, _witchKillId, {
+          allow: String(1 << 10), deny: String(1 << 11), type: 1,
+        });
+      } catch {}
+    }
+  }
+
+  // Couple death chain — if any dead player is in the couple, the partner dies too
+  if (game.couple) {
+    for (const d of [...deaths]) {
+      if (game.couple.includes(d.id)) {
+        const partnerId = d.id === game.couple[0] ? game.couple[1] : game.couple[0];
+        if (!game.dead.includes(partnerId)) {
+          game.dead.push(partnerId);
+          let partnerName = "?";
+          try {
+            const pm: any = await getGuildMember(token, game.guildId, partnerId);
+            partnerName = pm.nick || pm.user.global_name || pm.user.username;
+          } catch {}
+          deaths.push({ id: partnerId, name: partnerName, cause: "mort(e) de chagrin (couple 💔)" });
+          try {
+            await setChannelPermission(token, game.gameChannelId, partnerId, {
+              allow: String(1 << 10), deny: String(1 << 11), type: 1,
+            });
+          } catch {}
+        }
+      }
+    }
+  }
+
+  // Update witch potions: consume used potions
+  if (_witchSaved && game.witchPotions) {
+    game.witchPotions.life = false;
+  }
+  if (_witchKillId && game.witchPotions) {
+    game.witchPotions.death = false;
+  }
+
+  // Clean up petite fille spy thread if it exists
+  if (game.petiteFilleThreadId) {
+    try { await deleteChannel(token, game.petiteFilleThreadId); } catch {}
+    game.petiteFilleThreadId = undefined;
+  }
+
+  // Persist updated state to lobby embed
+  if (game.lobbyMessageId) {
+    const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+    try {
+      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+      const embed = msg.embeds?.[0];
+      if (embed) {
+        embed.url = stateUrl;
+        await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
+      }
+    } catch {}
+  }
+
+  // Check win conditions first
+  const winResult = checkWinCondition(game);
+
+  // Announce deaths
+  if (deaths.length === 0) {
+    await sendMessage(token, game.gameChannelId, {
+      embeds: [{
+        title: "☀️ Le jour se lève...",
+        description: [
+          "Les villageois se réveillent et... **personne n'est mort cette nuit!** 🎉",
+          "",
+          "*La sorcière a veillé sur le village...*",
+        ].join("\n"),
+        color: EMBED_COLOR_GREEN,
+        image: { url: SCENE_IMAGES.dawn_breaks },
+      }],
+    });
+  } else if (deaths.length === 1) {
+    const d = deaths[0]!;
+    await sendMessage(token, game.gameChannelId, {
+      embeds: [{
+        title: "☀️ Le jour se lève...",
+        description: [
+          `Les villageois découvrent avec horreur que **${d.name}** (<@${d.id}>) a été ${d.cause} cette nuit.`,
+          "",
+          "*Un moment de silence pour la victime...*",
+        ].join("\n"),
+        color: EMBED_COLOR,
+        image: { url: SCENE_IMAGES.dawn_breaks },
+      }],
+    });
+  } else {
+    const deathLines = deaths.map((d) => `💀 **${d.name}** (<@${d.id}>) — ${d.cause}`);
+    await sendMessage(token, game.gameChannelId, {
+      embeds: [{
+        title: "☀️ Le jour se lève... Double meurtre!",
+        description: [
+          "Les villageois découvrent avec horreur que **deux personnes** sont mortes cette nuit!",
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+          "",
+          ...deathLines,
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+          "",
+          "*Un moment de silence pour les victimes...*",
+        ].join("\n"),
+        color: EMBED_COLOR,
+        image: { url: SCENE_IMAGES.dawn_breaks },
+      }],
+    });
+  }
+
+  // Check if any dead player is a chasseur → trigger their last shot
+  for (const d of deaths) {
+    if (game.roles?.[d.id] === "chasseur") {
+      await sleep(2000);
+      await triggerChasseurShoot(token, game, d.id, ctx, env);
+      // Chasseur handler will check win conditions after shooting
+      return;
+    }
+  }
+
+  if (winResult) {
+    await sleep(3000);
+    await announceVictory(token, game, winResult, env);
+    return;
+  }
+
+  // Trigger loup_blanc vote on even nights if loup_blanc is alive
+  if (game.nightCount && game.nightCount % 2 === 0) {
+    const loupBlancEntry = Object.entries(game.roles ?? {}).find(([id, r]) => r === "loup_blanc" && !game.dead!.includes(id));
+    if (loupBlancEntry) {
+      triggerPhase(ctx, env, "loup_blanc_vote", { game });
+      return;
+    }
+  }
+}
+
+// ── Sorciere Phase ───────────────────────────────────────────────────
+
+async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { game, _wolfVictimId, _wolfVictimName } = data as { game: GameState; _wolfVictimId: string; _wolfVictimName: string };
+  if (!game?.roles) { triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }); return; }
+
+  const dead = game.dead ?? [];
+  const sorciereEntry = Object.entries(game.roles).find(([id, r]) => r === "sorciere" && !dead.includes(id));
+  if (!sorciereEntry) {
+    triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false });
+    return;
+  }
+  const sorciereId = sorciereEntry[0];
+  const potions = game.witchPotions ?? { life: false, death: false };
+
+  // Build targets for death potion (all living players except sorciere)
+  const targetIds = game.players.filter((id) => id !== sorciereId && !dead.includes(id));
+  const targets = await Promise.all(
+    targetIds.map(async (id) => {
+      const member: any = await getGuildMember(token, game.guildId, id);
+      return { id, name: member.nick || member.user.global_name || member.user.username };
+    })
+  );
+
+  const deadline = Math.floor(Date.now() / 1000) + SORCIERE_TIMEOUT_SECONDS;
+
+  // Create private thread
+  const sorciereThread: any = await createThread(token, game.gameChannelId, {
+    name: "🧪 Laboratoire",
+    type: 12,
+    auto_archive_duration: 1440,
+  });
+
+  await addThreadMember(token, sorciereThread.id, sorciereId);
+
+  const soState: SorciereState = {
+    gameNumber: game.gameNumber,
+    guildId: game.guildId,
+    gameChannelId: game.gameChannelId,
+    sorciereThreadId: sorciereThread.id,
+    lobbyMessageId: game.lobbyMessageId!,
+    sorciereId,
+    wolfVictimId: _wolfVictimId,
+    wolfVictimName: _wolfVictimName,
+    potions,
+    targets,
+    deadline,
+  };
+
+  await sendMessage(token, sorciereThread.id, {
+    content: `<@${sorciereId}>\n\n🧪 **La Sorcière se réveille!** Les loups ont choisi leur victime...`,
+  });
+  const soMsg: any = await sendMessage(token, sorciereThread.id, buildSorciereEmbed(soState));
+
+  // Schedule timer
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({
+        phase: "sorciere_timer",
+        sorciereMessageId: soMsg.id,
+        sorciereThreadId: sorciereThread.id,
+        game,
+        _wolfVictimId,
+        _wolfVictimName,
+      }),
+    }).catch((err) => console.error("Sorciere timer trigger failed:", err))
+  );
+}
+
+async function phaseSorciereTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { sorciereMessageId, sorciereThreadId, game, _wolfVictimId, _wolfVictimName } = data;
+  if (!sorciereMessageId || !sorciereThreadId) return;
+
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await sleep(5000);
+    try {
+      const msg: any = await getMessage(token, sorciereThreadId, sorciereMessageId);
+      if (!msg.components?.length) {
+        // Resolved — read decision from embed state
+        const so = parseSorciereFromEmbed(msg);
+        const witchSaved = so?.witchSaved ?? false;
+        const witchKillId = so?.witchKillTargetId;
+        try { await deleteChannel(token, sorciereThreadId); } catch {}
+        triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: witchSaved, _witchKillId: witchKillId });
+        return;
+      }
+      const so = parseSorciereFromEmbed(msg);
+      if (!so) return;
+      if (Date.now() / 1000 >= so.deadline) {
+        // Timeout — skip
+        await editMessage(token, sorciereThreadId, sorciereMessageId, {
+          embeds: [{
+            title: `🧪 Sorcière — Temps écoulé`,
+            description: "La Sorcière n'a pas agi à temps.",
+            color: EMBED_COLOR_PURPLE,
+            thumbnail: { url: getRoleImage("sorciere") },
+          }],
+          components: [],
+        });
+        await sleep(2000);
+        try { await deleteChannel(token, sorciereThreadId); } catch {}
+        triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false });
+        return;
+      }
+    } catch { return; }
+  }
+  // Re-invoke
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "sorciere_timer", sorciereMessageId, sorciereThreadId, game, _wolfVictimId, _wolfVictimName }),
+    }).catch((err) => console.error("Sorciere timer re-trigger failed:", err))
+  );
+}
+
+async function handleSorciereLife(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const so = parseSorciereFromEmbed(interaction.message);
+  if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (userId !== so.sorciereId) return json({ type: 4, data: { content: "❌ Seule la Sorcière peut utiliser ce pouvoir.", flags: 64 } });
+  if (!so.potions.life) return json({ type: 4, data: { content: "❌ Tu as déjà utilisé ta Potion de Vie.", flags: 64 } });
+
+  so.witchSaved = true;
+  so.resolved = true;
+  const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
+
+  return json({
+    type: 7,
+    data: {
+      embeds: [{
+        title: `🧪 Sorcière — Partie #${so.gameNumber}`,
+        url: stateUrl,
+        description: [
+          `💚 Tu as utilisé la **Potion de Vie** pour sauver **${so.wolfVictimName}**!`,
+          "",
+          "*La victime des loups survivra cette nuit.*",
+        ].join("\n"),
+        color: EMBED_COLOR_GREEN,
+        thumbnail: { url: getRoleImage("sorciere") },
+      }],
+      components: [],
+    },
+  });
+}
+
+async function handleSorciereDeath(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const so = parseSorciereFromEmbed(interaction.message);
+  if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (userId !== so.sorciereId) return json({ type: 4, data: { content: "❌ Seule la Sorcière peut utiliser ce pouvoir.", flags: 64 } });
+  if (!so.potions.death) return json({ type: 4, data: { content: "❌ Tu as déjà utilisé ta Potion de Mort.", flags: 64 } });
+
+  // Show target picker
+  return json({ type: 7, data: buildSorciereTargetEmbed(so) });
+}
+
+async function handleSorciereTarget(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const so = parseSorciereFromEmbed(interaction.message);
+  if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (userId !== so.sorciereId) return json({ type: 4, data: { content: "❌ Seule la Sorcière peut utiliser ce pouvoir.", flags: 64 } });
+
+  const customId: string = interaction.data?.custom_id || "";
+  const targetId = customId.replace(`sorciere_target_${so.gameNumber}_`, "");
+  const target = so.targets.find((t) => t.id === targetId);
+  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+
+  so.witchKillTargetId = targetId;
+  so.resolved = true;
+  const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
+
+  return json({
+    type: 7,
+    data: {
+      embeds: [{
+        title: `🧪 Sorcière — Partie #${so.gameNumber}`,
+        url: stateUrl,
+        description: [
+          `💀 Tu as utilisé la **Potion de Mort** sur **${target.name}**!`,
+          "",
+          "*Ton poison fera effet cette nuit...*",
+        ].join("\n"),
+        color: EMBED_COLOR,
+        thumbnail: { url: getRoleImage("sorciere") },
+      }],
+      components: [],
+    },
+  });
+}
+
+async function handleSorciereSkip(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const so = parseSorciereFromEmbed(interaction.message);
+  if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (userId !== so.sorciereId) return json({ type: 4, data: { content: "❌ Seule la Sorcière peut faire ça.", flags: 64 } });
+
+  so.resolved = true;
+  const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
+
+  return json({
+    type: 7,
+    data: {
+      embeds: [{
+        title: `🧪 Sorcière — Partie #${so.gameNumber}`,
+        url: stateUrl,
+        description: "Tu as choisi de ne rien faire cette nuit.",
+        color: EMBED_COLOR_PURPLE,
+        thumbnail: { url: getRoleImage("sorciere") },
+      }],
+      components: [],
+    },
   });
 }
 
@@ -2221,6 +3545,17 @@ async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext)
   // Record vote
   vote.votes[userId] = targetId;
 
+  // Mirror vote to petite fille spy thread (non-blocking)
+  if (vote.petiteFilleThreadId) {
+    const wolfIndex = vote.wolves.indexOf(userId) + 1;
+    const token = env.DISCORD_BOT_TOKEN;
+    ctx.waitUntil(
+      sendMessage(token, vote.petiteFilleThreadId, {
+        content: `👀 **Loup #${wolfIndex}** a voté pour **${target.name}**`,
+      }).catch(() => {})
+    );
+  }
+
   // Check if unanimous
   const allVoted = vote.wolves.every((wId) => vote.votes[wId]);
   const allSameTarget = allVoted && new Set(Object.values(vote.votes)).size === 1;
@@ -2399,7 +3734,16 @@ export default {
       const work = (async () => {
         try {
           if (phase === "start_game") await startGame(token, payload.game, ctx, env);
+          else if (phase === "voyante_phase") await phaseVoyante(token, payload.game, ctx, env);
+          else if (phase === "voyante_timer") await phaseVoyanteTimer(token, payload, ctx, env);
+          else if (phase === "wolf_phase") await startWolfPhase(token, payload.game, ctx, env);
           else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
+          else if (phase === "post_wolf") await phasePostWolf(token, payload, ctx, env);
+          else if (phase === "sorciere_phase") await phaseSorciere(token, payload, ctx, env);
+          else if (phase === "sorciere_timer") await phaseSorciereTimer(token, payload, ctx, env);
+          else if (phase === "dawn_phase") await phaseDawn(token, payload, ctx, env);
+          else if (phase === "cupidon_timer") await phaseCupidonTimer(token, payload, ctx, env);
+          else if (phase === "chasseur_timer") await phaseChasseurTimer(token, payload, ctx, env);
           else if (phase === "loup_blanc_vote") await phaseLoupBlancVote(token, payload.game, ctx, env);
           else if (phase === "loup_blanc_timer") await phaseLoupBlancTimer(token, payload, ctx, env);
           else console.error("Unknown phase:", phase);
@@ -2446,7 +3790,18 @@ export default {
 
       if (customId.startsWith("reveal_role_")) return handleRevealRole(interaction, env, ctx);
 
+      if (customId.startsWith("voyante_see_")) return handleVoyanteSee(interaction, env);
+
       if (customId.startsWith("vote_kill_")) return handleVoteKill(interaction, env, ctx);
+
+      if (customId.startsWith("cupidon_pick_")) return handleCupidonPick(interaction, env, ctx);
+      if (customId.startsWith("cupidon_confirm_")) return handleCupidonConfirm(interaction, env, ctx);
+      if (customId.startsWith("chasseur_shoot_")) return handleChasseurShoot(interaction, env, ctx);
+
+      if (customId.startsWith("sorciere_life_")) return handleSorciereLife(interaction, env);
+      if (customId.startsWith("sorciere_death_")) return handleSorciereDeath(interaction, env);
+      if (customId.startsWith("sorciere_target_")) return handleSorciereTarget(interaction, env);
+      if (customId.startsWith("sorciere_skip_")) return handleSorciereSkip(interaction, env);
 
       if (customId.startsWith("lb_kill_") || customId.startsWith("lb_skip_")) return handleLoupBlancKill(interaction, env, ctx);
 
