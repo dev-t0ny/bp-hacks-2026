@@ -27,6 +27,8 @@ interface Env {
   PRESETS_KV?: KVNamespace;
   VOICE_SERVICE_URL?: string;
   VOICE_SERVICE_TOKEN?: string;
+  GATEWAY_URL?: string;
+  GATEWAY_TOKEN?: string;
 }
 
 const PLAYER_TTL = 86400;
@@ -328,6 +330,8 @@ interface GameState {
   dead?: string[]; // dead player IDs
   voiceChannelId?: string; // voice channel for sound effects
   witchPotions?: { life: boolean; death: boolean }; // true = available
+  discussionTime?: number; // seconds for day discussion
+  voteTime?: number; // seconds for day vote
 }
 
 function encodeState(game: GameState): string {
@@ -352,6 +356,8 @@ function encodeState(game: GameState): string {
   if (game.dead?.length) compact.d = game.dead;
   if (game.voiceChannelId) compact.vc = game.voiceChannelId;
   if (game.witchPotions) compact.wp = game.witchPotions;
+  if (game.discussionTime) compact.dt = game.discussionTime;
+  if (game.voteTime) compact.vt = game.voteTime;
   return btoa(JSON.stringify(compact));
 }
 
@@ -380,6 +386,8 @@ function decodeState(url: string): GameState | null {
       dead: compact.d ?? [],
       voiceChannelId: compact.vc,
       witchPotions: compact.wp,
+      discussionTime: compact.dt ?? 120,
+      voteTime: compact.vt ?? 60,
     };
   } catch {
     return null;
@@ -587,6 +595,26 @@ function sleep(ms: number) {
 
 function getMessage(token: string, channelId: string, messageId: string) {
   return discordFetch(token, `/channels/${channelId}/messages/${messageId}`);
+}
+
+function getChannelMessages(token: string, channelId: string, after?: string, limit = 100) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (after) params.set("after", after);
+  return discordFetch(token, `/channels/${channelId}/messages?${params}`);
+}
+
+async function bulkDeleteMessages(token: string, channelId: string, messageIds: string[]) {
+  for (let i = 0; i < messageIds.length; i += 100) {
+    const batch = messageIds.slice(i, i + 100);
+    if (batch.length === 1) {
+      await deleteMessage(token, channelId, batch[0]!);
+    } else if (batch.length >= 2) {
+      await discordFetch(token, `/channels/${channelId}/messages/bulk-delete`, {
+        method: "POST",
+        body: JSON.stringify({ messages: batch }),
+      });
+    }
+  }
 }
 
 async function findOrCreateCategory(token: string, guildId: string): Promise<string> {
@@ -901,6 +929,8 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         players: [userId],
         announceChannelId: channelId,
         voiceChannelId,
+        discussionTime: config.discussionTime,
+        voteTime: config.voteTime,
       };
 
       // Send lobby embed in game channel
@@ -1236,6 +1266,66 @@ async function triggerStartSound(env: Env, game: GameState): Promise<void> {
     } else {
       console.error("[garou] Voice service fetch error:", err);
     }
+  }
+}
+
+// ── Gateway Service (message mirroring for Petite Fille) ────────────
+
+const GATEWAY_TIMEOUT_MS = 5_000;
+
+async function gatewayTrackThread(
+  env: Env,
+  wolfThreadId: string,
+  spyThreadId: string,
+  wolves: { id: string; index: number }[]
+): Promise<void> {
+  if (!env.GATEWAY_URL) {
+    console.log("[garou] Gateway skipped: GATEWAY_URL not set");
+    return;
+  }
+  const endpoint = `${env.GATEWAY_URL.replace(/\/+$/, "")}/track-thread`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (env.GATEWAY_TOKEN) headers.Authorization = `Bearer ${env.GATEWAY_TOKEN}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GATEWAY_TIMEOUT_MS);
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ wolfThreadId, spyThreadId, wolves }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[garou] Gateway track-thread failed (${res.status}): ${body}`);
+    } else {
+      console.log(`[garou] Gateway tracking wolf thread ${wolfThreadId} → spy thread ${spyThreadId}`);
+    }
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err?.name === "AbortError") console.error("[garou] Gateway track-thread timeout");
+    else console.error("[garou] Gateway track-thread error:", err);
+  }
+}
+
+async function gatewayUntrackThread(env: Env, wolfThreadId: string): Promise<void> {
+  if (!env.GATEWAY_URL) return;
+  const endpoint = `${env.GATEWAY_URL.replace(/\/+$/, "")}/untrack-thread`;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (env.GATEWAY_TOKEN) headers.Authorization = `Bearer ${env.GATEWAY_TOKEN}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GATEWAY_TIMEOUT_MS);
+  try {
+    await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ wolfThreadId }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+  } catch {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -2234,7 +2324,11 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
     }
 
     const wr = checkWinCondition(game);
-    if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); }
+    if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); return; }
+
+    // No win → start day discussion
+    await sleep(2000);
+    triggerPhase(ctx, env, "day_discussion", { game });
   })());
 
   return ackResponse;
@@ -2294,7 +2388,10 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
           try { const m: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId); const e = m.embeds?.[0]; if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); } } catch {}
         }
         const wr = checkWinCondition(game);
-        if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); }
+        if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); return; }
+        // No win → start day discussion
+        await sleep(2000);
+        triggerPhase(ctx, env, "day_discussion", { game });
         return;
       }
     } catch { return; }
@@ -2382,10 +2479,14 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     await sendMessage(token, spyThread.id, {
       embeds: [{
         title: "👧 Petite Fille — Espionnage nocturne",
-        description: "Tu espionnes les loups-garous cette nuit...\n\nTu verras leurs votes apparaître ici en temps réel.\nIls ne savent pas que tu les observes.\n\n*Fais attention à ne pas te faire repérer...*",
+        description: "Tu espionnes les loups-garous cette nuit...\n\nTu verras leurs messages apparaître ici en temps réel.\nIls ne savent pas que tu les observes.\n\n*Fais attention à ne pas te faire repérer...*",
         color: 0x9b59b6, thumbnail: { url: getRoleImage("petite_fille") },
       }],
     });
+
+    // Tell the gateway to mirror wolf thread messages to spy thread
+    const wolfIndices = wolfIds.map((id, i) => ({ id, index: i + 1 }));
+    ctx.waitUntil(gatewayTrackThread(env, wolfThread.id, spyThread.id, wolfIndices).catch(() => {}));
   }
 
   const wolfMentions = wolfIds.map(id => `<@${id}>`).join(" ");
@@ -2746,6 +2847,7 @@ async function announceVictory(token: string, game: GameState, result: WinResult
 
   // Clean up wolf channel if exists
   if (game.wolfChannelId) {
+    gatewayUntrackThread(env, game.wolfChannelId).catch(() => {});
     try { await deleteChannel(token, game.wolfChannelId); } catch {}
   }
 
@@ -2811,6 +2913,7 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
   });
 
   // Delete wolf thread — a new one will be created next night
+  if (ctx && env) ctx.waitUntil(gatewayUntrackThread(env, vote.wolfChannelId).catch(() => {}));
   try { await deleteChannel(token, vote.wolfChannelId); } catch {}
 
   // Recover game state and chain to post_wolf
@@ -3033,6 +3136,10 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
       return;
     }
   }
+
+  // No special phases → start day discussion
+  await sleep(3000);
+  triggerPhase(ctx, env, "day_discussion", { game });
 }
 
 // ── Sorciere Phase ───────────────────────────────────────────────────
@@ -3398,7 +3505,7 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
     fetch(WORKER_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "loup_blanc_timer", lbDmChannelId: dmChannel.id, lbDmMessageId: dmMsg.id }),
+      body: JSON.stringify({ phase: "loup_blanc_timer", lbDmChannelId: dmChannel.id, lbDmMessageId: dmMsg.id, gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId }),
     }).catch((err) => console.error("LB timer trigger failed:", err))
   );
 }
@@ -3423,6 +3530,17 @@ async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionCon
 
   // Handle skip
   if (customId.startsWith("lb_skip_")) {
+    // Recover game and start day discussion
+    ctx.waitUntil((async () => {
+      try {
+        const lobbyMsg: any = await getMessage(token, lb.gameChannelId, lb.lobbyMessageId);
+        const game = parseGameFromEmbed(lobbyMsg);
+        if (game) {
+          await sleep(2000);
+          triggerPhase(ctx, env, "day_discussion", { game });
+        }
+      } catch {}
+    })());
     return json({
       type: 7,
       data: {
@@ -3511,7 +3629,12 @@ async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionCon
       if (winResult) {
         await sleep(2000);
         await announceVictory(token, game, winResult, env);
+        return;
       }
+
+      // No win → start day discussion
+      await sleep(3000);
+      triggerPhase(ctx, env, "day_discussion", { game });
     } catch (err) {
       console.error("Loup Blanc kill error:", err);
     }
@@ -3548,6 +3671,17 @@ async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionConte
           }],
           components: [],
         });
+        // Recover game and start day discussion
+        if (data.gameChannelId && data.lobbyMessageId) {
+          try {
+            const lobbyMsg: any = await getMessage(token, data.gameChannelId, data.lobbyMessageId);
+            const game = parseGameFromEmbed(lobbyMsg);
+            if (game) {
+              await sleep(2000);
+              triggerPhase(ctx, env, "day_discussion", { game });
+            }
+          } catch {}
+        }
         return;
       }
     } catch { return; }
@@ -3561,6 +3695,545 @@ async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionConte
     }).catch((err) => console.error("LB timer re-trigger failed:", err))
   );
 }
+
+// ── Day Discussion & Village Vote ────────────────────────────────────
+
+interface DayVoteState {
+  gameNumber: number;
+  guildId: string;
+  gameChannelId: string;
+  lobbyMessageId: string;
+  targets: { id: string; name: string }[];
+  votes: Record<string, string>; // voterId → targetId or "skip"
+  voters: string[]; // living player IDs who can vote
+  deadline: number; // Unix timestamp seconds
+  voteMessageId?: string;
+  allRoles?: Record<string, string>;
+  couple?: [string, string];
+  discussionTime?: number;
+  voteTime?: number;
+}
+
+function encodeDayVoteState(dv: DayVoteState): string {
+  const o: Record<string, unknown> = {
+    g: dv.gameNumber, gi: dv.guildId, gc: dv.gameChannelId,
+    lm: dv.lobbyMessageId,
+    t: dv.targets.map((t) => [t.id, t.name]),
+    v: dv.votes, vt: dv.voters, dl: dv.deadline,
+  };
+  if (dv.voteMessageId) o.vm = dv.voteMessageId;
+  if (dv.allRoles) o.ar = dv.allRoles;
+  if (dv.couple) o.cp = dv.couple;
+  if (dv.discussionTime) o.dst = dv.discussionTime;
+  if (dv.voteTime) o.vtt = dv.voteTime;
+  return btoa(JSON.stringify(o));
+}
+
+function decodeDayVoteState(url: string): DayVoteState | null {
+  try {
+    const b64 = url.split("/dv/")[1];
+    if (!b64) return null;
+    const c = JSON.parse(atob(b64));
+    return {
+      gameNumber: c.g, guildId: c.gi, gameChannelId: c.gc,
+      lobbyMessageId: c.lm,
+      targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
+      votes: c.v ?? {}, voters: c.vt ?? [], deadline: c.dl,
+      voteMessageId: c.vm,
+      allRoles: c.ar,
+      couple: c.cp,
+      discussionTime: c.dst,
+      voteTime: c.vtt,
+    };
+  } catch { return null; }
+}
+
+function parseDayVoteFromEmbed(message: any): DayVoteState | null {
+  const embed = message.embeds?.[0];
+  if (!embed?.url?.includes("/dv/")) return null;
+  return decodeDayVoteState(embed.url);
+}
+
+// ── Discussion Phase ────────────────────────────────────────────────
+
+async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { game } = data as { game: GameState };
+  if (!game) return;
+
+  const dead = game.dead ?? [];
+  const livingPlayers = game.players.filter((id) => !dead.includes(id));
+  const discussionSeconds = game.discussionTime ?? 120;
+  const deadline = Math.floor(Date.now() / 1000) + discussionSeconds;
+
+  // Unlock SEND_MESSAGES for living players
+  for (const playerId of livingPlayers) {
+    try {
+      await setChannelPermission(token, game.gameChannelId, playerId, {
+        allow: ((1n << 10n) | (1n << 11n)).toString(), // VIEW + SEND
+        type: 1,
+      });
+    } catch {}
+  }
+
+  const mins = Math.floor(discussionSeconds / 60);
+  const secs = discussionSeconds % 60;
+  const timeStr = secs > 0 ? `${mins}m${secs}s` : `${mins} minute${mins > 1 ? "s" : ""}`;
+
+  const discMsg: any = await sendMessage(token, game.gameChannelId, {
+    embeds: [{
+      title: `☀️ Période de discussion — ${timeStr}`,
+      description: [
+        "Les villageois peuvent maintenant discuter librement!",
+        "",
+        `⏰ Fin de la discussion: <t:${deadline}:R>`,
+        "",
+        "*Débattez, accusez, défendez-vous... le vote approche!*",
+      ].join("\n"),
+      color: EMBED_COLOR_ORANGE,
+      image: { url: SCENE_IMAGES.dawn_breaks },
+    }],
+  });
+
+  triggerPhase(ctx, env, "discussion_timer", {
+    discussionMsgId: discMsg.id,
+    gameChannelId: game.gameChannelId,
+    deadline,
+    lobbyMessageId: game.lobbyMessageId,
+    game,
+  });
+}
+
+async function phaseDiscussionTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { discussionMsgId, gameChannelId, deadline, game } = data as {
+    discussionMsgId: string; gameChannelId: string; deadline: number;
+    lobbyMessageId: string; game: GameState;
+  };
+  if (!discussionMsgId || !gameChannelId) return;
+
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await sleep(5000);
+    if (Date.now() / 1000 >= deadline) {
+      // Time's up — clean up discussion messages
+      try {
+        const msgs: any[] = await getChannelMessages(token, gameChannelId, discussionMsgId);
+        const idsToDelete = msgs.map((m: any) => m.id);
+        if (idsToDelete.length > 0) {
+          await bulkDeleteMessages(token, gameChannelId, idsToDelete);
+        }
+      } catch (err) {
+        console.error("Discussion cleanup error:", err);
+      }
+
+      // Re-lock SEND_MESSAGES for all living players
+      const dead = game.dead ?? [];
+      const livingPlayers = game.players.filter((id) => !dead.includes(id));
+      for (const playerId of livingPlayers) {
+        try {
+          await setChannelPermission(token, game.gameChannelId, playerId, {
+            allow: String(1 << 10), // VIEW only
+            deny: String(1 << 11), // deny SEND
+            type: 1,
+          });
+        } catch {}
+      }
+
+      // Edit discussion embed to show it's over
+      try {
+        await editMessage(token, gameChannelId, discussionMsgId, {
+          embeds: [{
+            title: "☀️ Discussion terminée!",
+            description: "Le temps de parole est écoulé. Place au vote!",
+            color: EMBED_COLOR_ORANGE,
+          }],
+        });
+      } catch {}
+
+      // Trigger vote phase
+      triggerPhase(ctx, env, "day_vote", { game });
+      return;
+    }
+  }
+  // Re-invoke if deadline not reached
+  triggerPhase(ctx, env, "discussion_timer", data);
+}
+
+// ── Day Vote Phase ──────────────────────────────────────────────────
+
+async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { game } = data as { game: GameState };
+  if (!game) return;
+
+  const dead = game.dead ?? [];
+  const livingPlayers = game.players.filter((id) => !dead.includes(id));
+  const voteSeconds = game.voteTime ?? 60;
+  const deadline = Math.floor(Date.now() / 1000) + voteSeconds;
+
+  // Build targets (all living players)
+  const targets = await Promise.all(
+    livingPlayers.map(async (id) => {
+      let name = id;
+      try {
+        const member: any = await getGuildMember(token, game.guildId, id);
+        name = member.nick || member.user.global_name || member.user.username;
+      } catch {}
+      return { id, name };
+    })
+  );
+
+  const dvState: DayVoteState = {
+    gameNumber: game.gameNumber,
+    guildId: game.guildId,
+    gameChannelId: game.gameChannelId,
+    lobbyMessageId: game.lobbyMessageId!,
+    targets,
+    votes: {},
+    voters: livingPlayers,
+    deadline,
+    allRoles: game.roles,
+    couple: game.couple,
+    discussionTime: game.discussionTime,
+    voteTime: game.voteTime,
+  };
+
+  const stateUrl = `https://garou.bot/dv/${encodeDayVoteState(dvState)}`;
+
+  // Build voter status lines
+  const voterLines = livingPlayers.map((id) => `⬜ <@${id}> — *en attente...*`);
+
+  // Build buttons (5 per row max)
+  const rows: any[] = [];
+  let currentRow: any[] = [];
+  for (const t of targets) {
+    currentRow.push({
+      type: 2, style: 4, label: t.name.slice(0, 80),
+      custom_id: `day_vote_${game.gameNumber}_${t.id}`,
+    });
+    if (currentRow.length === 5) {
+      rows.push({ type: 1, components: currentRow });
+      currentRow = [];
+    }
+  }
+  // Add skip button
+  currentRow.push({
+    type: 2, style: 2, label: "⏭️ Passer",
+    custom_id: `day_skip_${game.gameNumber}`,
+  });
+  if (currentRow.length > 5) {
+    rows.push({ type: 1, components: currentRow.slice(0, 5) });
+    rows.push({ type: 1, components: currentRow.slice(5) });
+  } else {
+    rows.push({ type: 1, components: currentRow });
+  }
+
+  const voteMsg: any = await sendMessage(token, game.gameChannelId, {
+    embeds: [{
+      title: `🗳️ Vote du village — Partie #${game.gameNumber}`,
+      url: stateUrl,
+      description: [
+        "Votez pour éliminer un suspect, ou passez votre tour.",
+        "",
+        `⏰ Fin du vote: <t:${deadline}:R>`,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...voterLines,
+      ].join("\n"),
+      color: EMBED_COLOR,
+      image: { url: SCENE_IMAGES.day_elimination },
+    }],
+    components: rows,
+  });
+
+  dvState.voteMessageId = voteMsg.id;
+
+  // Update embed with voteMessageId
+  const updatedUrl = `https://garou.bot/dv/${encodeDayVoteState(dvState)}`;
+  try {
+    const embed = voteMsg.embeds?.[0];
+    if (embed) {
+      embed.url = updatedUrl;
+      await editMessage(token, game.gameChannelId, voteMsg.id, {
+        embeds: [embed],
+        components: voteMsg.components ?? rows,
+      });
+    }
+  } catch {}
+
+  // Start vote timer
+  triggerPhase(ctx, env, "day_vote_timer", {
+    voteMessageId: voteMsg.id,
+    gameChannelId: game.gameChannelId,
+  });
+}
+
+async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur.", flags: 64 } });
+
+  const dv = parseDayVoteFromEmbed(interaction.message);
+  if (!dv) return json({ type: 4, data: { content: "❌ Erreur: vote introuvable.", flags: 64 } });
+
+  if (!dv.voters.includes(userId)) {
+    return json({ type: 4, data: { content: "❌ Tu ne peux pas voter (éliminé ou non-joueur).", flags: 64 } });
+  }
+
+  if (Math.floor(Date.now() / 1000) > dv.deadline) {
+    return json({ type: 4, data: { content: "⏰ Le temps de vote est écoulé!", flags: 64 } });
+  }
+
+  const customId: string = interaction.data?.custom_id || "";
+  const token = env.DISCORD_BOT_TOKEN;
+
+  if (customId.startsWith("day_skip_")) {
+    dv.votes[userId] = "skip";
+  } else {
+    const targetId = customId.replace(`day_vote_${dv.gameNumber}_`, "");
+    if (!dv.targets.find((t) => t.id === targetId)) {
+      return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+    }
+    dv.votes[userId] = targetId;
+  }
+
+  // Build updated voter lines
+  const voterLines = dv.voters.map((id) => {
+    const vote = dv.votes[id];
+    if (!vote) return `⬜ <@${id}> — *en attente...*`;
+    if (vote === "skip") return `⏭️ <@${id}> — **Passe**`;
+    const target = dv.targets.find((t) => t.id === vote);
+    return `✅ <@${id}> — a voté pour **${target?.name ?? "?"}**`;
+  });
+
+  const allVoted = dv.voters.every((id) => dv.votes[id]);
+
+  const updatedUrl = `https://garou.bot/dv/${encodeDayVoteState(dv)}`;
+  const updatedEmbed = {
+    title: `🗳️ Vote du village — Partie #${dv.gameNumber}`,
+    url: updatedUrl,
+    description: [
+      "Votez pour éliminer un suspect, ou passez votre tour.",
+      "",
+      `⏰ Fin du vote: <t:${dv.deadline}:R>`,
+      "",
+      "━━━━━━━━━━━━━━━━━━━━",
+      "",
+      ...voterLines,
+    ].join("\n"),
+    color: EMBED_COLOR,
+    image: { url: SCENE_IMAGES.day_elimination },
+  };
+
+  if (allVoted) {
+    // Resolve immediately
+    ctx.waitUntil(resolveDayVote(token, dv, ctx, env));
+    return json({ type: 7, data: { embeds: [updatedEmbed], components: [] } });
+  }
+
+  return json({ type: 7, data: { embeds: [updatedEmbed], components: interaction.message.components } });
+}
+
+async function phaseDayVoteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { voteMessageId, gameChannelId } = data;
+  if (!voteMessageId || !gameChannelId) return;
+
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await sleep(5000);
+    try {
+      const msg: any = await getMessage(token, gameChannelId, voteMessageId);
+      if (!msg.components?.length) return; // Already resolved
+      const dv = parseDayVoteFromEmbed(msg);
+      if (!dv) return;
+      if (Date.now() / 1000 >= dv.deadline) {
+        // Time's up — resolve with whatever votes we have
+        await editMessage(token, gameChannelId, voteMessageId, {
+          embeds: msg.embeds,
+          components: [],
+        });
+        await resolveDayVote(token, dv, ctx, env);
+        return;
+      }
+    } catch { return; }
+  }
+  // Re-invoke
+  triggerPhase(ctx, env, "day_vote_timer", data);
+}
+
+async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionContext, env: Env) {
+  // Count votes (ignore "skip")
+  const tally: Record<string, number> = {};
+  for (const [, targetId] of Object.entries(dv.votes)) {
+    if (targetId === "skip") continue;
+    tally[targetId] = (tally[targetId] ?? 0) + 1;
+  }
+
+  const entries = Object.entries(tally);
+  if (entries.length === 0) {
+    // All skip or no votes
+    await sendMessage(token, dv.gameChannelId, {
+      embeds: [{
+        title: "🗳️ Résultat du vote",
+        description: "Le village n'a pas réussi à se mettre d'accord. **Personne n'est éliminé!**",
+        color: EMBED_COLOR_GREEN,
+      }],
+    });
+    await startNextNight(token, dv, ctx, env);
+    return;
+  }
+
+  // Find max votes
+  const maxVotes = Math.max(...entries.map(([, c]) => c));
+  const winners = entries.filter(([, c]) => c === maxVotes);
+
+  if (winners.length > 1) {
+    // Tie — nobody dies
+    const tiedNames = winners.map(([id]) => {
+      const t = dv.targets.find((t) => t.id === id);
+      return t ? `**${t.name}**` : `<@${id}>`;
+    }).join(", ");
+    await sendMessage(token, dv.gameChannelId, {
+      embeds: [{
+        title: "🗳️ Égalité!",
+        description: [
+          `Égalité entre ${tiedNames} (${maxVotes} voix chacun).`,
+          "",
+          "**Personne n'est éliminé!**",
+        ].join("\n"),
+        color: EMBED_COLOR_GREEN,
+      }],
+    });
+    await startNextNight(token, dv, ctx, env);
+    return;
+  }
+
+  // Clear winner — eliminate
+  const eliminatedId = winners[0]![0];
+  const eliminatedTarget = dv.targets.find((t) => t.id === eliminatedId);
+  const eliminatedName = eliminatedTarget?.name ?? "?";
+  const eliminatedRole = dv.allRoles?.[eliminatedId] ?? "villageois";
+  const roleInfo = ROLES[eliminatedRole] ?? ROLES.villageois!;
+
+  // Recover game state from lobby
+  let game: GameState | null = null;
+  try {
+    const lobbyMsg: any = await getMessage(token, dv.gameChannelId, dv.lobbyMessageId);
+    game = parseGameFromEmbed(lobbyMsg);
+  } catch {}
+  if (!game) return;
+  if (!game.dead) game.dead = [];
+  game.dead.push(eliminatedId);
+
+  // Set eliminated player as spectator (can view, can't send)
+  try {
+    await setChannelPermission(token, dv.gameChannelId, eliminatedId, {
+      allow: String(1 << 10), deny: String(1 << 11), type: 1,
+    });
+  } catch {}
+
+  // Announce elimination with role reveal
+  await sendMessage(token, dv.gameChannelId, {
+    embeds: [{
+      title: "⚖️ Le village a rendu son verdict!",
+      description: [
+        `**${eliminatedName}** (<@${eliminatedId}>) a été éliminé(e) par le village!`,
+        "",
+        `${roleInfo.emoji} C'était **${roleInfo.name}**!`,
+        "",
+        `*${roleInfo.description}*`,
+      ].join("\n"),
+      color: EMBED_COLOR,
+      thumbnail: { url: getRoleImage(eliminatedRole) },
+      image: { url: SCENE_IMAGES.day_elimination },
+    }],
+  });
+
+  // Couple death chain
+  if (game.couple && game.couple.includes(eliminatedId)) {
+    const partnerId = eliminatedId === game.couple[0] ? game.couple[1] : game.couple[0];
+    if (!game.dead.includes(partnerId)) {
+      game.dead.push(partnerId);
+      try {
+        await setChannelPermission(token, dv.gameChannelId, partnerId, {
+          allow: String(1 << 10), deny: String(1 << 11), type: 1,
+        });
+      } catch {}
+      const pm: any = await getGuildMember(token, game.guildId, partnerId).catch(() => null);
+      const pName = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
+      const partnerRole = game.roles?.[partnerId] ?? "villageois";
+      const partnerRoleInfo = ROLES[partnerRole] ?? ROLES.villageois!;
+      await sendMessage(token, dv.gameChannelId, {
+        embeds: [{
+          title: "💔 Le couple est brisé...",
+          description: [
+            `**${pName}** (<@${partnerId}>) meurt de chagrin.`,
+            "",
+            `${partnerRoleInfo.emoji} C'était **${partnerRoleInfo.name}**!`,
+          ].join("\n"),
+          color: 0xe91e63,
+        }],
+      });
+    }
+  }
+
+  // Check chasseur
+  if (eliminatedRole === "chasseur") {
+    // Persist state first
+    if (game.lobbyMessageId) {
+      const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+      try {
+        const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+        const embed = msg.embeds?.[0];
+        if (embed) {
+          embed.url = stateUrl;
+          await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
+        }
+      } catch {}
+    }
+    await sleep(2000);
+    await triggerChasseurShoot(token, game, eliminatedId, ctx, env);
+    return;
+  }
+
+  // Persist state
+  if (game.lobbyMessageId) {
+    const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+    try {
+      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+      const embed = msg.embeds?.[0];
+      if (embed) {
+        embed.url = stateUrl;
+        await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
+      }
+    } catch {}
+  }
+
+  // Check win conditions
+  const winResult = checkWinCondition(game);
+  if (winResult) {
+    await sleep(2000);
+    await announceVictory(token, game, winResult, env);
+    return;
+  }
+
+  // Start next night
+  await sleep(3000);
+  triggerPhase(ctx, env, "night_start", { game });
+}
+
+async function startNextNight(token: string, dv: DayVoteState, ctx: ExecutionContext, env: Env) {
+  // Recover game from lobby embed
+  let game: GameState | null = null;
+  try {
+    const lobbyMsg: any = await getMessage(token, dv.gameChannelId, dv.lobbyMessageId);
+    game = parseGameFromEmbed(lobbyMsg);
+  } catch {}
+  if (!game) return;
+
+  await sleep(3000);
+  triggerPhase(ctx, env, "night_start", { game });
+}
+
+// ── Wolf Vote (Night) ───────────────────────────────────────────────
 
 async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
@@ -3588,16 +4261,7 @@ async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext)
   // Record vote
   vote.votes[userId] = targetId;
 
-  // Mirror vote to petite fille spy thread (non-blocking)
-  if (vote.petiteFilleThreadId) {
-    const wolfIndex = vote.wolves.indexOf(userId) + 1;
-    const token = env.DISCORD_BOT_TOKEN;
-    ctx.waitUntil(
-      sendMessage(token, vote.petiteFilleThreadId, {
-        content: `👀 **Loup #${wolfIndex}** a voté pour **${target.name}**`,
-      }).catch(() => {})
-    );
-  }
+
 
   // Check if unanimous
   const allVoted = vote.wolves.every((wId) => vote.votes[wId]);
@@ -3790,6 +4454,10 @@ export default {
           else if (phase === "chasseur_timer") await phaseChasseurTimer(token, payload, ctx, env);
           else if (phase === "loup_blanc_vote") await phaseLoupBlancVote(token, payload.game, ctx, env);
           else if (phase === "loup_blanc_timer") await phaseLoupBlancTimer(token, payload, ctx, env);
+          else if (phase === "day_discussion") await phaseDiscussion(token, payload, ctx, env);
+          else if (phase === "discussion_timer") await phaseDiscussionTimer(token, payload, ctx, env);
+          else if (phase === "day_vote") await phaseDayVote(token, payload, ctx, env);
+          else if (phase === "day_vote_timer") await phaseDayVoteTimer(token, payload, ctx, env);
           else console.error("Unknown phase:", phase);
         } catch (err) {
           console.error(`Phase ${phase} failed:`, err);
@@ -3848,6 +4516,8 @@ export default {
       if (customId.startsWith("sorciere_skip_")) return handleSorciereSkip(interaction, env);
 
       if (customId.startsWith("lb_kill_") || customId.startsWith("lb_skip_")) return handleLoupBlancKill(interaction, env, ctx);
+
+      if (customId.startsWith("day_vote_") || customId.startsWith("day_skip_")) return handleDayVote(interaction, env, ctx);
 
       if (customId.startsWith("start_game_") || customId.startsWith("skip_countdown_")) {
         const handler = customId.startsWith("skip_countdown_") ? handleSkipCountdown : handleStart;
