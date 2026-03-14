@@ -6,3 +6,14 @@ account_id = "3314599f71a92145cd2769c61ab3edf4"
 [vars]
 DISCORD_PUBLIC_KEY = "638239c661b49aca1aaf6b5e646a266de4b9844260efa776fbdec8ad4ee1b383"
 DISCORD_BOT_TOKEN = "MTQ4MjM4MDIzNjUyMjc4NzAwOA.G06kVH.6D2_kWssTPYvsLDUaMK_vhOH8726fxgWbaSICo"
+
+[[kv_namespaces]]
+binding = "ACTIVE_PLAYERS"
+id = "894e588e4db2430c82571a4a9ad9b044"
+
+# To enable custom preset saving, create a KV namespace:
+#   npx wrangler kv:namespace create PRESETS_KV
+# Then uncomment and fill in the ID:
+# [[kv_namespaces]]
+# binding = "PRESETS_KV"
+# id = "your-kv-namespace-id"
