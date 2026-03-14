@@ -1,4 +1,4 @@
-import { Conversation, bot, actions } from "@botpress/runtime";
+import { Conversation, bot } from "@botpress/runtime";
 import * as discord from "../actions/discord-api";
 import { buildGameEmbed, type GameState } from "../actions/embed-builder";
 
@@ -54,10 +54,9 @@ export default new Conversation({
     // Use message.text (ADK convenience) or fall back to payload.text
     const text = ((message as any).text ?? (message.payload as any)?.text ?? "").trim();
 
-    // Only respond if the bot is mentioned (@Garou) or via mentionsBot tag
-    const BOT_DISCORD_ID = "1482380236522787008";
+    // Respond if ANY bot is mentioned via <@id> pattern or mentionsBot tag
     const mentionedViaTag = message.tags?.["discord:mentionsBot"] === "true";
-    const mentionedViaText = text.includes(`<@${BOT_DISCORD_ID}>`) || text.includes(`<@!${BOT_DISCORD_ID}>`);
+    const mentionedViaText = /<@[!&]?\d+>/.test(text);
     console.log("[GAROU] Mention check:", JSON.stringify({ mentionedViaTag, mentionedViaText, text, tags: message.tags }));
     if (!mentionedViaTag && !mentionedViaText) return;
 
@@ -66,9 +65,7 @@ export default new Conversation({
 
     if (!match) {
       await execute({
-        instructions:
-          "Tu es Garou, un bot de jeu de Loup-Garou sur Discord. Réponds TOUJOURS en français. Dis aux utilisateurs de taper /loupgarou <nombre> pour créer une partie. Sois bref. Tu peux aussi générer des images de scènes du jeu si on te le demande.",
-        tools: [actions.generateSceneImage.asTool()],
+        instructions: "Tu es Garou, un bot de jeu de Loup-Garou sur Discord. Réponds TOUJOURS en français. Dis aux utilisateurs de taper /loupgarou <nombre> pour créer une partie. Sois bref.",
       });
       return;
     }
