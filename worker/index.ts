@@ -329,15 +329,49 @@ const ROLES: Record<string, Role> = {
   },
 };
 
-function assignRoles(playerCount: number): string[] {
-  // Fixed: 2 loups, 1 sorcière, 1 cupidon, reste = villageois
-  const roles: string[] = ["loup", "loup", "sorciere", "cupidon"];
-  for (let i = roles.length; i < playerCount; i++) {
-    roles.push("villageois");
+// Map ALL_ROLES IDs to gameplay role keys
+const ROLE_ID_TO_KEY: Record<number, string> = {
+  3: "sorciere",
+  4: "chasseur",
+  5: "cupidon",
+  6: "petite_fille",
+  47: "loup", 48: "loup", 49: "loup", 50: "loup", 51: "loup", 52: "loup", 53: "loup",
+};
+function roleIdToKey(id: number): string {
+  return ROLE_ID_TO_KEY[id] ?? "villageois";
+}
+
+function secureRandom(): number {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return buf[0]! / 0x1_0000_0000;
+}
+
+function assignRoles(playerCount: number, selectedRoleIds?: number[]): string[] {
+  let roles: string[];
+
+  if (selectedRoleIds?.length) {
+    // Use configured roles, mapped to gameplay keys
+    roles = selectedRoleIds.map(roleIdToKey);
+    // If more players than configured roles, fill with villageois
+    while (roles.length < playerCount) roles.push("villageois");
+    // If fewer players than configured roles, trim villageois first
+    while (roles.length > playerCount) {
+      const lastVillageois = roles.lastIndexOf("villageois");
+      if (lastVillageois !== -1) roles.splice(lastVillageois, 1);
+      else break; // no more villageois to remove, keep as-is
+    }
+    // Still too many? trim from the end
+    roles.length = playerCount;
+  } else {
+    // Fallback: hardcoded defaults
+    roles = ["loup", "loup", "sorciere", "cupidon"];
+    for (let i = roles.length; i < playerCount; i++) roles.push("villageois");
   }
-  // Shuffle (Fisher-Yates)
+
+  // Shuffle (Fisher-Yates) with crypto-safe randomness
   for (let i = roles.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(secureRandom() * (i + 1));
     [roles[i], roles[j]] = [roles[j]!, roles[i]!];
   }
   return roles;
@@ -362,6 +396,7 @@ interface GameState {
   nightCount?: number; // how many nights have passed (cupidon acts night 1 only)
   dead?: string[]; // dead player IDs
   voiceChannelId?: string; // voice channel for sound effects
+  selectedRoleIds?: number[]; // configured role IDs from config embed
 }
 
 function encodeState(game: GameState): string {
@@ -385,6 +420,7 @@ function encodeState(game: GameState): string {
   if (game.nightCount) compact.nc = game.nightCount;
   if (game.dead?.length) compact.d = game.dead;
   if (game.voiceChannelId) compact.vc = game.voiceChannelId;
+  if (game.selectedRoleIds?.length) compact.sr = game.selectedRoleIds;
   return btoa(JSON.stringify(compact));
 }
 
@@ -412,6 +448,7 @@ function decodeState(url: string): GameState | null {
       nightCount: compact.nc ?? 0,
       dead: compact.d ?? [],
       voiceChannelId: compact.vc,
+      selectedRoleIds: compact.sr,
     };
   } catch {
     return null;
@@ -869,7 +906,13 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
   const userId = config.creatorId;
   const guildId = config.guildId;
   const channelId = config.channelId;
-  const maxPlayers = config.selectedRoles.length;
+  const maxPlayers = Math.max(MIN_PLAYERS, Math.min(MAX_PLAYERS, config.selectedRoles.length));
+
+  // Validate: at least 1 wolf role
+  const hasWolf = config.selectedRoles.some((id) => ROLE_ID_TO_KEY[id] === "loup");
+  if (!hasWolf) {
+    return json({ type: 4, data: { content: "❌ La config doit contenir au moins un Loup-Garou.", flags: 64 } });
+  }
 
   // ACK with deferred update (remove the config embed)
   const deferredResponse = json({ type: 5, data: { flags: 64 } });
@@ -913,6 +956,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         maxPlayers,
         players: [userId],
         announceChannelId: channelId,
+        selectedRoleIds: config.selectedRoles,
       };
 
       // Send lobby embed in game channel
@@ -1084,7 +1128,7 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   // Creator left → transfer
   let lastEvent: string;
   if (userId === game.creatorId) {
-    const newCreatorId = game.players[Math.floor(Math.random() * game.players.length)]!;
+    const newCreatorId = game.players[Math.floor(secureRandom() * game.players.length)]!;
     game.creatorId = newCreatorId;
     const newCreatorMember: any = await getGuildMember(token, game.guildId, newCreatorId);
     game.creatorName = newCreatorMember.nick || newCreatorMember.user.global_name || newCreatorMember.user.username;
@@ -1211,7 +1255,7 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   });
 
   // ── Assign roles ──
-  const roleKeys = assignRoles(game.players.length);
+  const roleKeys = assignRoles(game.players.length, game.selectedRoleIds);
   const rolesMap: Record<string, string> = {};
   game.players.forEach((id, i) => { rolesMap[id] = roleKeys[i]!; });
   game.roles = rolesMap;
@@ -1631,13 +1675,13 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
   const entries = Object.entries(voteCounts);
 
   if (entries.length === 0) {
-    victimId = vote.targets[Math.floor(Math.random() * vote.targets.length)]!.id;
+    victimId = vote.targets[Math.floor(secureRandom() * vote.targets.length)]!.id;
   } else {
     const maxVotes = Math.max(...entries.map(([_, c]) => c));
     const topTargets = entries.filter(([_, c]) => c === maxVotes).map(([id]) => id);
     victimId = topTargets.length === 1
       ? topTargets[0]!
-      : topTargets[Math.floor(Math.random() * topTargets.length)]!;
+      : topTargets[Math.floor(secureRandom() * topTargets.length)]!;
   }
 
   const victim = vote.targets.find((t) => t.id === victimId)!;

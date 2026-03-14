@@ -10,6 +10,12 @@ import {
   type PresetConfig,
 } from "./roles";
 
+const MIN_PLAYERS = 4;
+const WOLF_IDS = new Set([47, 48, 49, 50, 51, 52, 53]);
+function configIsValid(roles: number[]): boolean {
+  return roles.length >= MIN_PLAYERS && roles.some((id) => WOLF_IDS.has(id));
+}
+
 // ── Config State ────────────────────────────────────────────────────
 
 export interface ConfigState {
@@ -215,7 +221,7 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
             style: 3,
             label: "Créer avec preset",
             custom_id: "cfg_create",
-            disabled: config.selectedRoles.length === 0,
+            disabled: !configIsValid(config.selectedRoles),
           },
         ],
       },
@@ -293,7 +299,7 @@ export function buildStep2Embed(config: ConfigState) {
             style: 3,
             label: "Créer la partie",
             custom_id: "cfg_create",
-            disabled: total === 0,
+            disabled: !configIsValid(config.selectedRoles),
           },
           {
             type: 2,
