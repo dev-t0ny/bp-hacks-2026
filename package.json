@@ -7,8 +7,7 @@
   "scripts": {
     "dev": "adk dev",
     "dev:interactions": "bun run interactions-server.ts",
-    "build": "adk build",
-    "deploy": "adk deploy"
+    "build": "adk build"
   },
   "dependencies": {
     "@botpress/runtime": "^1.16.3",
