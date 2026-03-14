@@ -608,14 +608,13 @@ async function getNextGameNumber(token: string, guildId: string, categoryId: str
 }
 
 async function updateAllEmbeds(token: string, game: GameState, lastEvent?: string) {
-  const promises: Promise<any>[] = [];
+  // Update lobby FIRST (source of truth for re-fetches), THEN announce
   if (game.lobbyMessageId) {
-    promises.push(editMessage(token, game.gameChannelId, game.lobbyMessageId, buildLobbyEmbed(game, lastEvent)));
+    await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildLobbyEmbed(game, lastEvent));
   }
   if (game.announceChannelId && game.announceMessageId) {
-    promises.push(editMessage(token, game.announceChannelId, game.announceMessageId, buildAnnounceEmbed(game)));
+    await editMessage(token, game.announceChannelId, game.announceMessageId, buildAnnounceEmbed(game));
   }
-  await Promise.all(promises);
 }
 
 // ── Custom Presets (KV) ──────────────────────────────────────────────
@@ -992,12 +991,19 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
   if (!initialGame) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
 
   // Re-read the latest state from the LOBBY embed to avoid race conditions.
+  // Then MERGE player lists from both sources — the interaction message (announce embed)
+  // may have a newer list than the lobby if the lobby edit hasn't propagated yet, or vice versa.
   let game = initialGame;
   if (initialGame.lobbyMessageId) {
     try {
       const latestMsg: any = await getMessage(token, initialGame.gameChannelId, initialGame.lobbyMessageId);
       const latestGame = parseGameFromEmbed(latestMsg);
-      if (latestGame) game = latestGame;
+      if (latestGame) {
+        // Merge: keep every player that appears in EITHER source
+        const mergedPlayers = [...new Set([...initialGame.players, ...latestGame.players])];
+        game = latestGame;
+        game.players = mergedPlayers;
+      }
     } catch {}
   }
 
