@@ -1,36 +1,94 @@
-# garou
+# Garou — Bot Discord Loup-Garou
 
-A Botpress Agent built with the ADK.
+Bot de jeu de Loup-Garou pour Discord, construit avec Botpress ADK.
 
-## Getting Started
+## Setup
 
-1. Install dependencies:
+### 1. Installer les dependances
 
-   ```bash
-   pnpm install
-   ```
+```bash
+pnpm install
+```
 
-2. Start development server:
+### 2. Configurer les variables d'environnement
 
-   ```bash
-   adk dev
-   ```
+Creer un fichier `.env` a la racine du projet :
 
-3. Deploy your agent:
-   ```bash
-   adk deploy
-   ```
+```
+DISCORD_BOT_TOKEN=<ton_token_discord>
+```
 
-## Project Structure
+### 3. Lancer le bot
 
-- `src/actions/` - Define callable functions
-- `src/workflows/` - Define long-running processes
-- `src/conversations/` - Define conversation handlers
-- `src/tables/` - Define data storage schemas
-- `src/triggers/` - Define event subscriptions
-- `src/knowledge/` - Add knowledge base files
+```bash
+pnpm run dev
+```
 
-## Learn More
+Le bot ADK tourne dans Botpress Cloud avec hot-reload.
 
-- [ADK Documentation](https://botpress.com/docs/adk)
-- [Botpress Platform](https://botpress.com)
+### 4. Serveur d'interactions (boutons Discord)
+
+Le serveur d'interactions est un Cloudflare Worker deja deploye a :
+
+```
+https://garou-interactions.gabgingras.workers.dev
+```
+
+Pour redeploy apres des changements :
+
+```bash
+cd worker && wrangler deploy
+```
+
+## Utilisation
+
+Dans un channel Discord ou le bot est present :
+
+```
+/loupgarou 10
+```
+
+- `10` = nombre max de joueurs (min 4, max 20)
+- Le bot envoie un embed avec une image de loup-garou et un bouton **Rejoindre**
+- Un channel `#partie-N` est cree sous la categorie "Loup-Garou"
+- Les joueurs cliquent le bouton pour rejoindre
+- Quand un joueur rejoint : il voit le channel (lecture seule), l'embed se met a jour
+- A 4+ joueurs : le createur peut lancer avec `/start`
+- Quand le max est atteint : la partie demarre automatiquement
+
+## Architecture
+
+```
+garou/
+├── src/
+│   ├── conversations/index.ts   # Handler /loupgarou — cree embed + channel
+│   ├── actions/
+│   │   ├── discord-api.ts       # Wrapper Discord REST API (fetch)
+│   │   └── embed-builder.ts     # Construction/parsing des embeds
+│   └── ...
+├── worker/
+│   ├── index.ts                 # Cloudflare Worker — boutons Discord
+│   └── wrangler.toml            # Config du Worker
+├── interactions-server.ts       # Version locale Bun (alternative au Worker)
+├── agent.config.ts              # Config ADK
+└── .env                         # Variables d'environnement
+```
+
+**2 process :**
+1. **Bot ADK** (`pnpm run dev`) — detecte les commandes, cree les games
+2. **Cloudflare Worker** — recoit les clics de boutons Discord, gere les joins
+
+L'etat du jeu est stocke dans les champs caches de l'embed Discord (pas de base de donnees).
+
+## Dev
+
+```bash
+# Bot ADK (terminal interactif requis)
+pnpm run dev
+
+# Redeploy le Worker apres modifications
+cd worker && wrangler deploy
+
+# Build sans deployer
+pnpm run build
+```

@@ -10,7 +10,9 @@ export default defineConfig({
   },
 
   bot: {
-    state: z.object({}),
+    state: z.object({
+      gameCounter: z.number().optional().describe("Auto-incrementing game number counter"),
+    }),
   },
 
   user: {
