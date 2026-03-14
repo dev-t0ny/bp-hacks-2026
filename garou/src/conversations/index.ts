@@ -51,13 +51,25 @@ export default new Conversation({
   handler: async ({ message, conversation, execute }) => {
     if (!message || message.type !== "text") return;
 
-    const text = message.payload.text.trim();
-    const match = text.match(/^\/loupgarou\s+(\d+)$/i);
+    // Use message.text (ADK convenience) or fall back to payload.text
+    const text = ((message as any).text ?? (message.payload as any)?.text ?? "").trim();
+
+    // Debug: log everything to diagnose issues
+    console.log("[GAROU] Handler invoked:", JSON.stringify({
+      type: message.type,
+      text,
+      payload: message.payload,
+      messageKeys: Object.keys(message),
+      tags: message.tags,
+    }));
+
+    // Lenient match: look for "loupgarou" followed by a number anywhere in the text
+    const match = text.match(/loupgarou\s*(\d+)/i);
 
     if (!match) {
       await execute({
         instructions:
-          "Tu es Garou, un bot de jeu de Loup-Garou. Dis aux utilisateurs de taper /loupgarou <nombre> pour créer une partie.",
+          "Tu es Garou, un bot de jeu de Loup-Garou sur Discord. Réponds TOUJOURS en français. Dis aux utilisateurs de taper /loupgarou <nombre> pour créer une partie. Sois bref.",
       });
       return;
     }
