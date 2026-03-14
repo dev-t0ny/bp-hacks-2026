@@ -943,7 +943,7 @@ async function phaseVillageSleeps(token: string, game: GameState, ctx: Execution
 
 // ── Phase: night_wolf_vote — unlock tanière, ping wolves, wait for votes ──
 async function phaseWolfVote(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  await startNightPhase(token, game);
+  await startNightPhase(token, game, ctx, env);
 }
 
 // ── Countdown when game is full ──────────────────────────────────────
@@ -1145,13 +1145,12 @@ function buildVoteEmbed(vote: VoteState) {
   };
 }
 
-async function startNightPhase(token: string, game: GameState) {
+async function startNightPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.wolfChannelId || !game.roles) return;
 
   const wolfIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
   const targetIds = game.players.filter((id) => !wolfIds.includes(id));
 
-  // Fetch target display names
   const targets = await Promise.all(
     targetIds.map(async (id) => {
       const member: any = await getGuildMember(token, game.guildId, id);
@@ -1177,8 +1176,8 @@ async function startNightPhase(token: string, game: GameState) {
   for (const wolfId of wolfIds) {
     try {
       await setChannelPermission(token, game.wolfChannelId, wolfId, {
-        allow: String((1 << 10) | (1 << 11)),  // VIEW + SEND
-        deny: String(0),                         // clear deny
+        allow: String((1 << 10) | (1 << 11)),
+        deny: String(0),
         type: 1,
       });
     } catch {}
@@ -1191,19 +1190,43 @@ async function startNightPhase(token: string, game: GameState) {
   });
   const voteMsg: any = await sendMessage(token, game.wolfChannelId, buildVoteEmbed(voteState));
 
-  // Wait for timer to expire
-  await sleep(NIGHT_VOTE_SECONDS * 1000);
+  // Schedule vote timer via self-invocation (avoids 90s sleep killing the worker)
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "night_vote_timer", voteMessageId: voteMsg.id, wolfChannelId: game.wolfChannelId }),
+    }).catch((err) => console.error("Vote timer trigger failed:", err))
+  );
+}
 
-  // Auto-resolve if not already resolved by unanimous vote
-  try {
-    const currentMsg: any = await getMessage(token, game.wolfChannelId, voteMsg.id);
-    if (!currentMsg.components?.length) return; // Already resolved
-    const currentVote = parseVoteFromEmbed(currentMsg);
-    if (!currentVote) return;
-    await resolveNightVote(token, currentVote, voteMsg.id);
-  } catch (err) {
-    console.error("Night auto-resolve failed:", err);
+// ── Phase: night_vote_timer — poll until deadline then auto-resolve ──
+async function phaseVoteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { voteMessageId, wolfChannelId } = data;
+  if (!voteMessageId || !wolfChannelId) return;
+
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await sleep(5000);
+    try {
+      const currentMsg: any = await getMessage(token, wolfChannelId, voteMessageId);
+      if (!currentMsg.components?.length) return; // Already resolved
+      const currentVote = parseVoteFromEmbed(currentMsg);
+      if (!currentVote) return;
+      if (Date.now() / 1000 >= currentVote.deadline) {
+        await resolveNightVote(token, currentVote, voteMessageId);
+        return;
+      }
+    } catch { return; }
   }
+  // Not resolved yet — re-invoke
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "night_vote_timer", voteMessageId, wolfChannelId }),
+    }).catch((err) => console.error("Vote timer re-trigger failed:", err))
+  );
 }
 
 async function resolveNightVote(token: string, vote: VoteState, voteMessageId: string) {
@@ -1459,13 +1482,15 @@ export default {
     // ── Internal phase calls (self-invocation for long-running flows) ──
     const internalToken = req.headers.get("X-Internal");
     if (internalToken === env.DISCORD_BOT_TOKEN) {
-      const { phase, game } = await req.json() as { phase: string; game: GameState };
+      const payload = await req.json() as any;
+      const { phase } = payload;
       const token = env.DISCORD_BOT_TOKEN;
       try {
-        if (phase === "role_check") await phaseRoleCheck(token, game, ctx, env);
-        else if (phase === "countdown") await phaseCountdown(token, game, ctx, env);
-        else if (phase === "night_village_sleeps") await phaseVillageSleeps(token, game, ctx, env);
-        else if (phase === "night_wolf_vote") await phaseWolfVote(token, game, ctx, env);
+        if (phase === "role_check") await phaseRoleCheck(token, payload.game, ctx, env);
+        else if (phase === "countdown") await phaseCountdown(token, payload.game, ctx, env);
+        else if (phase === "night_village_sleeps") await phaseVillageSleeps(token, payload.game, ctx, env);
+        else if (phase === "night_wolf_vote") await phaseWolfVote(token, payload.game, ctx, env);
+        else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
         else console.error("Unknown phase:", phase);
       } catch (err) {
         console.error(`Phase ${phase} failed:`, err);
