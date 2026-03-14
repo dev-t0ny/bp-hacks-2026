@@ -19,6 +19,17 @@ import {
   findPreset,
   updateRolesForGroup,
 } from "./config-embed";
+import { pickBots, type BotPlayer } from "./bot-personalities";
+import {
+  buildBotPrompt,
+  botDelay,
+  botSpeaks,
+  fallbackDecision,
+  loadHistory,
+  appendHistory,
+  type BotDecisionRequest,
+  type BotDecisionResult,
+} from "./bot-orchestrator";
 
 interface Env {
   DISCORD_PUBLIC_KEY: string;
@@ -29,9 +40,20 @@ interface Env {
   VOICE_SERVICE_TOKEN?: string;
   GATEWAY_URL?: string;
   GATEWAY_TOKEN?: string;
+  ANTHROPIC_API_KEY?: string;
 }
 
 const PLAYER_TTL = 86400;
+
+async function saveBots(kv: KVNamespace, gameNumber: number, bots: BotPlayer[]) {
+  await kv.put(`game:${gameNumber}:bots`, JSON.stringify(bots), { expirationTtl: PLAYER_TTL });
+}
+
+async function loadBots(kv: KVNamespace, gameNumber: number): Promise<BotPlayer[]> {
+  const val = await kv.get(`game:${gameNumber}:bots`);
+  if (!val) return [];
+  try { return JSON.parse(val); } catch { return []; }
+}
 
 async function markPlayerActive(kv: KVNamespace, userId: string, gameNumber: number, channelId: string) {
   await kv.put(`player:${userId}`, JSON.stringify({ g: gameNumber, ch: channelId }), { expirationTtl: PLAYER_TTL });
@@ -363,36 +385,71 @@ function secureRandom(): number {
   return buf[0]! / 0x1_0000_0000;
 }
 
-function assignRoles(playerCount: number, selectedRoleIds?: number[]): string[] {
-  let roles: string[];
+function assignRoles(
+  humanIds: string[],
+  botIds: string[],
+  selectedRoleIds?: number[],
+): Record<string, string> {
+  const totalCount = humanIds.length + botIds.length;
+  let roleKeys: string[];
 
   if (selectedRoleIds?.length) {
-    // Use configured roles, mapped to gameplay keys
-    roles = selectedRoleIds.map(roleIdToKey);
-    // If more players than configured roles, fill with villageois
-    while (roles.length < playerCount) roles.push("villageois");
-    // If fewer players than configured roles, trim villageois first
-    while (roles.length > playerCount) {
-      const lastVillageois = roles.lastIndexOf("villageois");
-      if (lastVillageois !== -1) roles.splice(lastVillageois, 1);
-      else break; // no more villageois to remove, keep as-is
+    roleKeys = selectedRoleIds.map(roleIdToKey);
+    while (roleKeys.length < totalCount) roleKeys.push("villageois");
+    while (roleKeys.length > totalCount) {
+      const lastVillageois = roleKeys.lastIndexOf("villageois");
+      if (lastVillageois !== -1) roleKeys.splice(lastVillageois, 1);
+      else break;
     }
-    // Still too many? trim from the end
-    roles.length = playerCount;
+    roleKeys.length = totalCount;
   } else {
-    // Fallback: hardcoded defaults with voyante
-    const roles: string[] = ["loup", "loup", "voyante", "sorciere", "cupidon"];
-    if (playerCount >= 6) roles.push("chasseur");
-    if (playerCount >= 7) roles.push("petite_fille");
-    if (playerCount >= 8) roles.push("loup_blanc");
-    for (let i = roles.length; i < playerCount; i++) roles.push("villageois");
+    roleKeys = ["loup", "loup", "voyante", "sorciere", "cupidon"];
+    if (totalCount >= 6) roleKeys.push("chasseur");
+    if (totalCount >= 7) roleKeys.push("petite_fille");
+    if (totalCount >= 8) roleKeys.push("loup_blanc");
+    for (let i = roleKeys.length; i < totalCount; i++) roleKeys.push("villageois");
   }
 
-  // Shuffle (Fisher-Yates) with crypto-safe randomness
-  for (let i = roles.length - 1; i > 0; i--) {
-    const j = Math.floor(secureRandom() * (i + 1));
-    [roles[i], roles[j]] = [roles[j]!, roles[i]!];
+  // Separate special roles (not loup, not villageois) — these go to humans first
+  const specialRoles: string[] = [];
+  const simpleRoles: string[] = [];
+  for (const r of roleKeys) {
+    if (r !== "loup" && r !== "villageois") specialRoles.push(r);
+    else simpleRoles.push(r);
   }
+
+  const shuffle = (arr: string[]) => {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(secureRandom() * (i + 1));
+      [arr[i], arr[j]] = [arr[j]!, arr[i]!];
+    }
+  };
+  shuffle(specialRoles);
+  shuffle(simpleRoles);
+
+  // Assign special roles to humans first
+  const roles: Record<string, string> = {};
+  let humanIdx = 0;
+
+  for (const role of specialRoles) {
+    if (humanIdx < humanIds.length) {
+      roles[humanIds[humanIdx]!] = role;
+      humanIdx++;
+    }
+    // If more special roles than humans (unlikely), they spill to bots later
+  }
+
+  // Remaining humans + all bots get simple roles (loup/villageois)
+  const remaining = [
+    ...humanIds.filter((id) => !roles[id]),
+    ...botIds,
+  ];
+  shuffle(remaining);
+
+  for (let i = 0; i < remaining.length; i++) {
+    roles[remaining[i]!] = simpleRoles[i] ?? "villageois";
+  }
+
   return roles;
 }
 
@@ -419,6 +476,7 @@ interface GameState {
   discussionTime?: number; // seconds for day discussion
   voteTime?: number; // seconds for day vote
   selectedRoleIds?: number[]; // configured role IDs from config embed
+  botCount?: number; // number of AI bot players
 }
 
 function encodeState(game: GameState): string {
@@ -446,6 +504,7 @@ function encodeState(game: GameState): string {
   if (game.discussionTime) compact.dt = game.discussionTime;
   if (game.voteTime) compact.vt = game.voteTime;
   if (game.selectedRoleIds?.length) compact.sr = game.selectedRoleIds;
+  if (game.botCount) compact.bc = game.botCount;
   return btoa(JSON.stringify(compact));
 }
 
@@ -477,6 +536,7 @@ function decodeState(url: string): GameState | null {
       discussionTime: compact.dt ?? 120,
       voteTime: compact.vt ?? 60,
       selectedRoleIds: compact.sr,
+      botCount: compact.bc ?? 0,
     };
   } catch {
     return null;
@@ -579,10 +639,10 @@ function buildAnnounceEmbed(game: GameState) {
   };
 }
 
-function buildLobbyEmbed(game: GameState, lastEvent?: string) {
-  const playerCount = game.players.length;
-  const isFull = playerCount >= game.maxPlayers;
-  const canStart = playerCount >= MIN_PLAYERS;
+function buildLobbyEmbed(game: GameState, bots: BotPlayer[] = [], lastEvent?: string) {
+  const totalCount = game.players.length + bots.length;
+  const isFull = totalCount >= game.maxPlayers;
+  const canStart = totalCount >= MIN_PLAYERS;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
   // Player list with empty slots
@@ -590,7 +650,11 @@ function buildLobbyEmbed(game: GameState, lastEvent?: string) {
     const icon = id === game.creatorId ? "👑" : "🐺";
     return `${icon} <@${id}>`;
   });
-  for (let i = playerCount; i < game.maxPlayers; i++) {
+  // Add bot players
+  for (const bot of bots) {
+    playerLines.push(`🤖 ${bot.emoji} ${bot.name} (Bot)`);
+  }
+  for (let i = totalCount; i < game.maxPlayers; i++) {
     playerLines.push("⬜ *En attente...*");
   }
 
@@ -602,8 +666,8 @@ function buildLobbyEmbed(game: GameState, lastEvent?: string) {
       : `En attente de joueurs (min. ${MIN_PLAYERS})`;
 
   const lines = [
-    progressBar(playerCount, game.maxPlayers),
-    `${statusEmoji} **${playerCount}/${game.maxPlayers}** — ${statusText}`,
+    progressBar(totalCount, game.maxPlayers),
+    `${statusEmoji} **${totalCount}/${game.maxPlayers}** — ${statusText}`,
     "",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
@@ -724,10 +788,10 @@ async function getNextGameNumber(token: string, guildId: string, categoryId: str
   return gameChannels.length + 1;
 }
 
-async function updateAllEmbeds(token: string, game: GameState, lastEvent?: string) {
+async function updateAllEmbeds(token: string, game: GameState, lastEvent?: string, bots: BotPlayer[] = []) {
   // Update lobby FIRST (source of truth for re-fetches), THEN announce
   if (game.lobbyMessageId) {
-    await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildLobbyEmbed(game, lastEvent));
+    await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildLobbyEmbed(game, bots, lastEvent));
   }
   if (game.announceChannelId && game.announceMessageId) {
     await editMessage(token, game.announceChannelId, game.announceMessageId, buildAnnounceEmbed(game));
@@ -815,6 +879,12 @@ async function handleConfigSelect(interaction: any, env: Env): Promise<Response>
     return json({ type: 7, data: buildStep1Embed(config, customPresets) });
   }
 
+  if (customId === "cfg_bots") {
+    config.botCount = parseInt(values[0] || "0", 10);
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
+
   // Role selection menus (step 2)
   const selectedIds = values.map((v) => parseInt(v, 10));
 
@@ -854,6 +924,18 @@ async function handleConfigButton(interaction: any, env: Env, ctx: ExecutionCont
   }
 
   const customId: string = interaction.data?.custom_id || "";
+
+  if (customId === "cfg_votes_public") {
+    config.anonymousVotes = false;
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
+
+  if (customId === "cfg_votes_anonyme") {
+    config.anonymousVotes = true;
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
 
   if (customId === "cfg_next") {
     return json({ type: 7, data: buildStep2Embed(config) });
@@ -1027,10 +1109,25 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         discussionTime: config.discussionTime,
         voteTime: config.voteTime,
         selectedRoleIds: config.selectedRoles,
+        botCount: config.botCount,
       };
 
+      // Create bot players if configured
+      let bots: BotPlayer[] = [];
+      if (gameState.botCount && gameState.botCount > 0) {
+        const personalities = pickBots(gameState.botCount);
+        bots = personalities.map((p, i) => ({
+          id: `bot_${i + 1}`,
+          name: p.name,
+          traits: p.traits,
+          emoji: p.emoji,
+          alive: true,
+        }));
+        await saveBots(env.ACTIVE_PLAYERS, gameNumber, bots);
+      }
+
       // Send lobby embed in game channel
-      const lobbyMsg: any = await sendMessage(token, gameChannel.id, buildLobbyEmbed(gameState));
+      const lobbyMsg: any = await sendMessage(token, gameChannel.id, buildLobbyEmbed(gameState, bots));
       gameState.lobbyMessageId = lobbyMsg.id;
 
       // Send announce embed in the original channel (public)
@@ -1052,7 +1149,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
       });
 
       // Re-edit both with complete state (now includes all message IDs)
-      await updateAllEmbeds(token, gameState);
+      await updateAllEmbeds(token, gameState, undefined, bots);
     } catch (err) {
       console.error("Error in handleCreateGame:", err);
       try {
@@ -1097,6 +1194,7 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
     discussionTime: defaultPreset.discussionTime,
     voteTime: defaultPreset.voteTime,
     selectedRoles: [...defaultPreset.roles],
+    botCount: 0,
   };
 
   const customPresets = await loadCustomPresets(env, guildId);
@@ -1125,7 +1223,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
     const gn = initialGame.gameNumber;
 
     try {
-      // ── Step 1: Atomic KV write (no race condition — each player writes their own key) ──
+      // ── Step 1: Check if already in this game or another ──
       const playerKey = `gp:${gn}:${userId}`;
       const alreadyIn = await kv.get(playerKey);
       if (alreadyIn) {
@@ -1135,7 +1233,6 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
         return;
       }
 
-      // Check if in another game
       const activeGame = await getActiveGame(kv, token, userId);
       if (activeGame !== null) {
         await editOriginalInteractionResponse(appId, interactionToken, {
@@ -1144,14 +1241,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
         return;
       }
 
-      // Write this player's key atomically
-      await kv.put(playerKey, "1", { expirationTtl: PLAYER_TTL });
-
-      // ── Step 2: Rebuild player list from KV (source of truth) ──
-      const kvList = await kv.list({ prefix: `gp:${gn}:` });
-      const kvPlayers = kvList.keys.map((k) => k.name.replace(`gp:${gn}:`, ""));
-
-      // ── Step 3: Re-fetch lobby for game metadata ──
+      // ── Step 2: Re-fetch lobby embed (sole source of truth for player list) ──
       let game = initialGame;
       if (initialGame.lobbyMessageId) {
         try {
@@ -1161,21 +1251,27 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
         } catch {}
       }
 
-      // Replace player list with KV truth (merge with embed in case KV list is stale)
-      game.players = [...new Set([...kvPlayers, ...game.players])];
+      // Already in the embed? (concurrent join resolved it)
+      if (game.players.includes(userId)) {
+        await kv.put(playerKey, "1", { expirationTtl: PLAYER_TTL });
+        await markPlayerActive(kv, userId, gn, game.gameChannelId);
+        await editOriginalInteractionResponse(appId, interactionToken, {
+          content: `✅ Tu as rejoint la Partie #${game.gameNumber}!`,
+          components: [{ type: 1, components: [{ type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` }] }],
+        });
+        return;
+      }
 
-      if (game.players.length > game.maxPlayers) {
-        // Too many players — undo
-        await kv.delete(playerKey);
+      const bots = await loadBots(kv, game.gameNumber);
+      const humanSlots = game.maxPlayers - bots.length;
+      if (game.players.length >= humanSlots) {
         await editOriginalInteractionResponse(appId, interactionToken, {
           content: "❌ La partie est pleine!",
         });
         return;
       }
 
-      // ── Step 4: Permissions + embeds ──
-      await markPlayerActive(kv, userId, gn, game.gameChannelId);
-
+      // ── Step 3: Set permissions BEFORE embed (player must have access before appearing) ──
       await setChannelPermission(token, game.gameChannelId, userId, {
         allow: String(1 << 10),
         deny: String(1 << 11),
@@ -1191,13 +1287,35 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
         } catch {}
       }
 
+      // ── Step 4: Add player + update embeds ──
+      await kv.put(playerKey, "1", { expirationTtl: PLAYER_TTL });
+      await markPlayerActive(kv, userId, gn, game.gameChannelId);
+
+      game.players.push(userId);
+
       const member: any = await getGuildMember(token, game.guildId, userId);
       const playerName = member.nick || member.user.global_name || member.user.username;
 
-      await updateAllEmbeds(token, game, `${playerName} a rejoint la partie`);
+      await updateAllEmbeds(token, game, `${playerName} a rejoint la partie`, bots);
+
+      // ── Step 5: Post-update verify (fix race with concurrent joins) ──
+      await sleep(1500);
+      try {
+        const verifyMsg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
+        const verifyGame = parseGameFromEmbed(verifyMsg);
+        if (verifyGame && !verifyGame.players.includes(userId)) {
+          // Our update got overwritten by a concurrent join — re-add
+          verifyGame.players.push(userId);
+          await updateAllEmbeds(token, verifyGame, `${playerName} a rejoint la partie`, bots);
+          game = verifyGame;
+        } else if (verifyGame) {
+          game = verifyGame;
+        }
+      } catch {}
 
       // Game is full → start countdown
-      if (game.players.length >= game.maxPlayers) {
+      const totalWithBots = game.players.length + bots.length;
+      if (totalWithBots >= game.maxPlayers) {
         ctx.waitUntil(runCountdown(token, game, ctx, env));
       }
 
@@ -1292,7 +1410,8 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
     lastEvent = `${playerName} a quitté la partie`;
   }
 
-  await updateAllEmbeds(token, game, lastEvent);
+  const quitBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  await updateAllEmbeds(token, game, lastEvent, quitBots);
 
   return json({ type: 4, data: { content: `🚪 Tu as quitté la Partie #${game.gameNumber}.`, flags: 64 } });
 }
@@ -1458,7 +1577,7 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
         title: "🃏 Le destin se révèle...",
         url: stateUrl,
         description: [
-          `**${game.players.length} cartes** sont distribuées face cachée...`,
+          `**${game.players.length + (game.botCount ?? 0)} cartes** sont distribuées face cachée...`,
           "",
           "*Chaque joueur reçoit son destin en secret.*",
         ].join("\n"),
@@ -1470,16 +1589,15 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   });
 
   // ── Assign roles ──
-  const roleKeys = assignRoles(game.players.length, game.selectedRoleIds);
-  const rolesMap: Record<string, string> = {};
-  game.players.forEach((id, i) => { rolesMap[id] = roleKeys[i]!; });
-  game.roles = rolesMap;
+  const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const botIds = bots.map((b) => b.id);
+  game.roles = assignRoles(game.players, botIds, game.selectedRoleIds);
   game.witchPotions = { life: true, death: true };
 
   await sleep(3000);
 
   // ── Phase 3: Role check (channels are created lazily when players reveal) ──
-  game.seen = [];
+  game.seen = [...botIds]; // Bots "see" their role instantly
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
 
   if (game.announceChannelId && game.announceMessageId) {
@@ -1487,7 +1605,7 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
       embeds: [{
         title: `🎮 Partie #${game.gameNumber} — En cours!`,
         url: `https://garou.bot/s/${encodeState(game)}`,
-        description: [`Lancée par <@${game.creatorId}>`, "", `**${game.players.length} joueurs** — Les rôles sont distribués!`].join("\n"),
+        description: [`Lancée par <@${game.creatorId}>`, "", `**${game.players.length + (game.botCount ?? 0)} joueurs** — Les rôles sont distribués!`].join("\n"),
         color: EMBED_COLOR_GREEN,
         image: { url: SCENE_IMAGES.night_falls },
         footer: { text: "La partie est en cours!" },
@@ -4492,11 +4610,33 @@ async function handleStart(interaction: any, env: Env, ctx: ExecutionContext): P
   if (userId !== game.creatorId) {
     return json({ type: 4, data: { content: `❌ Seul le créateur (<@${game.creatorId}>) peut lancer la partie.`, flags: 64 } });
   }
-  if (game.players.length < MIN_PLAYERS) {
-    return json({ type: 4, data: { content: `❌ Il faut au minimum ${MIN_PLAYERS} joueurs pour lancer.`, flags: 64 } });
+
+  if (game.players.length < 2) {
+    return json({ type: 4, data: { content: "❌ Il faut au minimum 2 joueurs humains pour lancer.", flags: 64 } });
   }
 
   const token = env.DISCORD_BOT_TOKEN;
+
+  // Auto-fill with bots if not enough total players
+  const totalPlayers = game.players.length + (game.botCount ?? 0);
+  if (totalPlayers < MIN_PLAYERS && game.players.length >= 2) {
+    const needed = MIN_PLAYERS - game.players.length;
+    const personalities = pickBots(needed);
+    const bots: BotPlayer[] = personalities.map((p, i) => ({
+      id: `bot_${i + 1}`,
+      name: p.name,
+      traits: p.traits,
+      emoji: p.emoji,
+      alive: true,
+    }));
+    game.botCount = bots.length;
+    await saveBots(env.ACTIVE_PLAYERS, game.gameNumber, bots);
+  }
+
+  const totalWithBots = game.players.length + (game.botCount ?? 0);
+  if (totalWithBots < MIN_PLAYERS) {
+    return json({ type: 4, data: { content: `❌ Il faut au minimum ${MIN_PLAYERS} joueurs (humains + bots) pour lancer.`, flags: 64 } });
+  }
 
   // Use deferred response + background for the animation
   ctx.waitUntil(startGame(token, game, ctx, env));
