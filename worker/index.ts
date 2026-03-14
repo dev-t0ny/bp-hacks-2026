@@ -169,6 +169,7 @@ interface GameState {
   lobbyMessageId?: string;
   announceChannelId?: string;
   announceMessageId?: string;
+  wolfChannelId?: string;
   roles?: Record<string, string>; // playerId → roleKey (set after game starts)
 }
 
@@ -184,6 +185,7 @@ function encodeState(game: GameState): string {
     lm: game.lobbyMessageId,
     ac: game.announceChannelId,
     am: game.announceMessageId,
+    wc: game.wolfChannelId,
   };
   if (game.roles) compact.r = game.roles;
   return btoa(JSON.stringify(compact));
@@ -205,6 +207,7 @@ function decodeState(url: string): GameState | null {
       lobbyMessageId: compact.lm,
       announceChannelId: compact.ac,
       announceMessageId: compact.am,
+      wolfChannelId: compact.wc,
       roles: compact.r,
     };
   } catch {
@@ -556,6 +559,9 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   // No players left → delete everything
   if (game.players.length === 0) {
     try { await deleteChannel(token, game.gameChannelId); } catch {}
+    if (game.wolfChannelId) {
+      try { await deleteChannel(token, game.wolfChannelId); } catch {}
+    }
     if (game.announceChannelId && game.announceMessageId) {
       try { await deleteMessage(token, game.announceChannelId, game.announceMessageId); } catch {}
     }
@@ -651,10 +657,62 @@ async function startGame(token: string, game: GameState) {
 
   const playerRoles = game.players.map((id) => ({ id, roleKey: rolesMap[id]!, role: ROLES[rolesMap[id]!]! }));
 
+  // ── Create hidden wolf channel ──
+  const wolfPlayerIds = playerRoles.filter((p) => p.role.team === "loups").map((p) => p.id);
+  const botUser: any = await getBotUser(token);
+  const categoryId = await findOrCreateCategory(token, game.guildId);
+
+  const wolfChannel: any = await createChannel(token, game.guildId, {
+    name: `taniere-partie-${game.gameNumber}`,
+    type: 0,
+    parent_id: categoryId,
+    topic: `🐺 Canal secret des Loups-Garous — Partie #${game.gameNumber}`,
+    permission_overwrites: [
+      { id: game.guildId, type: 0, deny: String(1 << 10) },
+      { id: botUser.id, type: 1, allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)) },
+      ...wolfPlayerIds.map((id) => ({
+        id,
+        type: 1 as const,
+        allow: String((1 << 10) | (1 << 11)),
+      })),
+    ],
+  });
+  game.wolfChannelId = wolfChannel.id;
+
+  // Send welcome embed in wolf channel
+  await sendMessage(token, wolfChannel.id, {
+    embeds: [
+      {
+        title: "🐺 Bienvenue dans la Tanière",
+        description: [
+          "```",
+          "  🌑  Canal secret des Loups-Garous",
+          "  👁️  Invisible aux villageois",
+          "```",
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+          "",
+          ...wolfPlayerIds.map((id) => `🐺 <@${id}>`),
+          "",
+          "━━━━━━━━━━━━━━━━━━━━",
+          "",
+          "Complotez ici en toute discrétion.",
+          "Personne d'autre ne peut voir ce canal.",
+          "",
+          `*Choisissez votre victime pour la nuit...*`,
+        ].join("\n"),
+        color: EMBED_COLOR_NIGHT,
+        image: { url: WEREWOLF_IMAGE },
+        footer: { text: `Partie #${game.gameNumber} — Les villageois dorment` },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  });
+
   await sleep(3000);
 
   // ── Phase 3: Roles sent — final state ──
-  const loupCount = playerRoles.filter((p) => p.role.team === "loups").length;
+  const loupCount = wolfPlayerIds.length;
   const villageCount = playerRoles.filter((p) => p.role.team === "village").length;
 
   const stateUrlWithRoles = `https://garou.bot/s/${encodeState(game)}`;
