@@ -395,6 +395,10 @@ function assignRoles(
 
   if (selectedRoleIds?.length) {
     roleKeys = selectedRoleIds.map(roleIdToKey);
+    // Ensure at least 1 loup
+    if (!roleKeys.some(r => r === "loup" || r === "loup_blanc")) {
+      roleKeys.push("loup");
+    }
     while (roleKeys.length < totalCount) roleKeys.push("villageois");
     while (roleKeys.length > totalCount) {
       const lastVillageois = roleKeys.lastIndexOf("villageois");
@@ -1447,7 +1451,7 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
     discussionTime: defaultPreset.discussionTime,
     voteTime: defaultPreset.voteTime,
     selectedRoles: [...defaultPreset.roles],
-    botCount: 0,
+    botCount: 4,
   };
 
   const customPresets = await loadCustomPresets(env, guildId);
