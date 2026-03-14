@@ -786,10 +786,11 @@ async function startGame(token: string, game: GameState) {
   }
 
   // ── "La partie débute dans 10s" ──
+  const nightStateUrl = `https://garou.bot/s/${encodeState(game)}`;
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
     embeds: [{
       title: `⏳ La partie débute dans ${GAME_START_DELAY}s — Partie #${game.gameNumber}`,
-      url: `https://garou.bot/s/${encodeState(game)}`,
+      url: nightStateUrl,
       description: [
         "✅ Les rôles ont été distribués!",
         "",
@@ -798,8 +799,6 @@ async function startGame(token: string, game: GameState) {
         ...game.players.map((id) => `🎭 <@${id}>`),
         "",
         "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        "🐺 La première nuit arrive bientôt...",
         "",
         "*Préparez-vous...*",
       ].join("\n"),
@@ -812,20 +811,14 @@ async function startGame(token: string, game: GameState) {
 
   await sleep(GAME_START_DELAY * 1000);
 
-  // ── Update lobby embed to show night has started ──
+  // ── "Le village s'endort..." ──
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
     embeds: [{
-      title: `🌑 La nuit tombe — Partie #${game.gameNumber}`,
-      url: `https://garou.bot/s/${encodeState(game)}`,
+      title: `🌙 Le village s'endort... — Partie #${game.gameNumber}`,
+      url: nightStateUrl,
       description: [
-        "*Les villageois s'endorment...*",
-        "*Les loups-garous ouvrent les yeux.* 🐺",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        ...game.players.map((id) => `🎭 <@${id}>`),
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
+        "*Chaque villageois ferme les yeux...*",
+        "*Le silence envahit le village...*",
       ].join("\n"),
       color: EMBED_COLOR_NIGHT,
       thumbnail: { url: WEREWOLF_IMAGE },
@@ -833,7 +826,26 @@ async function startGame(token: string, game: GameState) {
     components: [],
   });
 
-  // ── Start Night Phase ──
+  await sleep(3000);
+
+  // ── "Les loups-garous se réveillent" ──
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+    embeds: [{
+      title: `🐺 Les loups-garous se réveillent... — Partie #${game.gameNumber}`,
+      url: nightStateUrl,
+      description: [
+        "*Des ombres se faufilent dans la nuit...*",
+        "*Les loups-garous ouvrent les yeux et choisissent leur victime.*",
+        "",
+        `⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour décider.`,
+      ].join("\n"),
+      color: EMBED_COLOR_NIGHT,
+      thumbnail: { url: WEREWOLF_IMAGE },
+    }],
+    components: [],
+  });
+
+  // ── Start Night Phase (unlock tanière, ping wolves, vote) ──
   await startNightPhase(token, game);
 }
 
@@ -1072,21 +1084,6 @@ async function startNightPhase(token: string, game: GameState) {
       });
     } catch {}
   }
-
-  // Announce night in game channel
-  await sendMessage(token, game.gameChannelId, {
-    embeds: [{
-      title: "🌑 La nuit tombe sur le village...",
-      description: [
-        "*Les villageois s'endorment...*",
-        "*Les loups-garous ouvrent les yeux.*",
-        "",
-        `⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour choisir leur victime.`,
-      ].join("\n"),
-      color: EMBED_COLOR_NIGHT,
-      thumbnail: { url: WEREWOLF_IMAGE },
-    }],
-  });
 
   // Tag wolves and send vote embed in wolf channel
   const wolfMentions = wolfIds.map((id) => `<@${id}>`).join(" ");
