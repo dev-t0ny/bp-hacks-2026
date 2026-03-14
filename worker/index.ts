@@ -8,15 +8,30 @@ interface Env {
 
 const PLAYER_TTL = 86400;
 
-async function markPlayerActive(kv: KVNamespace, userId: string, gameNumber: number) {
-  await kv.put(`player:${userId}`, String(gameNumber), { expirationTtl: PLAYER_TTL });
+async function markPlayerActive(kv: KVNamespace, userId: string, gameNumber: number, channelId: string) {
+  await kv.put(`player:${userId}`, JSON.stringify({ g: gameNumber, ch: channelId }), { expirationTtl: PLAYER_TTL });
 }
 async function clearPlayerActive(kv: KVNamespace, userId: string) {
   await kv.delete(`player:${userId}`);
 }
-async function getActiveGame(kv: KVNamespace, userId: string): Promise<number | null> {
+async function getActiveGame(kv: KVNamespace, token: string, userId: string): Promise<number | null> {
   const val = await kv.get(`player:${userId}`);
-  return val ? parseInt(val, 10) : null;
+  if (!val) return null;
+  const { g: gameNumber, ch: channelId } = JSON.parse(val);
+  // Verify the game channel still exists
+  try {
+    const res = await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
+      headers: { Authorization: `Bot ${token}` },
+    });
+    if (res.status === 404 || res.status === 403) {
+      // Channel deleted — player is no longer in a game
+      await kv.delete(`player:${userId}`);
+      return null;
+    }
+  } catch {
+    // Network error — assume channel exists to be safe
+  }
+  return gameNumber;
 }
 async function clearAllPlayersForGame(kv: KVNamespace, playerIds: string[]) {
   await Promise.all(playerIds.map((id) => clearPlayerActive(kv, id)));
@@ -487,7 +502,7 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
   }
 
   // Check if creator is already in a game
-  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, userId);
+  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
   if (activeGame !== null) {
     return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en créer une nouvelle.`, flags: 64 } });
   }
@@ -496,8 +511,7 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
 
   const backgroundWork = (async () => {
     try {
-      // Mark creator as active
-      await markPlayerActive(env.ACTIVE_PLAYERS, userId, 0); // will update with real game number below
+      // Mark creator as active (channel ID set below after creation)
 
       const member: any = await getGuildMember(token, guildId, userId);
       const creatorName = member.nick || member.user.global_name || member.user.username;
@@ -516,8 +530,8 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
         ],
       });
 
-      // Update KV with real game number
-      await markPlayerActive(env.ACTIVE_PLAYERS, userId, gameNumber);
+      // Mark creator as active with game channel
+      await markPlayerActive(env.ACTIVE_PLAYERS, userId, gameNumber, gameChannel.id);
 
       const gameState: GameState = {
         gameNumber,
@@ -575,15 +589,15 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
   if (game.players.length >= game.maxPlayers) return json({ type: 4, data: { content: "❌ La partie est pleine!", flags: 64 } });
 
   // Check if player is already in another game
-  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, userId);
+  const token = env.DISCORD_BOT_TOKEN;
+  const activeGame = await getActiveGame(env.ACTIVE_PLAYERS, token, userId);
   if (activeGame !== null) {
     return json({ type: 4, data: { content: `❌ Tu es déjà dans la Partie #${activeGame}. Quitte-la avant d'en rejoindre une autre.`, flags: 64 } });
   }
 
-  const token = env.DISCORD_BOT_TOKEN;
   game.players.push(userId);
 
-  await markPlayerActive(env.ACTIVE_PLAYERS, userId, game.gameNumber);
+  await markPlayerActive(env.ACTIVE_PLAYERS, userId, game.gameNumber, game.gameChannelId);
 
   await setChannelPermission(token, game.gameChannelId, userId, {
     allow: String(1 << 10),
