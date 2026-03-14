@@ -716,7 +716,8 @@ async function startGame(token: string, game: GameState) {
       ...wolfPlayerIds.map((id) => ({
         id,
         type: 1 as const,
-        allow: String((1 << 10) | (1 << 11)),
+        allow: String(1 << 10),       // VIEW_CHANNEL only — read-only until night vote
+        deny: String(1 << 11),        // deny SEND_MESSAGES
       })),
     ],
   });
@@ -1061,11 +1062,12 @@ async function startNightPhase(token: string, game: GameState) {
     deadline,
   };
 
-  // Unlock wolf channel for writing (in case it was locked from a previous round)
+  // Unlock wolf channel for writing
   for (const wolfId of wolfIds) {
     try {
       await setChannelPermission(token, game.wolfChannelId, wolfId, {
-        allow: String((1 << 10) | (1 << 11)),
+        allow: String((1 << 10) | (1 << 11)),  // VIEW + SEND
+        deny: String(0),                         // clear deny
         type: 1,
       });
     } catch {}
@@ -1262,22 +1264,38 @@ async function handleRevealRole(interaction: any, env: Env): Promise<Response> {
     }
   }
 
+  // Build description lines
+  const descLines = [
+    "",
+    `> ${role.description}`,
+    "",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+  ];
+
+  // Show wolf teammates if this player is a wolf
+  if (roleKey === "loup") {
+    const teammates = Object.entries(game.roles)
+      .filter(([id, r]) => r === "loup" && id !== userId)
+      .map(([id]) => `🐺 <@${id}>`);
+    if (teammates.length > 0) {
+      descLines.push(`**Tes coéquipiers:**`, ...teammates, "", "━━━━━━━━━━━━━━━━━━━━", "");
+    }
+  }
+
+  descLines.push(
+    `🎮 **Partie #${game.gameNumber}**`,
+    `👥 **${game.players.length} joueurs**`,
+    `⚔️ Équipe: **${role.team === "loups" ? "Loups-Garous 🐺" : "Village 🏘️"}**`,
+  );
+
   return json({
     type: 4,
     data: {
       embeds: [
         {
           title: `${role.emoji} Tu es ${role.name}`,
-          description: [
-            "",
-            `> ${role.description}`,
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-            `🎮 **Partie #${game.gameNumber}**`,
-            `👥 **${game.players.length} joueurs**`,
-            `⚔️ Équipe: **${role.team === "loups" ? "Loups-Garous 🐺" : "Village 🏘️"}**`,
-          ].join("\n"),
+          description: descLines.join("\n"),
           color: role.team === "loups" ? EMBED_COLOR : EMBED_COLOR_GREEN,
           thumbnail: { url: WEREWOLF_IMAGE },
           footer: { text: "🤫 Ne révèle ton rôle à personne!" },
