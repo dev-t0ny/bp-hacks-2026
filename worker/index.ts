@@ -171,6 +171,7 @@ interface GameState {
   announceMessageId?: string;
   wolfChannelId?: string;
   roles?: Record<string, string>; // playerId → roleKey (set after game starts)
+  seen?: string[]; // player IDs who have viewed their role
 }
 
 function encodeState(game: GameState): string {
@@ -188,6 +189,7 @@ function encodeState(game: GameState): string {
     wc: game.wolfChannelId,
   };
   if (game.roles) compact.r = game.roles;
+  if (game.seen?.length) compact.s = game.seen;
   return btoa(JSON.stringify(compact));
 }
 
@@ -209,10 +211,51 @@ function decodeState(url: string): GameState | null {
       announceMessageId: compact.am,
       wolfChannelId: compact.wc,
       roles: compact.r,
+      seen: compact.s ?? [],
     };
   } catch {
     return null;
   }
+}
+
+function buildRoleCheckEmbed(game: GameState) {
+  const seen = game.seen ?? [];
+  const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  const playerLines = game.players.map((id) => {
+    const checked = seen.includes(id);
+    return `${checked ? "✅" : "⬜"} <@${id}>`;
+  });
+
+  return {
+    embeds: [{
+      title: `🔮 Découvrez vos rôles — Partie #${game.gameNumber}`,
+      url: stateUrl,
+      description: [
+        "Cliquez sur le bouton pour découvrir votre rôle en **secret**.",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...playerLines,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        `✅ **${seen.length}/${game.players.length}** ont vu leur rôle`,
+      ].join("\n"),
+      color: EMBED_COLOR_PURPLE,
+      thumbnail: { url: WEREWOLF_IMAGE },
+      footer: { text: "🤫 Ne révèle ton rôle à personne!" },
+    }],
+    components: [{
+      type: 1,
+      components: [{
+        type: 2,
+        style: 1,
+        label: "🔮 Voir mon rôle",
+        custom_id: `reveal_role_${game.gameNumber}`,
+      }],
+    }],
+  };
 }
 
 // ── Embed Builders ──────────────────────────────────────────────────
@@ -711,74 +754,65 @@ async function startGame(token: string, game: GameState) {
 
   await sleep(3000);
 
-  // ── Phase 3: Roles sent — final state ──
-  const loupCount = wolfPlayerIds.length;
-  const villageCount = playerRoles.filter((p) => p.role.team === "village").length;
-
-  const stateUrlWithRoles = `https://garou.bot/s/${encodeState(game)}`;
-
-  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
-    embeds: [
-      {
-        title: `🐺 Partie #${game.gameNumber} — La chasse commence!`,
-        url: stateUrlWithRoles,
-        description: [
-          "```",
-          "  🔮  Les rôles ont été distribués!",
-          "  👇  Clique pour découvrir ton rôle.",
-          "```",
-          "",
-          "━━━━━━━━━━━━━━━━━━━━",
-          "",
-          ...game.players.map((id) => `> 🎭 <@${id}>`),
-          "",
-          "━━━━━━━━━━━━━━━━━━━━",
-          "",
-          `🐺 **${loupCount}** loup${loupCount > 1 ? "s-garous rôdent" : "-garou rôde"} parmi vous`,
-          `🏘️ **${villageCount}** membre${villageCount > 1 ? "s" : ""} du village ${villageCount > 1 ? "doivent" : "doit"} survivre`,
-          "",
-          "*La première nuit commence...*",
-        ].join("\n"),
-        color: EMBED_COLOR,
-        thumbnail: { url: WEREWOLF_IMAGE },
-        footer: { text: "🤫 Ne révèle ton rôle à personne!" },
-        timestamp: new Date().toISOString(),
-      },
-    ],
-    components: [
-      {
-        type: 1,
-        components: [
-          {
-            type: 2,
-            style: 1,
-            label: "🔮 Voir mon rôle",
-            custom_id: `reveal_role_${game.gameNumber}`,
-          },
-        ],
-      },
-    ],
-  });
+  // ── Phase 3: Role check — players discover their roles ──
+  game.seen = [];
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
 
   // Update announce embed
   if (game.announceChannelId && game.announceMessageId) {
     await editMessage(token, game.announceChannelId, game.announceMessageId, {
-      embeds: [
-        {
-          title: `🎮 Partie #${game.gameNumber} — En cours!`,
-          url: stateUrl,
-          description: [`Lancée par <@${game.creatorId}>`, "", `**${game.players.length} joueurs** — Les rôles sont distribués!`].join("\n"),
-          color: EMBED_COLOR_GREEN,
-          image: { url: WEREWOLF_IMAGE },
-          footer: { text: "La partie est en cours!" },
-        },
-      ],
+      embeds: [{
+        title: `🎮 Partie #${game.gameNumber} — En cours!`,
+        url: `https://garou.bot/s/${encodeState(game)}`,
+        description: [`Lancée par <@${game.creatorId}>`, "", `**${game.players.length} joueurs** — Les rôles sont distribués!`].join("\n"),
+        color: EMBED_COLOR_GREEN,
+        image: { url: WEREWOLF_IMAGE },
+        footer: { text: "La partie est en cours!" },
+      }],
       components: [],
     });
   }
 
+  // ── Wait for all players to check their roles (max 2 min) ──
+  const roleCheckEnd = Date.now() + ROLE_CHECK_TIMEOUT * 1000;
+  while (Date.now() < roleCheckEnd) {
+    await sleep(5000);
+    try {
+      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+      const current = parseGameFromEmbed(msg);
+      if (current?.seen?.length === game.players.length) break; // All seen!
+    } catch { break; }
+  }
+
+  // ── "La partie débute dans 30s" ──
+  const startTime = Math.floor(Date.now() / 1000) + GAME_START_DELAY;
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+    embeds: [{
+      title: `⏳ La partie débute bientôt — Partie #${game.gameNumber}`,
+      url: `https://garou.bot/s/${encodeState(game)}`,
+      description: [
+        "✅ Les rôles ont été distribués!",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...game.players.map((id) => `🎭 <@${id}>`),
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        `🐺 La première nuit commence <t:${startTime}:R>`,
+        "",
+        "*Préparez-vous...*",
+      ].join("\n"),
+      color: EMBED_COLOR_ORANGE,
+      thumbnail: { url: WEREWOLF_IMAGE },
+      footer: { text: "🤫 Ne révèle ton rôle à personne!" },
+    }],
+    components: [],
+  });
+
+  await sleep(GAME_START_DELAY * 1000);
+
   // ── Start Night Phase ──
-  await sleep(2000);
   await startNightPhase(token, game);
 }
 
@@ -880,7 +914,9 @@ async function runCountdown(token: string, game: GameState) {
 
 // ── Night Phase (Wolf Vote) ──────────────────────────────────────────
 
-const NIGHT_VOTE_SECONDS = 60;
+const NIGHT_VOTE_SECONDS = 90;
+const ROLE_CHECK_TIMEOUT = 120; // 2 minutes to check roles
+const GAME_START_DELAY = 30; // 30s countdown before night
 
 interface VoteState {
   gameNumber: number;
@@ -1176,7 +1212,7 @@ async function handleVoteKill(interaction: any, env: Env): Promise<Response> {
 
 // ── Reveal Role (ephemeral) ──────────────────────────────────────────
 
-async function handleRevealRole(interaction: any, _env: Env): Promise<Response> {
+async function handleRevealRole(interaction: any, env: Env): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
@@ -1192,6 +1228,19 @@ async function handleRevealRole(interaction: any, _env: Env): Promise<Response> 
   if (!roleKey) return json({ type: 4, data: { content: "❌ Aucun rôle trouvé pour toi.", flags: 64 } });
 
   const role = ROLES[roleKey]!;
+
+  // Track that this player has seen their role
+  if (!game.seen) game.seen = [];
+  if (!game.seen.includes(userId)) {
+    game.seen.push(userId);
+    // Update the main embed to show who has seen their role
+    const token = env.DISCORD_BOT_TOKEN;
+    if (game.lobbyMessageId) {
+      try {
+        await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
+      } catch {}
+    }
+  }
 
   return json({
     type: 4,
