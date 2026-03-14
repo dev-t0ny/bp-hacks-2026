@@ -776,6 +776,10 @@ async function startGame(token: string, game: GameState) {
       components: [],
     });
   }
+
+  // ── Start Night Phase ──
+  await sleep(2000);
+  await startNightPhase(token, game);
 }
 
 // ── Countdown when game is full ──────────────────────────────────────
@@ -872,6 +876,302 @@ async function runCountdown(token: string, game: GameState) {
   } catch (err) {
     console.error("Countdown auto-start failed:", err);
   }
+}
+
+// ── Night Phase (Wolf Vote) ──────────────────────────────────────────
+
+const NIGHT_VOTE_SECONDS = 60;
+
+interface VoteState {
+  gameNumber: number;
+  guildId: string;
+  gameChannelId: string;
+  wolfChannelId: string;
+  lobbyMessageId: string;
+  wolves: string[];
+  targets: { id: string; name: string }[];
+  votes: Record<string, string>; // wolfId → targetId
+  deadline: number; // Unix timestamp in seconds
+}
+
+function encodeVoteState(vote: VoteState): string {
+  return btoa(JSON.stringify({
+    g: vote.gameNumber, gi: vote.guildId, gc: vote.gameChannelId,
+    wc: vote.wolfChannelId, lm: vote.lobbyMessageId,
+    w: vote.wolves,
+    t: vote.targets.map((t) => [t.id, t.name]),
+    v: vote.votes, dl: vote.deadline,
+  }));
+}
+
+function decodeVoteState(url: string): VoteState | null {
+  try {
+    const b64 = url.split("/v/")[1];
+    if (!b64) return null;
+    const c = JSON.parse(atob(b64));
+    return {
+      gameNumber: c.g, guildId: c.gi, gameChannelId: c.gc,
+      wolfChannelId: c.wc, lobbyMessageId: c.lm,
+      wolves: c.w,
+      targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
+      votes: c.v ?? {}, deadline: c.dl,
+    };
+  } catch { return null; }
+}
+
+function parseVoteFromEmbed(message: any): VoteState | null {
+  const embed = message.embeds?.[0];
+  if (!embed?.url?.includes("/v/")) return null;
+  return decodeVoteState(embed.url);
+}
+
+function buildVoteEmbed(vote: VoteState) {
+  const stateUrl = `https://garou.bot/v/${encodeVoteState(vote)}`;
+
+  const voteLines = vote.wolves.map((wId) => {
+    const targetId = vote.votes[wId];
+    const target = targetId ? vote.targets.find((t) => t.id === targetId) : null;
+    return `🐺 <@${wId}> → ${target ? `**${target.name}**` : "*(en attente...)*"}`;
+  });
+
+  const buttonRows: any[] = [];
+  let currentRow: any[] = [];
+  for (const target of vote.targets) {
+    const voteCount = Object.values(vote.votes).filter((v) => v === target.id).length;
+    currentRow.push({
+      type: 2,
+      style: voteCount > 0 ? 4 : 2,
+      label: `${voteCount > 0 ? "🎯 " : ""}${target.name}`,
+      custom_id: `vote_kill_${vote.gameNumber}_${target.id}`,
+    });
+    if (currentRow.length === 5) {
+      buttonRows.push({ type: 1, components: currentRow });
+      currentRow = [];
+    }
+  }
+  if (currentRow.length > 0) {
+    buttonRows.push({ type: 1, components: currentRow });
+  }
+
+  return {
+    embeds: [{
+      title: `🐺 Vote de la Nuit — Partie #${vote.gameNumber}`,
+      url: stateUrl,
+      description: [
+        "**Qui les loups veulent-ils dévorer cette nuit?**",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...voteLines,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        `⏰ Fin du vote <t:${vote.deadline}:R>`,
+        "",
+        "*Vote unanime = résolution immédiate*",
+      ].join("\n"),
+      color: EMBED_COLOR_NIGHT,
+      thumbnail: { url: WEREWOLF_IMAGE },
+    }],
+    components: buttonRows,
+  };
+}
+
+async function startNightPhase(token: string, game: GameState) {
+  if (!game.wolfChannelId || !game.roles) return;
+
+  const wolfIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
+  const targetIds = game.players.filter((id) => !wolfIds.includes(id));
+
+  // Fetch target display names
+  const targets = await Promise.all(
+    targetIds.map(async (id) => {
+      const member: any = await getGuildMember(token, game.guildId, id);
+      return { id, name: member.nick || member.user.global_name || member.user.username };
+    })
+  );
+
+  const deadline = Math.floor(Date.now() / 1000) + NIGHT_VOTE_SECONDS;
+
+  const voteState: VoteState = {
+    gameNumber: game.gameNumber,
+    guildId: game.guildId,
+    gameChannelId: game.gameChannelId,
+    wolfChannelId: game.wolfChannelId,
+    lobbyMessageId: game.lobbyMessageId!,
+    wolves: wolfIds,
+    targets,
+    votes: {},
+    deadline,
+  };
+
+  // Unlock wolf channel for writing (in case it was locked from a previous round)
+  for (const wolfId of wolfIds) {
+    try {
+      await setChannelPermission(token, game.wolfChannelId, wolfId, {
+        allow: String((1 << 10) | (1 << 11)),
+        type: 1,
+      });
+    } catch {}
+  }
+
+  // Announce night in game channel
+  await sendMessage(token, game.gameChannelId, {
+    embeds: [{
+      title: "🌑 La nuit tombe sur le village...",
+      description: [
+        "*Les villageois s'endorment...*",
+        "*Les loups-garous ouvrent les yeux.*",
+        "",
+        `⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour choisir leur victime.`,
+      ].join("\n"),
+      color: EMBED_COLOR_NIGHT,
+      thumbnail: { url: WEREWOLF_IMAGE },
+    }],
+  });
+
+  // Tag wolves and send vote embed in wolf channel
+  const wolfMentions = wolfIds.map((id) => `<@${id}>`).join(" ");
+  await sendMessage(token, game.wolfChannelId, {
+    content: `${wolfMentions}\n\n🌙 **La nuit est tombée!** Choisissez votre victime ci-dessous.`,
+  });
+  const voteMsg: any = await sendMessage(token, game.wolfChannelId, buildVoteEmbed(voteState));
+
+  // Wait for timer to expire
+  await sleep(NIGHT_VOTE_SECONDS * 1000);
+
+  // Auto-resolve if not already resolved by unanimous vote
+  try {
+    const currentMsg: any = await getMessage(token, game.wolfChannelId, voteMsg.id);
+    if (!currentMsg.components?.length) return; // Already resolved
+    const currentVote = parseVoteFromEmbed(currentMsg);
+    if (!currentVote) return;
+    await resolveNightVote(token, currentVote, voteMsg.id);
+  } catch (err) {
+    console.error("Night auto-resolve failed:", err);
+  }
+}
+
+async function resolveNightVote(token: string, vote: VoteState, voteMessageId: string) {
+  // Safety: check if already resolved
+  try {
+    const check: any = await getMessage(token, vote.wolfChannelId, voteMessageId);
+    if (!check.components?.length) return;
+  } catch { return; }
+
+  // Determine victim
+  const voteCounts: Record<string, number> = {};
+  for (const targetId of Object.values(vote.votes)) {
+    voteCounts[targetId] = (voteCounts[targetId] ?? 0) + 1;
+  }
+
+  let victimId: string;
+  const entries = Object.entries(voteCounts);
+
+  if (entries.length === 0) {
+    victimId = vote.targets[Math.floor(Math.random() * vote.targets.length)]!.id;
+  } else {
+    const maxVotes = Math.max(...entries.map(([_, c]) => c));
+    const topTargets = entries.filter(([_, c]) => c === maxVotes).map(([id]) => id);
+    victimId = topTargets.length === 1
+      ? topTargets[0]!
+      : topTargets[Math.floor(Math.random() * topTargets.length)]!;
+  }
+
+  const victim = vote.targets.find((t) => t.id === victimId)!;
+  const stateUrl = `https://garou.bot/v/${encodeVoteState(vote)}`;
+
+  // Edit vote embed — show result, remove buttons
+  await editMessage(token, vote.wolfChannelId, voteMessageId, {
+    embeds: [{
+      title: `☠️ La meute a choisi — Partie #${vote.gameNumber}`,
+      url: stateUrl,
+      description: [
+        `**${victim.name}** (<@${victim.id}>) sera dévoré(e) cette nuit.`,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...vote.wolves.map((wId) => {
+          const targetId = vote.votes[wId];
+          const target = targetId ? vote.targets.find((t) => t.id === targetId) : null;
+          return `🐺 <@${wId}> → ${target ? target.name : "*(pas voté)*"}`;
+        }),
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "*🔒 Canal en lecture seule jusqu'à la prochaine nuit.*",
+      ].join("\n"),
+      color: EMBED_COLOR,
+      thumbnail: { url: WEREWOLF_IMAGE },
+    }],
+    components: [],
+  });
+
+  // Lock wolf channel
+  for (const wolfId of vote.wolves) {
+    try {
+      await setChannelPermission(token, vote.wolfChannelId, wolfId, {
+        allow: String(1 << 10),
+        deny: String(1 << 11),
+        type: 1,
+      });
+    } catch {}
+  }
+
+  // Announce in game channel
+  await sendMessage(token, vote.gameChannelId, {
+    embeds: [{
+      title: "☀️ Le jour se lève...",
+      description: [
+        `Les villageois découvrent avec horreur que **${victim.name}** (<@${victim.id}>) a été dévoré(e) par les loups-garous cette nuit.`,
+        "",
+        "*Un moment de silence pour la victime...*",
+      ].join("\n"),
+      color: EMBED_COLOR,
+      image: { url: WEREWOLF_IMAGE },
+    }],
+  });
+}
+
+async function handleVoteKill(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+
+  const vote = parseVoteFromEmbed(interaction.message);
+  if (!vote) return json({ type: 4, data: { content: "❌ Erreur: vote introuvable.", flags: 64 } });
+
+  if (!vote.wolves.includes(userId)) {
+    return json({ type: 4, data: { content: "❌ Seuls les loups-garous peuvent voter.", flags: 64 } });
+  }
+
+  // Check if time expired
+  if (Math.floor(Date.now() / 1000) > vote.deadline) {
+    return json({ type: 4, data: { content: "⏰ Le temps de vote est écoulé!", flags: 64 } });
+  }
+
+  // Extract target ID from custom_id: vote_kill_{gameNumber}_{targetId}
+  const customId: string = interaction.data?.custom_id || "";
+  const targetId = customId.replace(`vote_kill_${vote.gameNumber}_`, "");
+
+  const target = vote.targets.find((t) => t.id === targetId);
+  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+
+  // Record vote
+  vote.votes[userId] = targetId;
+
+  // Check if unanimous
+  const allVoted = vote.wolves.every((wId) => vote.votes[wId]);
+  const allSameTarget = allVoted && new Set(Object.values(vote.votes)).size === 1;
+
+  if (allSameTarget) {
+    // Unanimous! Resolve in background
+    const token = env.DISCORD_BOT_TOKEN;
+    (globalThis as any).__backgroundWork = resolveNightVote(token, vote, interaction.message.id);
+    return json({ type: 7, data: buildVoteEmbed(vote) });
+  }
+
+  // Update embed with new vote
+  return json({ type: 7, data: buildVoteEmbed(vote) });
 }
 
 // ── Reveal Role (ephemeral) ──────────────────────────────────────────
@@ -999,6 +1299,16 @@ export default {
       if (customId.startsWith("quit_game_")) return handleQuit(interaction, env);
 
       if (customId.startsWith("reveal_role_")) return handleRevealRole(interaction, env);
+
+      if (customId.startsWith("vote_kill_")) {
+        const response = await handleVoteKill(interaction, env);
+        const bgWork = (globalThis as any).__backgroundWork;
+        if (bgWork) {
+          ctx.waitUntil(bgWork);
+          (globalThis as any).__backgroundWork = null;
+        }
+        return response;
+      }
 
       if (customId.startsWith("start_game_") || customId.startsWith("skip_countdown_")) {
         const handler = customId.startsWith("skip_countdown_") ? handleSkipCountdown : handleStart;
