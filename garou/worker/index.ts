@@ -169,10 +169,11 @@ interface GameState {
   lobbyMessageId?: string;
   announceChannelId?: string;
   announceMessageId?: string;
+  roles?: Record<string, string>; // playerId → roleKey (set after game starts)
 }
 
 function encodeState(game: GameState): string {
-  const compact = {
+  const compact: Record<string, unknown> = {
     g: game.gameNumber,
     c: game.creatorId,
     n: game.creatorName,
@@ -184,6 +185,7 @@ function encodeState(game: GameState): string {
     ac: game.announceChannelId,
     am: game.announceMessageId,
   };
+  if (game.roles) compact.r = game.roles;
   return btoa(JSON.stringify(compact));
 }
 
@@ -203,6 +205,7 @@ function decodeState(url: string): GameState | null {
       lobbyMessageId: compact.lm,
       announceChannelId: compact.ac,
       announceMessageId: compact.am,
+      roles: compact.r,
     };
   } catch {
     return null;
@@ -640,38 +643,13 @@ async function startGame(token: string, game: GameState) {
     components: [],
   });
 
-  // ── Assign & DM roles ──
+  // ── Assign roles (stored in embed state, revealed via ephemeral button) ──
   const roleKeys = assignRoles(game.players.length);
-  const playerRoles = game.players.map((id, i) => ({ id, roleKey: roleKeys[i]!, role: ROLES[roleKeys[i]!]! }));
+  const rolesMap: Record<string, string> = {};
+  game.players.forEach((id, i) => { rolesMap[id] = roleKeys[i]!; });
+  game.roles = rolesMap;
 
-  const dmPromises = playerRoles.map(async ({ id, role }) => {
-    try {
-      const dm: any = await createDM(token, id);
-      await sendMessage(token, dm.id, {
-        embeds: [
-          {
-            title: `${role.emoji} Tu es ${role.name}`,
-            description: [
-              "",
-              `> ${role.description}`,
-              "",
-              "━━━━━━━━━━━━━━━━━━━━",
-              "",
-              `🎮 **Partie #${game.gameNumber}**`,
-              `👥 **${game.players.length} joueurs**`,
-              `⚔️ Équipe: **${role.team === "loups" ? "Loups-Garous 🐺" : "Village 🏘️"}**`,
-            ].join("\n"),
-            color: role.team === "loups" ? EMBED_COLOR : EMBED_COLOR_GREEN,
-            thumbnail: { url: WEREWOLF_IMAGE },
-            footer: { text: "🤫 Ne révèle ton rôle à personne!" },
-          },
-        ],
-      });
-    } catch (err) {
-      console.error(`Failed to DM role to ${id}:`, err);
-    }
-  });
-  await Promise.all(dmPromises);
+  const playerRoles = game.players.map((id) => ({ id, roleKey: rolesMap[id]!, role: ROLES[rolesMap[id]!]! }));
 
   await sleep(3000);
 
@@ -679,15 +657,17 @@ async function startGame(token: string, game: GameState) {
   const loupCount = playerRoles.filter((p) => p.role.team === "loups").length;
   const villageCount = playerRoles.filter((p) => p.role.team === "village").length;
 
+  const stateUrlWithRoles = `https://garou.bot/s/${encodeState(game)}`;
+
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
     embeds: [
       {
         title: `🐺 Partie #${game.gameNumber} — La chasse commence!`,
-        url: stateUrl,
+        url: stateUrlWithRoles,
         description: [
           "```",
-          "  ✉️  Les rôles ont été envoyés!",
-          "  📬  Vérifiez vos messages privés.",
+          "  🔮  Les rôles ont été distribués!",
+          "  👇  Clique pour découvrir ton rôle.",
           "```",
           "",
           "━━━━━━━━━━━━━━━━━━━━",
@@ -703,11 +683,23 @@ async function startGame(token: string, game: GameState) {
         ].join("\n"),
         color: EMBED_COLOR,
         thumbnail: { url: WEREWOLF_IMAGE },
-        footer: { text: "Que le meilleur camp gagne!" },
+        footer: { text: "🤫 Ne révèle ton rôle à personne!" },
         timestamp: new Date().toISOString(),
       },
     ],
-    components: [],
+    components: [
+      {
+        type: 1,
+        components: [
+          {
+            type: 2,
+            style: 1,
+            label: "🔮 Voir mon rôle",
+            custom_id: `reveal_role_${game.gameNumber}`,
+          },
+        ],
+      },
+    ],
   });
 
   // Update announce embed
@@ -824,6 +816,51 @@ async function runCountdown(token: string, game: GameState) {
   }
 }
 
+// ── Reveal Role (ephemeral) ──────────────────────────────────────────
+
+async function handleRevealRole(interaction: any, _env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+
+  const game = parseGameFromEmbed(interaction.message);
+  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+  if (!game.roles) return json({ type: 4, data: { content: "❌ Les rôles n'ont pas encore été distribués.", flags: 64 } });
+
+  if (!game.players.includes(userId)) {
+    return json({ type: 4, data: { content: "❌ Tu ne fais pas partie de cette partie.", flags: 64 } });
+  }
+
+  const roleKey = game.roles[userId];
+  if (!roleKey) return json({ type: 4, data: { content: "❌ Aucun rôle trouvé pour toi.", flags: 64 } });
+
+  const role = ROLES[roleKey]!;
+
+  return json({
+    type: 4,
+    data: {
+      embeds: [
+        {
+          title: `${role.emoji} Tu es ${role.name}`,
+          description: [
+            "",
+            `> ${role.description}`,
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "",
+            `🎮 **Partie #${game.gameNumber}**`,
+            `👥 **${game.players.length} joueurs**`,
+            `⚔️ Équipe: **${role.team === "loups" ? "Loups-Garous 🐺" : "Village 🏘️"}**`,
+          ].join("\n"),
+          color: role.team === "loups" ? EMBED_COLOR : EMBED_COLOR_GREEN,
+          thumbnail: { url: WEREWOLF_IMAGE },
+          footer: { text: "🤫 Ne révèle ton rôle à personne!" },
+        },
+      ],
+      flags: 64,
+    },
+  });
+}
+
 // ── Start (manual or skip countdown) ─────────────────────────────────
 
 async function handleStart(interaction: any, env: Env): Promise<Response> {
@@ -902,6 +939,8 @@ export default {
       if (customId.startsWith("join_game_")) return handleJoin(interaction, env, ctx);
 
       if (customId.startsWith("quit_game_")) return handleQuit(interaction, env);
+
+      if (customId.startsWith("reveal_role_")) return handleRevealRole(interaction, env);
 
       if (customId.startsWith("start_game_") || customId.startsWith("skip_countdown_")) {
         const handler = customId.startsWith("skip_countdown_") ? handleSkipCountdown : handleStart;
