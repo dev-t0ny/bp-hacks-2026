@@ -5,6 +5,10 @@ node_modules/
 # Build outputs
 dist/
 .adk/
+.wrangler/
+
+# Cloudflare Worker config (contains secrets)
+worker/wrangler.toml
 
 # Environment files
 .env

@@ -149,6 +149,19 @@ function deleteChannelPermission(token: string, channelId: string, targetId: str
   return discordFetch(token, `/channels/${channelId}/permissions/${targetId}`, { method: "DELETE" });
 }
 
+function createThread(token: string, channelId: string, body: Record<string, unknown>) {
+  return discordFetch(token, `/channels/${channelId}/threads`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+function addThreadMember(token: string, threadId: string, userId: string) {
+  return discordFetch(token, `/channels/${threadId}/thread-members/${userId}`, {
+    method: "PUT",
+  });
+}
+
 function getGuildMember(token: string, guildId: string, userId: string) {
   return discordFetch(token, `/guilds/${guildId}/members/${userId}`);
 }
@@ -803,7 +816,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         parent_id: categoryId,
         permission_overwrites: [
           { id: guildId, type: 0, deny: String(1 << 10) },
-          { id: botUser.id, type: 1, allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)) },
+          { id: botUser.id, type: 1, allow: ((1n << 10n) | (1n << 11n) | (1n << 14n) | (1n << 15n) | (1n << 34n) | (1n << 38n)).toString() },
           { id: userId, type: 1, allow: String(1 << 10) },
         ],
       });
@@ -1419,17 +1432,6 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
     deadline,
   };
 
-  // Unlock wolf channel for writing
-  for (const wolfId of wolfIds) {
-    try {
-      await setChannelPermission(token, game.wolfChannelId, wolfId, {
-        allow: String((1 << 10) | (1 << 11)),
-        deny: String(0),
-        type: 1,
-      });
-    } catch {}
-  }
-
   // Tag wolves and send vote embed in wolf channel
   const wolfMentions = wolfIds.map((id) => `<@${id}>`).join(" ");
   await sendMessage(token, game.wolfChannelId, {
@@ -1523,24 +1525,13 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
-        "*🔒 Canal en lecture seule jusqu'à la prochaine nuit.*",
+        "*Le vote est terminé.*",
       ].join("\n"),
       color: EMBED_COLOR,
       thumbnail: { url: WEREWOLF_IMAGE },
     }],
     components: [],
   });
-
-  // Lock wolf channel
-  for (const wolfId of vote.wolves) {
-    try {
-      await setChannelPermission(token, vote.wolfChannelId, wolfId, {
-        allow: String(1 << 10),
-        deny: String(1 << 11),
-        type: 1,
-      });
-    } catch {}
-  }
 
   // Announce in game channel
   await sendMessage(token, vote.gameChannelId, {
@@ -1635,33 +1626,26 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
     game.seen.push(userId);
   }
 
-  // ── Lazy channel creation for special roles ──
-  // Channels only appear for players who have revealed their role
+  // ── Lazy thread creation for special roles ──
+  // Private thread only appears for wolves who have revealed their role
   if (roleKey === "loup") {
     if (!game.wolfChannelId) {
-      // First wolf to reveal → create the wolf channel (bot-only at first)
-      const botUser: any = await getBotUser(token);
-      const categoryId = await findOrCreateCategory(token, game.guildId);
-      const wolfChannel: any = await createChannel(token, game.guildId, {
-        name: `taniere-partie-${game.gameNumber}`,
-        type: 0,
-        parent_id: categoryId,
-        topic: `🐺 Canal secret des Loups-Garous — Partie #${game.gameNumber}`,
-        permission_overwrites: [
-          { id: game.guildId, type: 0, deny: String(1 << 10) },
-          { id: botUser.id, type: 1, allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)) },
-        ],
+      // First wolf to reveal → create a private thread inside the game channel
+      const wolfThread: any = await createThread(token, game.gameChannelId, {
+        name: "🐺 Tanière",
+        type: 12, // GUILD_PRIVATE_THREAD
+        auto_archive_duration: 1440,
       });
-      game.wolfChannelId = wolfChannel.id;
+      game.wolfChannelId = wolfThread.id;
 
       // Send welcome message
       const wolfPlayerIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
-      await sendMessage(token, wolfChannel.id, {
+      await sendMessage(token, wolfThread.id, {
         embeds: [{
           title: "🐺 Bienvenue dans la Tanière",
           description: [
             "```",
-            "  🌑  Canal secret des Loups-Garous",
+            "  🌑  Fil secret des Loups-Garous",
             "  👁️  Invisible aux villageois",
             "```",
             "",
@@ -1672,9 +1656,9 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
             "━━━━━━━━━━━━━━━━━━━━",
             "",
             "Complotez ici en toute discrétion.",
-            "Personne d'autre ne peut voir ce canal.",
+            "Personne d'autre ne peut voir ce fil.",
             "",
-            "*Ce canal sera visible à chaque loup après qu'il ait découvert son rôle.*",
+            "*Ce fil sera visible à chaque loup après qu'il ait découvert son rôle.*",
           ].join("\n"),
           color: EMBED_COLOR_NIGHT,
           image: { url: SCENE_IMAGES.night_falls },
@@ -1684,12 +1668,8 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
       });
     }
 
-    // Grant this wolf access to the channel (read-only until night)
-    await setChannelPermission(token, game.wolfChannelId, userId, {
-      allow: String(1 << 10),
-      deny: String(1 << 11),
-      type: 1,
-    });
+    // Add this wolf to the private thread
+    await addThreadMember(token, game.wolfChannelId, userId);
   }
 
   // Update role check embed with latest seen list + wolfChannelId
