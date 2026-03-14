@@ -1476,17 +1476,9 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
     const gn = initialGame.gameNumber;
 
     try {
-      // ── Step 1: Check if already in this game or another ──
       const playerKey = `gp:${gn}:${userId}`;
-      const alreadyIn = await kv.get(playerKey);
-      if (alreadyIn) {
-        await editOriginalInteractionResponse(appId, interactionToken, {
-          content: "❌ Tu es déjà dans cette partie!",
-        });
-        return;
-      }
 
-      // ── Step 2: Re-fetch lobby embed (sole source of truth for player list) ──
+      // ── Step 1: Re-fetch lobby embed (sole source of truth for player list) ──
       let game = initialGame;
       if (initialGame.lobbyMessageId) {
         try {
@@ -3263,7 +3255,9 @@ interface WinResult {
 function checkWinCondition(game: GameState): WinResult | null {
   if (!game.roles) return null;
   const dead = game.dead ?? [];
-  const alive = game.players.filter((id) => !dead.includes(id));
+  // All players with roles (includes both humans and bots)
+  const allPlayerIds = Object.keys(game.roles);
+  const alive = allPlayerIds.filter((id) => !dead.includes(id));
 
   const aliveWolves = alive.filter((id) => {
     const r = game.roles![id];
@@ -3310,8 +3304,9 @@ function checkWinCondition(game: GameState): WinResult | null {
 
 async function announceVictory(token: string, game: GameState, result: WinResult, env: Env) {
   const dead = game.dead ?? [];
+  const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
 
-  // Build role reveal lines
+  // Build role reveal lines — humans
   const revealLines = game.players.map((id) => {
     const roleKey = game.roles?.[id] ?? "villageois";
     const role = ROLES[roleKey] ?? ROLES.villageois!;
@@ -3319,6 +3314,13 @@ async function announceVictory(token: string, game: GameState, result: WinResult
     const status = isDead ? "💀" : "✅";
     return `${status} ${role.emoji} <@${id}> — **${role.name}**`;
   });
+  // Bot reveal lines
+  for (const bot of bots) {
+    const roleKey = game.roles?.[bot.id] ?? "villageois";
+    const role = ROLES[roleKey] ?? ROLES.villageois!;
+    const status = bot.alive ? "✅" : "💀";
+    revealLines.push(`${status} ${role.emoji} 🤖 ${bot.name} — **${role.name}**`);
+  }
 
   await sendMessage(token, game.gameChannelId, {
     embeds: [{
@@ -3391,14 +3393,17 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
       title: `☠️ La meute a choisi — Partie #${vote.gameNumber}`,
       url: stateUrl,
       description: [
-        `**${victim.name}** (<@${victim.id}>) sera dévoré(e) cette nuit.`,
+        `**${victim.name}**${victim.id.startsWith("bot_") ? " 🤖" : ` (<@${victim.id}>)`} sera dévoré(e) cette nuit.`,
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
         ...vote.wolves.map((wId) => {
           const targetId = vote.votes[wId];
           const target = targetId ? vote.targets.find((t) => t.id === targetId) : null;
-          return `🐺 <@${wId}> → ${target ? target.name : "*(pas voté)*"}`;
+          const wolfLabel = wId.startsWith("bot_")
+            ? `🤖 **${vote.wolfNames?.[wId] ?? wId}**`
+            : `🐺 <@${wId}>`;
+          return `${wolfLabel} → ${target ? target.name : "*(pas voté)*"}`;
         }),
         "",
         "━━━━━━━━━━━━━━━━━━━━",
@@ -3414,6 +3419,25 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
   // Delete wolf thread — a new one will be created next night
   if (ctx && env) ctx.waitUntil(gatewayUntrackThread(env, vote.wolfChannelId).catch(() => {}));
   try { await deleteChannel(token, vote.wolfChannelId); } catch {}
+
+  // Mark bot victim as dead in KV
+  if (env && victimId.startsWith("bot_")) {
+    const bots = await loadBots(env.ACTIVE_PLAYERS, vote.gameNumber);
+    const bot = bots.find((b) => b.id === victimId);
+    if (bot) {
+      bot.alive = false;
+      await saveBots(env.ACTIVE_PLAYERS, vote.gameNumber, bots);
+    }
+  }
+
+  // Append to game history
+  if (env) {
+    await appendHistory(
+      env.ACTIVE_PLAYERS,
+      vote.gameNumber,
+      `Nuit: ${victim.name} a été dévoré(e) par les loups-garous`,
+    );
+  }
 
   // Recover game state and chain to post_wolf
   if (ctx && env) {
