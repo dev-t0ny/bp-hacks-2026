@@ -1480,21 +1480,25 @@ export default {
     }
 
     // ── Internal phase calls (self-invocation for long-running flows) ──
+    // Return immediately and run the phase in waitUntil so each phase gets its own 30s budget.
     const internalToken = req.headers.get("X-Internal");
     if (internalToken === env.DISCORD_BOT_TOKEN) {
       const payload = await req.json() as any;
       const { phase } = payload;
       const token = env.DISCORD_BOT_TOKEN;
-      try {
-        if (phase === "role_check") await phaseRoleCheck(token, payload.game, ctx, env);
-        else if (phase === "countdown") await phaseCountdown(token, payload.game, ctx, env);
-        else if (phase === "night_village_sleeps") await phaseVillageSleeps(token, payload.game, ctx, env);
-        else if (phase === "night_wolf_vote") await phaseWolfVote(token, payload.game, ctx, env);
-        else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
-        else console.error("Unknown phase:", phase);
-      } catch (err) {
-        console.error(`Phase ${phase} failed:`, err);
-      }
+      const work = (async () => {
+        try {
+          if (phase === "role_check") await phaseRoleCheck(token, payload.game, ctx, env);
+          else if (phase === "countdown") await phaseCountdown(token, payload.game, ctx, env);
+          else if (phase === "night_village_sleeps") await phaseVillageSleeps(token, payload.game, ctx, env);
+          else if (phase === "night_wolf_vote") await phaseWolfVote(token, payload.game, ctx, env);
+          else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
+          else console.error("Unknown phase:", phase);
+        } catch (err) {
+          console.error(`Phase ${phase} failed:`, err);
+        }
+      })();
+      ctx.waitUntil(work);
       return new Response("OK", { status: 200 });
     }
 
