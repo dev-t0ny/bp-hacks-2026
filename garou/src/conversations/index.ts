@@ -1,4 +1,4 @@
-import { Conversation, bot } from "@botpress/runtime";
+import { Conversation, bot, actions } from "@botpress/runtime";
 import * as discord from "../actions/discord-api";
 import { buildGameEmbed, type GameState } from "../actions/embed-builder";
 
@@ -69,7 +69,8 @@ export default new Conversation({
     if (!match) {
       await execute({
         instructions:
-          "Tu es Garou, un bot de jeu de Loup-Garou sur Discord. Réponds TOUJOURS en français. Dis aux utilisateurs de taper /loupgarou <nombre> pour créer une partie. Sois bref.",
+          "Tu es Garou, un bot de jeu de Loup-Garou sur Discord. Réponds TOUJOURS en français. Dis aux utilisateurs de taper /loupgarou <nombre> pour créer une partie. Sois bref. Tu peux aussi générer des images de scènes du jeu si on te le demande.",
+        tools: [actions.generateSceneImage.asTool()],
       });
       return;
     }
