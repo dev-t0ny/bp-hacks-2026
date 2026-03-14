@@ -222,6 +222,7 @@ function getRoleImage(roleKey: string): string {
     idiot_du_village: "idiot_du_village",
     corbeau: "corbeau",
     renard: "renard",
+    loup_blanc: "loup_garou_blanc",
   };
   const file = roleImageMap[roleKey] ?? "villageois";
   return `${ASSET_BASE}/roles/${file}.png`;
@@ -275,11 +276,21 @@ const ROLES: Record<string, Role> = {
     team: "village",
     description: "Trouvez et éliminez les loups-garous lors des votes du village. Votre instinct est votre arme.",
   },
+  loup_blanc: {
+    name: "Loup-Garou Blanc",
+    emoji: "🐺",
+    team: "loups",
+    description: "Vous êtes un loup-garou, mais vous jouez aussi en solo. Une nuit sur deux, vous pouvez éliminer un autre loup-garou en secret.",
+  },
 };
 
 function assignRoles(playerCount: number): string[] {
   // Fixed: 2 loups, 1 sorcière, 1 cupidon, reste = villageois
+  // >= 8 players: add 1 loup_blanc (replaces 1 villageois)
   const roles: string[] = ["loup", "loup", "sorciere", "cupidon"];
+  if (playerCount >= 8) {
+    roles.push("loup_blanc");
+  }
   for (let i = roles.length; i < playerCount; i++) {
     roles.push("villageois");
   }
@@ -850,6 +861,25 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         ],
       });
 
+      // Create a voice channel for sound effects (type 2 = GUILD_VOICE)
+      // Bot needs CONNECT (1<<20) and SPEAK (1<<21)
+      let voiceChannelId: string | undefined;
+      try {
+        const voiceChannel: any = await createChannel(token, guildId, {
+          name: `vocal-partie-${gameNumber}`,
+          type: 2,
+          parent_id: categoryId,
+          permission_overwrites: [
+            { id: guildId, type: 0, deny: String(1 << 10) },
+            { id: botUser.id, type: 1, allow: ((1n << 10n) | (1n << 20n) | (1n << 21n)).toString() },
+            { id: userId, type: 1, allow: ((1n << 10n) | (1n << 20n)).toString() },
+          ],
+        });
+        voiceChannelId = voiceChannel.id;
+      } catch (err) {
+        console.error("Failed to create voice channel:", err);
+      }
+
       await markPlayerActive(env.ACTIVE_PLAYERS, userId, gameNumber, gameChannel.id);
 
       const gameState: GameState = {
@@ -861,6 +891,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         maxPlayers,
         players: [userId],
         announceChannelId: channelId,
+        voiceChannelId,
       };
 
       // Send lobby embed in game channel
@@ -967,6 +998,16 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
     type: 1,
   });
 
+  // Grant access to voice channel (VIEW_CHANNEL + CONNECT)
+  if (game.voiceChannelId) {
+    try {
+      await setChannelPermission(token, game.voiceChannelId, userId, {
+        allow: ((1n << 10n) | (1n << 20n)).toString(),
+        type: 1,
+      });
+    } catch {}
+  }
+
   const member: any = await getGuildMember(token, game.guildId, userId);
   const playerName = member.nick || member.user.global_name || member.user.username;
 
@@ -1011,6 +1052,9 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   await clearPlayerActive(env.ACTIVE_PLAYERS, userId);
 
   try { await deleteChannelPermission(token, game.gameChannelId, userId); } catch {}
+  if (game.voiceChannelId) {
+    try { await deleteChannelPermission(token, game.voiceChannelId, userId); } catch {}
+  }
 
   const member: any = await getGuildMember(token, game.guildId, userId);
   const playerName = member.nick || member.user.global_name || member.user.username;
@@ -1022,6 +1066,9 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
     try { await deleteChannel(token, game.gameChannelId); } catch {}
     if (game.wolfChannelId) {
       try { await deleteChannel(token, game.wolfChannelId); } catch {}
+    }
+    if (game.voiceChannelId) {
+      try { await deleteChannel(token, game.voiceChannelId); } catch {}
     }
     if (game.announceChannelId && game.announceMessageId) {
       try { await deleteMessage(token, game.announceChannelId, game.announceMessageId); } catch {}
@@ -1478,8 +1525,26 @@ function buildVoteEmbed(vote: VoteState) {
 async function startNightPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.roles) return;
 
-  const wolfIds = Object.entries(game.roles).filter(([_, r]) => r === "loup").map(([id]) => id);
-  const targetIds = game.players.filter((id) => !wolfIds.includes(id));
+  const dead = game.dead ?? [];
+
+  // Increment night count and persist
+  game.nightCount = (game.nightCount ?? 0) + 1;
+  if (game.lobbyMessageId) {
+    const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+    try {
+      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+      const embed = msg.embeds?.[0];
+      if (embed) {
+        embed.url = stateUrl;
+        await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
+      }
+    } catch {}
+  }
+
+  const wolfIds = Object.entries(game.roles)
+    .filter(([id, r]) => (r === "loup" || r === "loup_blanc") && !dead.includes(id))
+    .map(([id]) => id);
+  const targetIds = game.players.filter((id) => !wolfIds.includes(id) && !dead.includes(id));
 
   const targets = await Promise.all(
     targetIds.map(async (id) => {
@@ -1547,7 +1612,7 @@ async function phaseVoteTimer(token: string, data: any, ctx: ExecutionContext, e
       const currentVote = parseVoteFromEmbed(currentMsg);
       if (!currentVote) return;
       if (Date.now() / 1000 >= currentVote.deadline) {
-        await resolveNightVote(token, currentVote, voteMessageId);
+        await resolveNightVote(token, currentVote, voteMessageId, ctx, env);
         return;
       }
     } catch { return; }
@@ -1562,7 +1627,111 @@ async function phaseVoteTimer(token: string, data: any, ctx: ExecutionContext, e
   );
 }
 
-async function resolveNightVote(token: string, vote: VoteState, voteMessageId: string) {
+// ── Win Conditions ──────────────────────────────────────────────────
+
+interface WinResult {
+  winner: "village" | "loups" | "loup_blanc";
+  title: string;
+  description: string;
+  image: string;
+}
+
+function checkWinCondition(game: GameState): WinResult | null {
+  if (!game.roles) return null;
+  const dead = game.dead ?? [];
+  const alive = game.players.filter((id) => !dead.includes(id));
+
+  const aliveWolves = alive.filter((id) => {
+    const r = game.roles![id];
+    return r === "loup" || r === "loup_blanc";
+  });
+  const aliveLoupBlanc = alive.filter((id) => game.roles![id] === "loup_blanc");
+  const aliveVillagers = alive.filter((id) => {
+    const r = game.roles![id];
+    return r !== "loup" && r !== "loup_blanc";
+  });
+
+  // Loup Blanc wins if they are the last one alive
+  if (alive.length === 1 && aliveLoupBlanc.length === 1) {
+    return {
+      winner: "loup_blanc",
+      title: "⚪ Le Loup-Garou Blanc triomphe!",
+      description: "Le Loup-Garou Blanc a éliminé tout le monde et règne seul sur le village désolé.",
+      image: SCENE_IMAGES.victory_wolves,
+    };
+  }
+
+  // All wolves dead → village wins
+  if (aliveWolves.length === 0) {
+    return {
+      winner: "village",
+      title: "🏘️ Le village est sauvé!",
+      description: "Les villageois ont réussi à éliminer tous les loups-garous. La paix revient au village!",
+      image: SCENE_IMAGES.victory_village,
+    };
+  }
+
+  // Wolves >= villagers → wolves win
+  if (aliveWolves.length >= aliveVillagers.length) {
+    return {
+      winner: "loups",
+      title: "🐺 Les Loups-Garous ont gagné!",
+      description: "Les loups-garous sont désormais aussi nombreux que les villageois. Le village est perdu!",
+      image: SCENE_IMAGES.victory_wolves,
+    };
+  }
+
+  return null;
+}
+
+async function announceVictory(token: string, game: GameState, result: WinResult, env: Env) {
+  const dead = game.dead ?? [];
+
+  // Build role reveal lines
+  const revealLines = game.players.map((id) => {
+    const roleKey = game.roles?.[id] ?? "villageois";
+    const role = ROLES[roleKey] ?? ROLES.villageois!;
+    const isDead = dead.includes(id);
+    const status = isDead ? "💀" : "✅";
+    return `${status} ${role.emoji} <@${id}> — **${role.name}**`;
+  });
+
+  await sendMessage(token, game.gameChannelId, {
+    embeds: [{
+      title: result.title,
+      description: [
+        result.description,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "**Récapitulatif des rôles:**",
+        "",
+        ...revealLines,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        `🎮 **Partie #${game.gameNumber}** terminée!`,
+      ].join("\n"),
+      color: result.winner === "village" ? EMBED_COLOR_GREEN : EMBED_COLOR,
+      image: { url: result.image },
+    }],
+  });
+
+  // Clear KV entries for all players
+  await clearAllPlayersForGame(env.ACTIVE_PLAYERS, game.players);
+
+  // Clean up wolf channel if exists
+  if (game.wolfChannelId) {
+    try { await deleteChannel(token, game.wolfChannelId); } catch {}
+  }
+
+  // Clean up voice channel if exists
+  if (game.voiceChannelId) {
+    try { await deleteChannel(token, game.voiceChannelId); } catch {}
+  }
+}
+
+async function resolveNightVote(token: string, vote: VoteState, voteMessageId: string, ctx?: ExecutionContext, env?: Env) {
   // Safety: check if already resolved
   try {
     const check: any = await getMessage(token, vote.wolfChannelId, voteMessageId);
@@ -1620,7 +1789,89 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
   // Delete wolf thread — a new one will be created next night
   try { await deleteChannel(token, vote.wolfChannelId); } catch {}
 
-  // Announce in game channel
+  // ── Eliminate victim: update game state ──
+  let game: GameState | null = null;
+  if (vote.lobbyMessageId && vote.gameChannelId) {
+    try {
+      const lobbyMsg: any = await getMessage(token, vote.gameChannelId, vote.lobbyMessageId);
+      game = parseGameFromEmbed(lobbyMsg);
+    } catch {}
+  }
+
+  if (game) {
+    if (!game.dead) game.dead = [];
+    game.dead.push(victimId);
+
+    // Set victim as spectator (can see but not send messages)
+    try {
+      await setChannelPermission(token, vote.gameChannelId, victimId, {
+        allow: String(1 << 10), // VIEW_CHANNEL
+        deny: String(1 << 11), // SEND_MESSAGES
+        type: 1,
+      });
+    } catch {}
+
+    // Persist updated state to lobby embed
+    if (game.lobbyMessageId) {
+      const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+      try {
+        const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+        const embed = msg.embeds?.[0];
+        if (embed) {
+          embed.url = stateUrl;
+          await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
+        }
+      } catch {}
+    }
+
+    // Check win conditions
+    if (env) {
+      const winResult = checkWinCondition(game);
+      if (winResult) {
+        // Announce death first, then victory
+        await sendMessage(token, vote.gameChannelId, {
+          embeds: [{
+            title: "☀️ Le jour se lève...",
+            description: [
+              `Les villageois découvrent avec horreur que **${victim.name}** (<@${victim.id}>) a été dévoré(e) par les loups-garous cette nuit.`,
+              "",
+              "*Un moment de silence pour la victime...*",
+            ].join("\n"),
+            color: EMBED_COLOR,
+            image: { url: SCENE_IMAGES.dawn_breaks },
+          }],
+        });
+        await sleep(3000);
+        await announceVictory(token, game, winResult, env);
+        return;
+      }
+    }
+
+    // Trigger loup_blanc vote on even nights if loup_blanc is alive
+    if (ctx && env && game.nightCount && game.nightCount % 2 === 0) {
+      const dead = game.dead;
+      const loupBlancId = Object.entries(game.roles ?? {}).find(([id, r]) => r === "loup_blanc" && !dead.includes(id));
+      if (loupBlancId) {
+        // Announce death first, then trigger loup_blanc phase
+        await sendMessage(token, vote.gameChannelId, {
+          embeds: [{
+            title: "☀️ Le jour se lève...",
+            description: [
+              `Les villageois découvrent avec horreur que **${victim.name}** (<@${victim.id}>) a été dévoré(e) par les loups-garous cette nuit.`,
+              "",
+              "*Mais la nuit n'est pas encore terminée pour tout le monde...*",
+            ].join("\n"),
+            color: EMBED_COLOR,
+            image: { url: SCENE_IMAGES.dawn_breaks },
+          }],
+        });
+        triggerPhase(ctx, env, "loup_blanc_vote", game);
+        return;
+      }
+    }
+  }
+
+  // Announce in game channel (default path when no game state recovered or no special conditions)
   await sendMessage(token, vote.gameChannelId, {
     embeds: [{
       title: "☀️ Le jour se lève...",
@@ -1633,6 +1884,315 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
       image: { url: SCENE_IMAGES.dawn_breaks },
     }],
   });
+}
+
+// ── Loup Blanc Solo Kill System ──────────────────────────────────────
+
+interface LoupBlancVoteState {
+  gameNumber: number;
+  guildId: string;
+  gameChannelId: string;
+  lobbyMessageId: string;
+  loupBlancId: string;
+  targets: { id: string; name: string }[];
+  dmChannelId: string;
+  dmMessageId: string;
+  deadline: number;
+}
+
+function encodeLBState(lb: LoupBlancVoteState): string {
+  return btoa(JSON.stringify({
+    g: lb.gameNumber, gi: lb.guildId, gc: lb.gameChannelId,
+    lm: lb.lobbyMessageId, lb: lb.loupBlancId,
+    t: lb.targets.map((t) => [t.id, t.name]),
+    dc: lb.dmChannelId, dm: lb.dmMessageId, dl: lb.deadline,
+  }));
+}
+
+function decodeLBState(url: string): LoupBlancVoteState | null {
+  try {
+    const b64 = url.split("/lb/")[1];
+    if (!b64) return null;
+    const c = JSON.parse(atob(b64));
+    return {
+      gameNumber: c.g, guildId: c.gi, gameChannelId: c.gc,
+      lobbyMessageId: c.lm, loupBlancId: c.lb,
+      targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
+      dmChannelId: c.dc, dmMessageId: c.dm, deadline: c.dl,
+    };
+  } catch { return null; }
+}
+
+const LOUP_BLANC_VOTE_SECONDS = 30;
+
+async function phaseLoupBlancVote(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  if (!game.roles) return;
+  const dead = game.dead ?? [];
+
+  const loupBlancEntry = Object.entries(game.roles).find(([id, r]) => r === "loup_blanc" && !dead.includes(id));
+  if (!loupBlancEntry) return;
+  const loupBlancId = loupBlancEntry[0];
+
+  // Targets = living regular wolves (not loup_blanc itself)
+  const wolfTargetIds = Object.entries(game.roles)
+    .filter(([id, r]) => r === "loup" && !dead.includes(id) && id !== loupBlancId)
+    .map(([id]) => id);
+
+  if (wolfTargetIds.length === 0) return; // No wolves to kill
+
+  const targets = await Promise.all(
+    wolfTargetIds.map(async (id) => {
+      const member: any = await getGuildMember(token, game.guildId, id);
+      return { id, name: member.nick || member.user.global_name || member.user.username };
+    })
+  );
+
+  const deadline = Math.floor(Date.now() / 1000) + LOUP_BLANC_VOTE_SECONDS;
+
+  // Create DM channel to loup_blanc
+  const dmChannel: any = await createDM(token, loupBlancId);
+
+  const lbState: LoupBlancVoteState = {
+    gameNumber: game.gameNumber,
+    guildId: game.guildId,
+    gameChannelId: game.gameChannelId,
+    lobbyMessageId: game.lobbyMessageId!,
+    loupBlancId,
+    targets,
+    dmChannelId: dmChannel.id,
+    dmMessageId: "", // will be set after sending
+    deadline,
+  };
+
+  const stateUrl = `https://garou.bot/lb/${encodeLBState(lbState)}`;
+
+  // Build kill buttons + skip button
+  const killButtons: any[] = targets.map((t) => ({
+    type: 2,
+    style: 4,
+    label: `🔪 ${t.name}`,
+    custom_id: `lb_kill_${game.gameNumber}_${t.id}`,
+  }));
+
+  const buttonRows: any[] = [];
+  let currentRow: any[] = [];
+  for (const btn of killButtons) {
+    currentRow.push(btn);
+    if (currentRow.length === 5) {
+      buttonRows.push({ type: 1, components: currentRow });
+      currentRow = [];
+    }
+  }
+  // Add skip button in the last row or a new one
+  currentRow.push({
+    type: 2,
+    style: 2,
+    label: "⏭️ Passer",
+    custom_id: `lb_skip_${game.gameNumber}`,
+  });
+  buttonRows.push({ type: 1, components: currentRow });
+
+  const dmMsg: any = await sendMessage(token, dmChannel.id, {
+    embeds: [{
+      title: `⚪ Loup-Garou Blanc — Nuit ${game.nightCount}`,
+      url: stateUrl,
+      description: [
+        "**C'est ton tour!** Tu peux éliminer un loup-garou cette nuit.",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...targets.map((t) => `🐺 **${t.name}** (<@${t.id}>)`),
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        `⏰ Tu as **${LOUP_BLANC_VOTE_SECONDS}s** pour décider. (<t:${deadline}:R>)`,
+        "",
+        "*Tu peux aussi passer ton tour.*",
+      ].join("\n"),
+      color: 0xffffff,
+      thumbnail: { url: getRoleImage("loup_blanc") },
+    }],
+    components: buttonRows,
+  });
+
+  // Update state with DM message ID and re-encode
+  lbState.dmMessageId = dmMsg.id;
+  const updatedUrl = `https://garou.bot/lb/${encodeLBState(lbState)}`;
+  await editMessage(token, dmChannel.id, dmMsg.id, {
+    embeds: [{
+      ...dmMsg.embeds[0],
+      url: updatedUrl,
+    }],
+    components: buttonRows,
+  });
+
+  // Schedule timer via direct self-invocation (not triggerPhase, since we need custom payload)
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "loup_blanc_timer", lbDmChannelId: dmChannel.id, lbDmMessageId: dmMsg.id }),
+    }).catch((err) => console.error("LB timer trigger failed:", err))
+  );
+}
+
+async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur.", flags: 64 } });
+
+  const lb = (() => {
+    const embed = interaction.message?.embeds?.[0];
+    if (!embed?.url?.includes("/lb/")) return null;
+    return decodeLBState(embed.url);
+  })();
+  if (!lb) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+
+  if (userId !== lb.loupBlancId) {
+    return json({ type: 4, data: { content: "❌ Ce n'est pas ton choix.", flags: 64 } });
+  }
+
+  const customId: string = interaction.data?.custom_id || "";
+  const token = env.DISCORD_BOT_TOKEN;
+
+  // Handle skip
+  if (customId.startsWith("lb_skip_")) {
+    return json({
+      type: 7,
+      data: {
+        embeds: [{
+          title: "⚪ Loup-Garou Blanc — Passé",
+          description: "Tu as choisi de ne tuer personne cette nuit.",
+          color: 0xffffff,
+          thumbnail: { url: getRoleImage("loup_blanc") },
+        }],
+        components: [],
+      },
+    });
+  }
+
+  // Handle kill
+  const targetId = customId.replace(`lb_kill_${lb.gameNumber}_`, "");
+  const target = lb.targets.find((t) => t.id === targetId);
+  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+
+  // Remove buttons immediately
+  const ackResponse = json({
+    type: 7,
+    data: {
+      embeds: [{
+        title: "⚪ Loup-Garou Blanc — Choix fait",
+        description: `Tu as choisi d'éliminer **${target.name}**.`,
+        color: 0xffffff,
+        thumbnail: { url: getRoleImage("loup_blanc") },
+      }],
+      components: [],
+    },
+  });
+
+  // Process kill in background
+  ctx.waitUntil((async () => {
+    try {
+      // Recover game state
+      let game: GameState | null = null;
+      try {
+        const lobbyMsg: any = await getMessage(token, lb.gameChannelId, lb.lobbyMessageId);
+        game = parseGameFromEmbed(lobbyMsg);
+      } catch {}
+      if (!game) return;
+
+      if (!game.dead) game.dead = [];
+      game.dead.push(targetId);
+
+      // Set victim as spectator
+      try {
+        await setChannelPermission(token, lb.gameChannelId, targetId, {
+          allow: String(1 << 10),
+          deny: String(1 << 11),
+          type: 1,
+        });
+      } catch {}
+
+      // Persist state
+      if (game.lobbyMessageId) {
+        const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+        try {
+          const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+          const embed = msg.embeds?.[0];
+          if (embed) {
+            embed.url = stateUrl;
+            await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
+          }
+        } catch {}
+      }
+
+      // Announce mysterious death in game channel
+      await sendMessage(token, lb.gameChannelId, {
+        embeds: [{
+          title: "💀 Une mort mystérieuse...",
+          description: [
+            `Au petit matin, les villageois trouvent le corps sans vie de **${target.name}** (<@${targetId}>).`,
+            "",
+            "*Personne ne sait ce qui s'est passé...*",
+          ].join("\n"),
+          color: 0xffffff,
+          image: { url: SCENE_IMAGES.night_kill },
+        }],
+      });
+
+      // Check win conditions
+      const winResult = checkWinCondition(game);
+      if (winResult) {
+        await sleep(2000);
+        await announceVictory(token, game, winResult, env);
+      }
+    } catch (err) {
+      console.error("Loup Blanc kill error:", err);
+    }
+  })());
+
+  return ackResponse;
+}
+
+async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const dmChannelId = data.lbDmChannelId;
+  const dmMessageId = data.lbDmMessageId;
+  if (!dmChannelId || !dmMessageId) return;
+
+  const start = Date.now();
+  while (Date.now() - start < 25000) {
+    await sleep(5000);
+    try {
+      const msg: any = await getMessage(token, dmChannelId, dmMessageId);
+      if (!msg.components?.length) return; // Already resolved (player clicked)
+      const lb = (() => {
+        const embed = msg.embeds?.[0];
+        if (!embed?.url?.includes("/lb/")) return null;
+        return decodeLBState(embed.url);
+      })();
+      if (!lb) return;
+      if (Date.now() / 1000 >= lb.deadline) {
+        // Auto-skip: remove buttons
+        await editMessage(token, dmChannelId, dmMessageId, {
+          embeds: [{
+            title: "⚪ Loup-Garou Blanc — Temps écoulé",
+            description: "Tu n'as pas choisi à temps. Aucun loup n'est éliminé cette nuit.",
+            color: 0xffffff,
+            thumbnail: { url: getRoleImage("loup_blanc") },
+          }],
+          components: [],
+        });
+        return;
+      }
+    } catch { return; }
+  }
+  // Re-invoke if not resolved yet
+  ctx.waitUntil(
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
+      body: JSON.stringify({ phase: "loup_blanc_timer", ...data }),
+    }).catch((err) => console.error("LB timer re-trigger failed:", err))
+  );
 }
 
 async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1668,7 +2228,7 @@ async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext)
   if (allSameTarget) {
     // Unanimous! Resolve in background
     const token = env.DISCORD_BOT_TOKEN;
-    ctx.waitUntil(resolveNightVote(token, vote, interaction.message.id));
+    ctx.waitUntil(resolveNightVote(token, vote, interaction.message.id, ctx, env));
     return json({ type: 7, data: buildVoteEmbed(vote) });
   }
 
@@ -1746,13 +2306,16 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
     "",
   ];
 
-  // Show wolf teammates if this player is a wolf
-  if (roleKey === "loup") {
+  // Show wolf teammates if this player is a wolf (loup or loup_blanc)
+  if (roleKey === "loup" || roleKey === "loup_blanc") {
     const teammates = Object.entries(game.roles)
-      .filter(([id, r]) => r === "loup" && id !== userId)
+      .filter(([id, r]) => (r === "loup" || r === "loup_blanc") && id !== userId)
       .map(([id]) => `🐺 <@${id}>`);
     if (teammates.length > 0) {
       descLines.push(`**Tes coéquipiers:**`, ...teammates, "", "━━━━━━━━━━━━━━━━━━━━", "");
+    }
+    if (roleKey === "loup_blanc") {
+      descLines.push("⚪ **Objectif secret:** Élimine tous les autres joueurs — loups compris — pour gagner seul!", "", "━━━━━━━━━━━━━━━━━━━━", "");
     }
   }
 
@@ -1837,6 +2400,8 @@ export default {
         try {
           if (phase === "start_game") await startGame(token, payload.game, ctx, env);
           else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
+          else if (phase === "loup_blanc_vote") await phaseLoupBlancVote(token, payload.game, ctx, env);
+          else if (phase === "loup_blanc_timer") await phaseLoupBlancTimer(token, payload, ctx, env);
           else console.error("Unknown phase:", phase);
         } catch (err) {
           console.error(`Phase ${phase} failed:`, err);
@@ -1882,6 +2447,8 @@ export default {
       if (customId.startsWith("reveal_role_")) return handleRevealRole(interaction, env, ctx);
 
       if (customId.startsWith("vote_kill_")) return handleVoteKill(interaction, env, ctx);
+
+      if (customId.startsWith("lb_kill_") || customId.startsWith("lb_skip_")) return handleLoupBlancKill(interaction, env, ctx);
 
       if (customId.startsWith("start_game_") || customId.startsWith("skip_countdown_")) {
         const handler = customId.startsWith("skip_countdown_") ? handleSkipCountdown : handleStart;
