@@ -1607,42 +1607,47 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
   if (!roleKey) return json({ type: 4, data: { content: "❌ Aucun rôle trouvé pour toi.", flags: 64 } });
 
   const role = ROLES[roleKey]!;
-
-  // Track that this player has seen their role
-  // Fetch latest message to avoid race condition (multiple players clicking at once)
   const token = env.DISCORD_BOT_TOKEN;
+
+  // Update seen list in background with retry loop to handle concurrent clicks
   if (game.lobbyMessageId) {
-    try {
-      const latestMsg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
-      const latest = parseGameFromEmbed(latestMsg);
-      if (latest) {
-        game.seen = latest.seen ?? [];
-        if (latest.wolfChannelId) game.wolfChannelId = latest.wolfChannelId;
+    ctx.waitUntil((async () => {
+      const lobbyId = game.lobbyMessageId!;
+      const channelId = game.gameChannelId;
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          // Always re-read the latest embed before writing
+          const latestMsg: any = await getMessage(token, channelId, lobbyId);
+          const latest = parseGameFromEmbed(latestMsg);
+          if (!latest) return;
+
+          const seen = latest.seen ?? [];
+          if (seen.includes(userId)) return; // Already saved by another attempt
+          seen.push(userId);
+          latest.seen = seen;
+
+          await editMessage(token, channelId, lobbyId, buildRoleCheckEmbed(latest));
+
+          // Verify our write persisted
+          await sleep(150);
+          const verifyMsg: any = await getMessage(token, channelId, lobbyId);
+          const verify = parseGameFromEmbed(verifyMsg);
+          if (verify?.seen?.includes(userId)) {
+            // All players seen → trigger countdown + night
+            if (verify.seen.length >= verify.players.length) {
+              const title: string = verifyMsg.embeds?.[0]?.title ?? "";
+              if (title.includes("Découvrez vos rôles")) {
+                await runCountdownAndNight(token, verify, ctx, env);
+              }
+            }
+            return; // Success
+          }
+          // Our write was overwritten — retry with backoff
+          await sleep(200 * (attempt + 1));
+        } catch {}
       }
-    } catch {}
-  }
-  if (!game.seen) game.seen = [];
-  if (!game.seen.includes(userId)) {
-    game.seen.push(userId);
-  }
-
-  // Update role check embed with latest seen list
-
-  if (game.lobbyMessageId) {
-    try {
-      await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
-    } catch {}
-  }
-
-  // All players seen → run countdown + night directly in background
-  if (game.seen.length >= game.players.length) {
-    try {
-      const checkMsg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
-      const title: string = checkMsg.embeds?.[0]?.title ?? "";
-      if (title.includes("Découvrez vos rôles")) {
-        ctx.waitUntil(runCountdownAndNight(token, game, ctx, env));
-      }
-    } catch {}
+    })());
   }
 
   // Build description lines
