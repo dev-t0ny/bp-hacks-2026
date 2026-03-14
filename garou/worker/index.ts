@@ -41,11 +41,19 @@ function editMessage(token: string, channelId: string, messageId: string, body: 
   });
 }
 
+function deleteMessage(token: string, channelId: string, messageId: string) {
+  return discordFetch(token, `/channels/${channelId}/messages/${messageId}`, { method: "DELETE" });
+}
+
 function createChannel(token: string, guildId: string, body: Record<string, unknown>) {
   return discordFetch(token, `/guilds/${guildId}/channels`, {
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+function deleteChannel(token: string, channelId: string) {
+  return discordFetch(token, `/channels/${channelId}`, { method: "DELETE" });
 }
 
 function getGuildChannels(token: string, guildId: string) {
@@ -64,6 +72,10 @@ function setChannelPermission(
   });
 }
 
+function deleteChannelPermission(token: string, channelId: string, targetId: string) {
+  return discordFetch(token, `/channels/${channelId}/permissions/${targetId}`, { method: "DELETE" });
+}
+
 function getGuildMember(token: string, guildId: string, userId: string) {
   return discordFetch(token, `/guilds/${guildId}/members/${userId}`);
 }
@@ -73,7 +85,6 @@ function getBotUser(token: string) {
 }
 
 function editOriginalInteractionResponse(appId: string, interactionToken: string, body: Record<string, unknown>) {
-  // This endpoint doesn't use Bot auth — it uses the interaction token
   return fetch(`${DISCORD_API}/webhooks/${appId}/${interactionToken}/messages/@original`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -81,9 +92,11 @@ function editOriginalInteractionResponse(appId: string, interactionToken: string
   });
 }
 
-// ── Embed Builder ───────────────────────────────────────────────────
+// ── Game State ──────────────────────────────────────────────────────
 
 const EMBED_COLOR = 0x8b0000;
+const EMBED_COLOR_GREEN = 0x2ecc71;
+const EMBED_COLOR_ORANGE = 0xe67e22;
 const WEREWOLF_IMAGE = "https://i.imgur.com/JfOLPcY.png";
 const MIN_PLAYERS = 4;
 const MAX_PLAYERS = 20;
@@ -96,9 +109,11 @@ interface GameState {
   gameChannelId: string;
   maxPlayers: number;
   players: string[];
+  lobbyMessageId?: string;
+  announceChannelId?: string;
+  announceMessageId?: string;
 }
 
-// Encode game state as base64 in embed URL (invisible to users)
 function encodeState(game: GameState): string {
   const compact = {
     g: game.gameNumber,
@@ -108,6 +123,9 @@ function encodeState(game: GameState): string {
     ch: game.gameChannelId,
     m: game.maxPlayers,
     p: game.players,
+    lm: game.lobbyMessageId,
+    ac: game.announceChannelId,
+    am: game.announceMessageId,
   };
   return btoa(JSON.stringify(compact));
 }
@@ -125,13 +143,18 @@ function decodeState(url: string): GameState | null {
       gameChannelId: compact.ch,
       maxPlayers: compact.m,
       players: compact.p ?? [],
+      lobbyMessageId: compact.lm,
+      announceChannelId: compact.ac,
+      announceMessageId: compact.am,
     };
   } catch {
     return null;
   }
 }
 
-function buildGameEmbed(game: GameState) {
+// ── Embed Builders ──────────────────────────────────────────────────
+
+function buildAnnounceEmbed(game: GameState) {
   const playerCount = game.players.length;
   const isFull = playerCount >= game.maxPlayers;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
@@ -161,7 +184,7 @@ function buildGameEmbed(game: GameState) {
         color: EMBED_COLOR,
         image: { url: WEREWOLF_IMAGE },
         footer: {
-          text: isFull ? "La partie va commencer!" : `Minimum ${MIN_PLAYERS} joueurs pour lancer`,
+          text: isFull ? "La partie est pleine!" : `Minimum ${MIN_PLAYERS} joueurs pour lancer`,
         },
       },
     ],
@@ -180,6 +203,61 @@ function buildGameEmbed(game: GameState) {
             ],
           },
         ],
+  };
+}
+
+function buildLobbyEmbed(game: GameState) {
+  const playerCount = game.players.length;
+  const isFull = playerCount >= game.maxPlayers;
+  const canStart = playerCount >= MIN_PLAYERS;
+  const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  const playerList =
+    game.players.length > 0
+      ? game.players
+          .map((id, i) => {
+            const prefix = id === game.creatorId ? "👑" : `${i + 1}.`;
+            return `${prefix} <@${id}>`;
+          })
+          .join("\n")
+      : "*Aucun joueur pour l'instant...*";
+
+  const statusLine = isFull
+    ? "🟢 **La partie est pleine!** Prêt à lancer."
+    : canStart
+      ? `🟡 **${playerCount}/${game.maxPlayers}** — Prêt à lancer ou en attente de joueurs...`
+      : `🔴 **${playerCount}/${game.maxPlayers}** — En attente de joueurs (min. ${MIN_PLAYERS})`;
+
+  const buttons: any[] = [];
+  if (canStart) {
+    buttons.push({
+      type: 2,
+      style: 3,
+      label: "▶️ Lancer la partie",
+      custom_id: `start_game_${game.gameNumber}`,
+    });
+  }
+  buttons.push({
+    type: 2,
+    style: 4,
+    label: "🚪 Quitter la partie",
+    custom_id: `quit_game_${game.gameNumber}`,
+  });
+
+  return {
+    embeds: [
+      {
+        title: `🐺 Salle d'attente — Partie #${game.gameNumber}`,
+        url: stateUrl,
+        description: [statusLine, "", "**Joueurs:**", playerList].join("\n"),
+        color: canStart ? (isFull ? EMBED_COLOR_GREEN : EMBED_COLOR_ORANGE) : EMBED_COLOR,
+        thumbnail: { url: WEREWOLF_IMAGE },
+        footer: {
+          text: `Créée par ${game.creatorName} · ${playerCount}/${game.maxPlayers} joueurs`,
+        },
+      },
+    ],
+    components: [{ type: 1, components: buttons }],
   };
 }
 
@@ -221,11 +299,7 @@ async function findOrCreateCategory(token: string, guildId: string): Promise<str
     (c: any) => c.type === 4 && c.name.toLowerCase() === "loup-garou"
   );
   if (existing) return existing.id;
-
-  const created: any = await createChannel(token, guildId, {
-    name: "Loup-Garou",
-    type: 4,
-  });
+  const created: any = await createChannel(token, guildId, { name: "Loup-Garou", type: 4 });
   return created.id;
 }
 
@@ -237,7 +311,18 @@ async function getNextGameNumber(token: string, guildId: string, categoryId: str
   return gameChannels.length + 1;
 }
 
-// ── Slash Command Handler (/loupgarou) ──────────────────────────────
+async function updateAllEmbeds(token: string, game: GameState) {
+  const promises: Promise<any>[] = [];
+  if (game.lobbyMessageId) {
+    promises.push(editMessage(token, game.gameChannelId, game.lobbyMessageId, buildLobbyEmbed(game)));
+  }
+  if (game.announceChannelId && game.announceMessageId) {
+    promises.push(editMessage(token, game.announceChannelId, game.announceMessageId, buildAnnounceEmbed(game)));
+  }
+  await Promise.all(promises);
+}
+
+// ── /loupgarou ──────────────────────────────────────────────────────
 
 async function handleSlashCommand(interaction: any, env: Env): Promise<Response> {
   const token = env.DISCORD_BOT_TOKEN;
@@ -248,69 +333,34 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
   const userId = interaction.member?.user?.id;
 
   if (!guildId || !channelId || !userId) {
-    return json({
-      type: 4,
-      data: { content: "❌ Cette commande ne fonctionne que dans un serveur Discord.", flags: 64 },
-    });
+    return json({ type: 4, data: { content: "❌ Cette commande ne fonctionne que dans un serveur Discord.", flags: 64 } });
   }
 
-  // Get the joueurs option
   const maxPlayers = interaction.data?.options?.find((o: any) => o.name === "joueurs")?.value;
   if (!maxPlayers || maxPlayers < MIN_PLAYERS || maxPlayers > MAX_PLAYERS) {
-    return json({
-      type: 4,
-      data: { content: `❌ Le nombre de joueurs doit être entre ${MIN_PLAYERS} et ${MAX_PLAYERS}.`, flags: 64 },
-    });
+    return json({ type: 4, data: { content: `❌ Le nombre de joueurs doit être entre ${MIN_PLAYERS} et ${MAX_PLAYERS}.`, flags: 64 } });
   }
 
-  // Respond with DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE (type 5) — shows "thinking..."
-  // Then do the heavy work in the background
   const deferredResponse = json({ type: 5 });
 
-  // Use waitUntil pattern for background work
-  const ctx = { waitUntil: (p: Promise<any>) => p }; // Cloudflare provides this via ExecutionContext
-
-  // Actually, we can't access executionContext in this function signature.
-  // Instead, return the deferred response and handle the rest with a fetch to ourselves.
-  // OR: we just do everything before responding (Discord gives us 3 seconds).
-  // For safety, let's use the deferred approach properly.
-
-  // We'll return the deferred response and schedule background work via a global promise
   const backgroundWork = (async () => {
     try {
-      // Get creator info
       const member: any = await getGuildMember(token, guildId, userId);
       const creatorName = member.nick || member.user.global_name || member.user.username;
-
-      // Find or create category
       const categoryId = await findOrCreateCategory(token, guildId);
-
-      // Get game number
       const gameNumber = await getNextGameNumber(token, guildId, categoryId);
-
-      // Get bot user for permissions
       const botUser: any = await getBotUser(token);
 
-      // Create game channel
       const gameChannel: any = await createChannel(token, guildId, {
         name: `partie-${gameNumber}`,
         type: 0,
         parent_id: categoryId,
         permission_overwrites: [
-          {
-            id: guildId,
-            type: 0,
-            deny: String(1 << 10), // VIEW_CHANNEL denied for @everyone
-          },
-          {
-            id: botUser.id,
-            type: 1,
-            allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)),
-          },
+          { id: guildId, type: 0, deny: String(1 << 10) },
+          { id: botUser.id, type: 1, allow: String((1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)) },
         ],
       });
 
-      // Build game state
       const gameState: GameState = {
         gameNumber,
         creatorId: userId,
@@ -319,30 +369,30 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
         gameChannelId: gameChannel.id,
         maxPlayers,
         players: [],
+        announceChannelId: channelId,
       };
 
-      // Edit the deferred response with the game embed
-      const embedPayload = buildGameEmbed(gameState);
-      await editOriginalInteractionResponse(appId, interactionToken, embedPayload);
+      // Send lobby embed in game channel
+      const lobbyMsg: any = await sendMessage(token, gameChannel.id, buildLobbyEmbed(gameState));
+      gameState.lobbyMessageId = lobbyMsg.id;
 
-      // Send welcome message in game channel
-      await sendMessage(token, gameChannel.id, {
-        embeds: [
-          {
-            title: `🐺 Salle d'attente — Partie #${gameNumber}`,
-            description: [
-              `Créée par **${creatorName}**`,
-              `**Joueurs max:** ${maxPlayers}`,
-              "",
-              "En attente de joueurs...",
-            ].join("\n"),
-            color: EMBED_COLOR,
-          },
-        ],
-      });
+      // Edit deferred response with announce embed
+      await editOriginalInteractionResponse(appId, interactionToken, buildAnnounceEmbed(gameState));
+
+      // Get announce message ID
+      const origRes = await fetch(
+        `${DISCORD_API}/webhooks/${appId}/${interactionToken}/messages/@original`,
+        { headers: { "Content-Type": "application/json" } }
+      );
+      if (origRes.ok) {
+        const origMsg: any = await origRes.json();
+        gameState.announceMessageId = origMsg.id;
+      }
+
+      // Re-edit both with complete state (now includes all message IDs)
+      await updateAllEmbeds(token, gameState);
     } catch (err) {
       console.error("Error in /loupgarou handler:", err);
-      // Try to edit the deferred response with an error message
       try {
         await editOriginalInteractionResponse(appId, interactionToken, {
           content: "❌ Une erreur est survenue lors de la création de la partie.",
@@ -351,84 +401,37 @@ async function handleSlashCommand(interaction: any, env: Env): Promise<Response>
     }
   })();
 
-  // Store promise so Cloudflare doesn't kill it (handled via ctx.waitUntil in the main handler)
   (globalThis as any).__backgroundWork = backgroundWork;
-
   return deferredResponse;
 }
 
-// ── Button Handler (join game) ──────────────────────────────────────
+// ── Join ────────────────────────────────────────────────────────────
 
 async function handleJoin(interaction: any, env: Env): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) {
-    return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
-  }
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
 
   const game = parseGameFromEmbed(interaction.message);
-  if (!game) {
-    return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
-  }
-
-  if (game.players.includes(userId)) {
-    return json({ type: 4, data: { content: "❌ Tu es déjà dans cette partie!", flags: 64 } });
-  }
-  if (game.players.length >= game.maxPlayers) {
-    return json({ type: 4, data: { content: "❌ La partie est pleine!", flags: 64 } });
-  }
+  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+  if (game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu es déjà dans cette partie!", flags: 64 } });
+  if (game.players.length >= game.maxPlayers) return json({ type: 4, data: { content: "❌ La partie est pleine!", flags: 64 } });
 
   const token = env.DISCORD_BOT_TOKEN;
   game.players.push(userId);
 
-  // Channel permission — allow view, deny send
   await setChannelPermission(token, game.gameChannelId, userId, {
     allow: String(1 << 10),
     deny: String(1 << 11),
     type: 1,
   });
 
-  // Update embed
-  const channelId = interaction.channel_id;
-  const messageId = interaction.message.id;
-  await editMessage(token, channelId, messageId, buildGameEmbed(game));
+  await updateAllEmbeds(token, game);
 
-  // Get player name
   const member: any = await getGuildMember(token, game.guildId, userId);
   const playerName = member.nick || member.user.global_name || member.user.username;
-
-  // Send join message in game channel
   await sendMessage(token, game.gameChannelId, {
     content: `**${playerName}** a rejoint la partie! (${game.players.length}/${game.maxPlayers})`,
   });
-
-  // Full → announce start
-  if (game.players.length >= game.maxPlayers) {
-    await sendMessage(token, game.gameChannelId, {
-      embeds: [
-        {
-          title: "🎮 La partie est pleine!",
-          description: "La partie de Loup-Garou va commencer...",
-          color: 0x00ff00,
-        },
-      ],
-    });
-  } else if (game.players.length === MIN_PLAYERS) {
-    await sendMessage(token, game.gameChannelId, {
-      embeds: [
-        {
-          title: "✅ Minimum de joueurs atteint!",
-          description: [
-            `**${MIN_PLAYERS}** joueurs sont prêts.`,
-            "",
-            `<@${game.creatorId}> peut lancer la partie avec \`/start\`.`,
-            "",
-            "Ou attendez que plus de joueurs rejoignent...",
-          ].join("\n"),
-          color: 0xffa500,
-        },
-      ],
-    });
-  }
 
   return json({
     type: 4,
@@ -439,17 +442,127 @@ async function handleJoin(interaction: any, env: Env): Promise<Response> {
         {
           type: 1,
           components: [
-            {
-              type: 2,
-              style: 5,
-              label: "🐺 Aller au salon",
-              url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}`,
-            },
+            { type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` },
           ],
         },
       ],
     },
   });
+}
+
+// ── Quit ────────────────────────────────────────────────────────────
+
+async function handleQuit(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+
+  const game = parseGameFromEmbed(interaction.message);
+  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+  if (!game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu n'es pas dans cette partie.", flags: 64 } });
+
+  const token = env.DISCORD_BOT_TOKEN;
+  game.players = game.players.filter((id) => id !== userId);
+
+  try { await deleteChannelPermission(token, game.gameChannelId, userId); } catch {}
+
+  const member: any = await getGuildMember(token, game.guildId, userId);
+  const playerName = member.nick || member.user.global_name || member.user.username;
+
+  // No players left → delete everything
+  if (game.players.length === 0) {
+    try { await deleteChannel(token, game.gameChannelId); } catch {}
+    if (game.announceChannelId && game.announceMessageId) {
+      try { await deleteMessage(token, game.announceChannelId, game.announceMessageId); } catch {}
+    }
+    return json({ type: 4, data: { content: `🗑️ La Partie #${game.gameNumber} a été supprimée (plus aucun joueur).`, flags: 64 } });
+  }
+
+  // Creator left → transfer
+  if (userId === game.creatorId) {
+    const newCreatorId = game.players[Math.floor(Math.random() * game.players.length)]!;
+    game.creatorId = newCreatorId;
+    const newCreatorMember: any = await getGuildMember(token, game.guildId, newCreatorId);
+    game.creatorName = newCreatorMember.nick || newCreatorMember.user.global_name || newCreatorMember.user.username;
+
+    await sendMessage(token, game.gameChannelId, {
+      content: `👑 **${playerName}** a quitté la partie. **${game.creatorName}** est maintenant le créateur!`,
+    });
+  } else {
+    await sendMessage(token, game.gameChannelId, {
+      content: `🚪 **${playerName}** a quitté la partie. (${game.players.length}/${game.maxPlayers})`,
+    });
+  }
+
+  await updateAllEmbeds(token, game);
+
+  return json({ type: 4, data: { content: `🚪 Tu as quitté la Partie #${game.gameNumber}.`, flags: 64 } });
+}
+
+// ── Start ───────────────────────────────────────────────────────────
+
+async function handleStart(interaction: any, env: Env): Promise<Response> {
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+
+  const game = parseGameFromEmbed(interaction.message);
+  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+
+  if (userId !== game.creatorId) {
+    return json({ type: 4, data: { content: `❌ Seul le créateur (<@${game.creatorId}>) peut lancer la partie.`, flags: 64 } });
+  }
+  if (game.players.length < MIN_PLAYERS) {
+    return json({ type: 4, data: { content: `❌ Il faut au minimum ${MIN_PLAYERS} joueurs pour lancer.`, flags: 64 } });
+  }
+
+  const token = env.DISCORD_BOT_TOKEN;
+  const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+
+  // Update lobby embed — remove buttons, show "started"
+  if (game.lobbyMessageId) {
+    await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+      embeds: [
+        {
+          title: `🎮 Partie #${game.gameNumber} — En cours!`,
+          url: stateUrl,
+          description: [
+            `**${game.players.length} joueurs:**`,
+            "",
+            ...game.players.map((id, i) => {
+              const prefix = id === game.creatorId ? "👑" : `${i + 1}.`;
+              return `${prefix} <@${id}>`;
+            }),
+          ].join("\n"),
+          color: EMBED_COLOR_GREEN,
+          thumbnail: { url: WEREWOLF_IMAGE },
+          footer: { text: "La partie a commencé!" },
+        },
+      ],
+      components: [],
+    });
+  }
+
+  // Update announce embed — remove join button
+  if (game.announceChannelId && game.announceMessageId) {
+    await editMessage(token, game.announceChannelId, game.announceMessageId, {
+      embeds: [
+        {
+          title: `🎮 Partie #${game.gameNumber} — En cours!`,
+          url: stateUrl,
+          description: [`Lancée par <@${game.creatorId}>`, "", `**${game.players.length} joueurs**`].join("\n"),
+          color: EMBED_COLOR_GREEN,
+          image: { url: WEREWOLF_IMAGE },
+          footer: { text: "La partie est en cours!" },
+        },
+      ],
+      components: [],
+    });
+  }
+
+  await sendMessage(token, game.gameChannelId, {
+    content: `# 🐺 La partie commence!\n\n**${game.players.length} joueurs** sont prêts.\n\n*L'attribution des rôles arrive bientôt...*`,
+  });
+
+  return json({ type: 4, data: { content: `🎮 La Partie #${game.gameNumber} a été lancée!`, flags: 64 } });
 }
 
 // ── Worker Entry Point ──────────────────────────────────────────────
@@ -470,17 +583,11 @@ export default {
 
     const interaction = JSON.parse(body);
 
-    // PING handshake
-    if (interaction.type === 1) {
-      return json({ type: 1 });
-    }
+    if (interaction.type === 1) return json({ type: 1 });
 
-    // APPLICATION_COMMAND (slash commands)
     if (interaction.type === 2) {
-      const commandName = interaction.data?.name;
-      if (commandName === "loupgarou") {
+      if (interaction.data?.name === "loupgarou") {
         const response = await handleSlashCommand(interaction, env);
-        // Wait for background work to complete
         const bgWork = (globalThis as any).__backgroundWork;
         if (bgWork) {
           ctx.waitUntil(bgWork);
@@ -490,12 +597,11 @@ export default {
       }
     }
 
-    // MESSAGE_COMPONENT (button clicks)
     if (interaction.type === 3) {
       const customId: string = interaction.data?.custom_id || "";
-      if (customId.startsWith("join_game_")) {
-        return await handleJoin(interaction, env);
-      }
+      if (customId.startsWith("join_game_")) return handleJoin(interaction, env);
+      if (customId.startsWith("quit_game_")) return handleQuit(interaction, env);
+      if (customId.startsWith("start_game_")) return handleStart(interaction, env);
     }
 
     return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
