@@ -3734,6 +3734,7 @@ export default {
       const work = (async () => {
         try {
           if (phase === "start_game") await startGame(token, payload.game, ctx, env);
+          else if (phase === "night_start") await startNightPhase(token, payload.game, ctx, env);
           else if (phase === "voyante_phase") await phaseVoyante(token, payload.game, ctx, env);
           else if (phase === "voyante_timer") await phaseVoyanteTimer(token, payload, ctx, env);
           else if (phase === "wolf_phase") await startWolfPhase(token, payload.game, ctx, env);
