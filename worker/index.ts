@@ -17,20 +17,40 @@ async function clearPlayerActive(kv: KVNamespace, userId: string) {
 async function getActiveGame(kv: KVNamespace, token: string, userId: string): Promise<number | null> {
   const val = await kv.get(`player:${userId}`);
   if (!val) return null;
-  const { g: gameNumber, ch: channelId } = JSON.parse(val);
+
+  let gameNumber: number;
+  let channelId: string | undefined;
+  try {
+    const parsed = JSON.parse(val);
+    if (typeof parsed === "number") {
+      // Legacy format: plain number — clear it (no channel to verify)
+      await kv.delete(`player:${userId}`);
+      return null;
+    }
+    gameNumber = parsed.g;
+    channelId = parsed.ch;
+  } catch {
+    // Unparseable — clear stale entry
+    await kv.delete(`player:${userId}`);
+    return null;
+  }
+
+  if (!channelId) {
+    await kv.delete(`player:${userId}`);
+    return null;
+  }
+
   // Verify the game channel still exists
   try {
     const res = await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
       headers: { Authorization: `Bot ${token}` },
     });
     if (res.status === 404 || res.status === 403) {
-      // Channel deleted — player is no longer in a game
       await kv.delete(`player:${userId}`);
       return null;
     }
-  } catch {
-    // Network error — assume channel exists to be safe
-  }
+  } catch {}
+
   return gameNumber;
 }
 async function clearAllPlayersForGame(kv: KVNamespace, playerIds: string[]) {
