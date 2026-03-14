@@ -784,11 +784,10 @@ async function startGame(token: string, game: GameState) {
     } catch { break; }
   }
 
-  // ── "La partie débute dans 30s" ──
-  const startTime = Math.floor(Date.now() / 1000) + GAME_START_DELAY;
+  // ── "La partie débute dans 10s" ──
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
     embeds: [{
-      title: `⏳ La partie débute bientôt — Partie #${game.gameNumber}`,
+      title: `⏳ La partie débute dans ${GAME_START_DELAY}s — Partie #${game.gameNumber}`,
       url: `https://garou.bot/s/${encodeState(game)}`,
       description: [
         "✅ Les rôles ont été distribués!",
@@ -799,7 +798,7 @@ async function startGame(token: string, game: GameState) {
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
-        `🐺 La première nuit commence <t:${startTime}:R>`,
+        "🐺 La première nuit arrive bientôt...",
         "",
         "*Préparez-vous...*",
       ].join("\n"),
@@ -811,6 +810,27 @@ async function startGame(token: string, game: GameState) {
   });
 
   await sleep(GAME_START_DELAY * 1000);
+
+  // ── Update lobby embed to show night has started ──
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+    embeds: [{
+      title: `🌑 La nuit tombe — Partie #${game.gameNumber}`,
+      url: `https://garou.bot/s/${encodeState(game)}`,
+      description: [
+        "*Les villageois s'endorment...*",
+        "*Les loups-garous ouvrent les yeux.* 🐺",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        ...game.players.map((id) => `🎭 <@${id}>`),
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+      ].join("\n"),
+      color: EMBED_COLOR_NIGHT,
+      thumbnail: { url: WEREWOLF_IMAGE },
+    }],
+    components: [],
+  });
 
   // ── Start Night Phase ──
   await startNightPhase(token, game);
@@ -916,7 +936,7 @@ async function runCountdown(token: string, game: GameState) {
 
 const NIGHT_VOTE_SECONDS = 90;
 const ROLE_CHECK_TIMEOUT = 120; // 2 minutes to check roles
-const GAME_START_DELAY = 30; // 30s countdown before night
+const GAME_START_DELAY = 10; // 10s countdown before night
 
 interface VoteState {
   gameNumber: number;
