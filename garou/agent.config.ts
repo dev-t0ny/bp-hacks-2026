@@ -5,8 +5,8 @@ export default defineConfig({
   description: "An AI agent built with Botpress ADK",
 
   defaultModels: {
-    autonomous: "anthropic:claude-sonnet-4-20250514",
-    zai: "anthropic:claude-sonnet-4-20250514",
+    autonomous: "best",
+    zai: "best",
   },
 
   bot: {
