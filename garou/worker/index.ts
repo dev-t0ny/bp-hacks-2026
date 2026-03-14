@@ -84,6 +84,13 @@ function getBotUser(token: string) {
   return discordFetch(token, "/users/@me");
 }
 
+function createDM(token: string, userId: string) {
+  return discordFetch(token, "/users/@me/channels", {
+    method: "POST",
+    body: JSON.stringify({ recipient_id: userId }),
+  });
+}
+
 function editOriginalInteractionResponse(appId: string, interactionToken: string, body: Record<string, unknown>) {
   return fetch(`${DISCORD_API}/webhooks/${appId}/${interactionToken}/messages/@original`, {
     method: "PATCH",
@@ -100,6 +107,56 @@ const EMBED_COLOR_ORANGE = 0xe67e22;
 const WEREWOLF_IMAGE = "https://i.imgur.com/JfOLPcY.png";
 const MIN_PLAYERS = 4;
 const MAX_PLAYERS = 20;
+
+// ── Roles ───────────────────────────────────────────────────────────
+
+interface Role {
+  name: string;
+  emoji: string;
+  team: "village" | "loups";
+  description: string;
+}
+
+const ROLES: Record<string, Role> = {
+  loup: {
+    name: "Loup-Garou",
+    emoji: "🐺",
+    team: "loups",
+    description: "Chaque nuit, éliminez un villageois avec votre meute. Ne vous faites pas démasquer!",
+  },
+  sorciere: {
+    name: "Sorcière",
+    emoji: "🧪",
+    team: "village",
+    description: "Vous avez une potion de vie et une potion de mort. Utilisez-les avec sagesse.",
+  },
+  cupidon: {
+    name: "Cupidon",
+    emoji: "💘",
+    team: "village",
+    description: "Au début de la partie, liez deux joueurs par l'amour. Si l'un meurt, l'autre aussi.",
+  },
+  villageois: {
+    name: "Villageois",
+    emoji: "🧑‍🌾",
+    team: "village",
+    description: "Trouvez et éliminez les loups-garous lors des votes du village. Votre instinct est votre arme.",
+  },
+};
+
+function assignRoles(playerCount: number): string[] {
+  // Fixed: 2 loups, 1 sorcière, 1 cupidon, reste = villageois
+  const roles: string[] = ["loup", "loup", "sorciere", "cupidon"];
+  for (let i = roles.length; i < playerCount; i++) {
+    roles.push("villageois");
+  }
+  // Shuffle (Fisher-Yates)
+  for (let i = roles.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [roles[i], roles[j]] = [roles[j]!, roles[i]!];
+  }
+  return roles;
+}
 
 interface GameState {
   gameNumber: number;
@@ -524,6 +581,43 @@ async function handleStart(interaction: any, env: Env): Promise<Response> {
   const token = env.DISCORD_BOT_TOKEN;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
+  // Assign roles
+  const roleKeys = assignRoles(game.players.length);
+  const playerRoles = game.players.map((id, i) => ({ id, roleKey: roleKeys[i]!, role: ROLES[roleKeys[i]!]! }));
+
+  // DM each player their role
+  const dmPromises = playerRoles.map(async ({ id, role }) => {
+    try {
+      const dm: any = await createDM(token, id);
+      await sendMessage(token, dm.id, {
+        embeds: [
+          {
+            title: `${role.emoji} Tu es **${role.name}**`,
+            description: [
+              role.description,
+              "",
+              "━━━━━━━━━━━━━━━━━━━━",
+              "",
+              `🎮 **Partie #${game.gameNumber}**`,
+              `👥 **${game.players.length} joueurs**`,
+              `⚔️ Équipe: **${role.team === "loups" ? "Loups-Garous" : "Village"}**`,
+            ].join("\n"),
+            color: role.team === "loups" ? EMBED_COLOR : EMBED_COLOR_GREEN,
+            thumbnail: { url: WEREWOLF_IMAGE },
+            footer: { text: "Ne révèle ton rôle à personne!" },
+          },
+        ],
+      });
+    } catch (err) {
+      console.error(`Failed to DM role to ${id}:`, err);
+    }
+  });
+  await Promise.all(dmPromises);
+
+  // Build role summary for game channel (no spoilers — just team counts)
+  const loupCount = playerRoles.filter((p) => p.role.team === "loups").length;
+  const villageCount = playerRoles.filter((p) => p.role.team === "village").length;
+
   // Update lobby embed — remove buttons, show "started"
   if (game.lobbyMessageId) {
     await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
@@ -534,14 +628,16 @@ async function handleStart(interaction: any, env: Env): Promise<Response> {
           description: [
             `**${game.players.length} joueurs:**`,
             "",
-            ...game.players.map((id, i) => {
-              const prefix = id === game.creatorId ? "👑" : `${i + 1}.`;
-              return `${prefix} <@${id}>`;
-            }),
+            ...game.players.map((id) => `🐺 <@${id}>`),
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "",
+            `🐺 **${loupCount}** loup${loupCount > 1 ? "s" : ""} rôdent parmi vous...`,
+            `🏘️ **${villageCount}** villageois doivent survivre.`,
           ].join("\n"),
           color: EMBED_COLOR_GREEN,
           thumbnail: { url: WEREWOLF_IMAGE },
-          footer: { text: "La partie a commencé!" },
+          footer: { text: "Les rôles ont été distribués en DM!" },
         },
       ],
       components: [],
@@ -566,10 +662,19 @@ async function handleStart(interaction: any, env: Env): Promise<Response> {
   }
 
   await sendMessage(token, game.gameChannelId, {
-    content: `# 🐺 La partie commence!\n\n**${game.players.length} joueurs** sont prêts.\n\n*L'attribution des rôles arrive bientôt...*`,
+    content: [
+      "# 🌕 La nuit tombe sur le village...",
+      "",
+      `**${game.players.length} joueurs** ont reçu leur rôle en message privé.`,
+      "",
+      `> 🐺 **${loupCount}** loup${loupCount > 1 ? "s-garous se cachent" : "-garou se cache"} parmi vous`,
+      `> 🏘️ **${villageCount}** membres du village doivent les démasquer`,
+      "",
+      "*Consultez vos DMs pour découvrir votre rôle!*",
+    ].join("\n"),
   });
 
-  return json({ type: 4, data: { content: `🎮 La Partie #${game.gameNumber} a été lancée!`, flags: 64 } });
+  return json({ type: 4, data: { content: `🎮 La Partie #${game.gameNumber} a été lancée! Vérifie tes DMs pour ton rôle.`, flags: 64 } });
 }
 
 // ── Worker Entry Point ──────────────────────────────────────────────
