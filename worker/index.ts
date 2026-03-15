@@ -407,11 +407,34 @@ function assignRoles(
     }
     roleKeys.length = totalCount;
   } else {
-    roleKeys = ["loup", "loup", "voyante", "sorciere", "cupidon"];
-    if (totalCount >= 6) roleKeys.push("chasseur");
-    if (totalCount >= 7) roleKeys.push("petite_fille");
-    if (totalCount >= 8) roleKeys.push("loup_blanc");
-    for (let i = roleKeys.length; i < totalCount; i++) roleKeys.push("villageois");
+    // Balanced random role assignment:
+    // ~1/3 wolves (min 1, max floor(total/3)), rest village
+    // Special village roles randomly picked from pool (equal chance for all)
+    const wolfCount = Math.max(1, Math.min(Math.floor(totalCount / 3), 4));
+    const villageCount = totalCount - wolfCount;
+
+    // Wolf roles: always regular loups, chance for loup_blanc if 2+ wolves
+    const wolves: string[] = [];
+    if (wolfCount >= 2 && secureRandom() < 0.4) {
+      wolves.push("loup_blanc");
+      for (let i = 1; i < wolfCount; i++) wolves.push("loup");
+    } else {
+      for (let i = 0; i < wolfCount; i++) wolves.push("loup");
+    }
+
+    // Village roles: pick random special roles from pool (each has equal chance)
+    const specialPool = ["voyante", "sorciere", "cupidon", "chasseur", "petite_fille"];
+    // Shuffle the pool randomly
+    for (let i = specialPool.length - 1; i > 0; i--) {
+      const j = Math.floor(secureRandom() * (i + 1));
+      [specialPool[i], specialPool[j]] = [specialPool[j]!, specialPool[i]!];
+    }
+    // Pick up to (villageCount - 1) special roles (always keep at least 1 plain villageois)
+    const specialCount = Math.min(specialPool.length, villageCount - 1);
+    const village: string[] = specialPool.slice(0, specialCount);
+    for (let i = village.length; i < villageCount; i++) village.push("villageois");
+
+    roleKeys = [...wolves, ...village];
   }
 
   // Separate special roles (not loup, not villageois) — these go to humans first
