@@ -29,6 +29,7 @@ export interface ConfigState {
   voteTime: number;
   selectedRoles: number[];
   botCount: number;
+  maxPlayers: number; // total players (humans + bots)
 }
 
 export function encodeConfigState(config: ConfigState): string {
@@ -44,6 +45,7 @@ export function encodeConfigState(config: ConfigState): string {
     rb: rolesToBitmask(config.selectedRoles),
   };
   if (config.botCount) compact.bc = config.botCount;
+  if (config.maxPlayers) compact.mp = config.maxPlayers;
   return btoa(JSON.stringify(compact));
 }
 
@@ -63,6 +65,7 @@ export function decodeConfigState(url: string): ConfigState | null {
       voteTime: compact.vt ?? 60,
       selectedRoles: bitmaskToRoles(compact.rb ?? "0000000000000000"),
       botCount: compact.bc ?? 0,
+      maxPlayers: compact.mp ?? 6,
     };
   } catch {
     return null;
@@ -90,10 +93,8 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
 
   const description = [
     `> **Preset:** ${config.presetName || "Aucun"}`,
-    `> **Votes:** ${config.anonymousVotes ? "🔒 Anonyme" : "👁️ Public"}`,
-    `> **Discussion:** ${formatTime(config.discussionTime)}`,
-    `> **Vote:** ${formatTime(config.voteTime)}`,
-    `> **Bots IA:** ${config.botCount > 0 ? `🤖 ${config.botCount}` : "Aucun"}`,
+    `> **Votes:** ${config.anonymousVotes ? "🔒 Anonyme" : "👁️ Public"} • **Discussion:** ${formatTime(config.discussionTime)} • **Vote:** ${formatTime(config.voteTime)}`,
+    `> **Joueurs:** ${config.maxPlayers} total (👥 ${config.maxPlayers - config.botCount} humains${config.botCount > 0 ? ` + 🤖 ${config.botCount} bots` : ""})`,
     "",
     `🎭 **Rôles:** ${rolesCount} sélectionnés`,
     rolesCount > 0
@@ -153,6 +154,27 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
         components: [
           {
             type: 3,
+            custom_id: "cfg_max_players",
+            placeholder: "👥 Nombre de joueurs",
+            min_values: 1,
+            max_values: 1,
+            options: [
+              { label: "4 joueurs", value: "4", default: config.maxPlayers === 4 },
+              { label: "5 joueurs", value: "5", default: config.maxPlayers === 5 },
+              { label: "6 joueurs", value: "6", default: config.maxPlayers === 6 },
+              { label: "7 joueurs", value: "7", default: config.maxPlayers === 7 },
+              { label: "8 joueurs", value: "8", default: config.maxPlayers === 8 },
+              { label: "10 joueurs", value: "10", default: config.maxPlayers === 10 },
+              { label: "12 joueurs", value: "12", default: config.maxPlayers === 12 },
+            ],
+          },
+        ],
+      },
+      {
+        type: 1,
+        components: [
+          {
+            type: 3,
             custom_id: "cfg_bots",
             placeholder: "🤖 Nombre de bots IA",
             min_values: 1,
@@ -173,34 +195,15 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
         components: [
           {
             type: 3,
-            custom_id: "cfg_disc_time",
-            placeholder: "💬 Temps de discussion",
+            custom_id: "cfg_timers",
+            placeholder: "⏱️ Temps (discussion / vote)",
             min_values: 1,
             max_values: 1,
             options: [
-              { label: "1 min 30", value: "90", default: config.discussionTime === 90 },
-              { label: "2 min", value: "120", default: config.discussionTime === 120 },
-              { label: "2 min 30", value: "150", default: config.discussionTime === 150 },
-              { label: "3 min", value: "180", default: config.discussionTime === 180 },
-              { label: "3 min 30", value: "210", default: config.discussionTime === 210 },
-            ],
-          },
-        ],
-      },
-      {
-        type: 1,
-        components: [
-          {
-            type: 3,
-            custom_id: "cfg_vote_time",
-            placeholder: "⏱️ Temps de vote",
-            min_values: 1,
-            max_values: 1,
-            options: [
-              { label: "30 sec", value: "30", default: config.voteTime === 30 },
-              { label: "1 min", value: "60", default: config.voteTime === 60 },
-              { label: "1 min 30", value: "90", default: config.voteTime === 90 },
-              { label: "2 min", value: "120", default: config.voteTime === 120 },
+              { label: "Rapide — 1m30 / 30s", value: "90_30", default: config.discussionTime === 90 && config.voteTime === 30 },
+              { label: "Normal — 2m / 1m", value: "120_60", default: config.discussionTime === 120 && config.voteTime === 60 },
+              { label: "Long — 3m / 1m30", value: "180_90", default: config.discussionTime === 180 && config.voteTime === 90 },
+              { label: "Très long — 3m30 / 2m", value: "210_120", default: config.discussionTime === 210 && config.voteTime === 120 },
             ],
           },
         ],

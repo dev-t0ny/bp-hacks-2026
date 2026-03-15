@@ -1161,20 +1161,30 @@ async function handleConfigSelect(interaction: any, env: Env): Promise<Response>
     return json({ type: 7, data: buildStep1Embed(config, customPresets) });
   }
 
-  if (customId === "cfg_disc_time") {
-    config.discussionTime = parseInt(values[0] || "120", 10);
+  if (customId === "cfg_max_players") {
+    config.maxPlayers = parseInt(values[0] || "6", 10);
+    // Auto-cap bots if they exceed total
+    if (config.botCount >= config.maxPlayers) {
+      config.botCount = Math.max(0, config.maxPlayers - 1);
+    }
     const customPresets = await loadCustomPresets(env, config.guildId);
     return json({ type: 7, data: buildStep1Embed(config, customPresets) });
   }
 
-  if (customId === "cfg_vote_time") {
-    config.voteTime = parseInt(values[0] || "60", 10);
+  if (customId === "cfg_timers") {
+    const parts = (values[0] || "120_60").split("_");
+    config.discussionTime = parseInt(parts[0]!, 10);
+    config.voteTime = parseInt(parts[1]!, 10);
     const customPresets = await loadCustomPresets(env, config.guildId);
     return json({ type: 7, data: buildStep1Embed(config, customPresets) });
   }
 
   if (customId === "cfg_bots") {
     config.botCount = parseInt(values[0] || "0", 10);
+    // Auto-cap bots so at least 1 human slot remains
+    if (config.botCount >= config.maxPlayers) {
+      config.botCount = Math.max(0, config.maxPlayers - 1);
+    }
     const customPresets = await loadCustomPresets(env, config.guildId);
     return json({ type: 7, data: buildStep1Embed(config, customPresets) });
   }
@@ -1329,7 +1339,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
   const userId = config.creatorId;
   const guildId = config.guildId;
   const channelId = config.channelId;
-  const maxPlayers = Math.max(MIN_PLAYERS, Math.min(MAX_PLAYERS, config.selectedRoles.length));
+  const maxPlayers = Math.max(MIN_PLAYERS, Math.min(MAX_PLAYERS, config.maxPlayers));
 
   // Validate: at least 1 wolf role
   const hasWolf = config.selectedRoles.some((id) => ROLE_ID_TO_KEY[id] === "loup");
@@ -1457,6 +1467,7 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
     voteTime: defaultPreset.voteTime,
     selectedRoles: [...defaultPreset.roles],
     botCount: 4,
+    maxPlayers: 6,
   };
 
   const customPresets = await loadCustomPresets(env, guildId);
