@@ -39,7 +39,8 @@ interface Env {
   GATEWAY_URL?: string;
   GATEWAY_TOKEN?: string;
   ANTHROPIC_API_KEY?: string;
-  WORKER_URL?: string; // auto-set from request URL for self-invocation
+  WORKER_URL?: string;
+  PHASE_QUEUE: Queue; // Cloudflare Queue for delayed phase dispatch
 }
 
 const PLAYER_TTL = 86400;
@@ -1652,7 +1653,8 @@ async function dispatchPhase(token: string, phase: string, payload: any, ctx: Ex
     else if (phase === "loup_blanc_vote") await phaseLoupBlancVote(token, payload.game, ctx, env);
     else if (phase === "loup_blanc_timer") await phaseLoupBlancTimer(token, payload, ctx, env);
     else if (phase === "day_discussion") await phaseDiscussion(token, payload, ctx, env);
-    else if (phase === "discussion_timer") await phaseDiscussionTimer(token, payload, ctx, env);
+    else if (phase === "discussion_timer") await phaseDiscussionEnd(token, payload, ctx, env);
+    else if (phase === "discussion_end") await phaseDiscussionEnd(token, payload, ctx, env);
     else if (phase === "day_vote") await phaseDayVote(token, payload, ctx, env);
     else if (phase === "day_vote_timer") await phaseDayVoteTimer(token, payload, ctx, env);
     else console.error(`[phase] ❌ Unknown phase: ${phase}`);
@@ -1704,24 +1706,19 @@ async function runVisualTimer(opts: {
   }
 }
 
-/** Self-invoke the worker via HTTP to get a FRESH execution context.
- *  Each invocation gets its own 30s CPU budget + subrequest quota.
- *  This breaks the long await chain so timers don't share budget. */
-async function selfInvoke(env: Env, phase: string, data: Record<string, unknown>) {
-  const url = env.WORKER_URL || WORKER_URL;
-  console.log(`[selfInvoke] → ${phase} via ${url}`);
+/** Schedule a phase to run after `delaySeconds` via Cloudflare Queue.
+ *  The queue consumer gets a FRESH worker invocation with full CPU budget.
+ *  This breaks the ctx.waitUntil chain that would otherwise die from wall clock limits. */
+async function schedulePhase(env: Env, phase: string, data: Record<string, unknown>, delaySeconds: number) {
+  console.log(`[schedulePhase] → ${phase} in ${delaySeconds}s via queue`);
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "X-Internal": env.DISCORD_BOT_TOKEN,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ phase, ...data }),
-    });
-    console.log(`[selfInvoke] → ${phase}: ${res.status} ${res.statusText}`);
+    await env.PHASE_QUEUE.send(
+      { phase, ...data },
+      { delaySeconds },
+    );
+    console.log(`[schedulePhase] → ${phase} queued OK`);
   } catch (err) {
-    console.error(`[selfInvoke] → ${phase} FAILED:`, err);
+    console.error(`[schedulePhase] → ${phase} FAILED:`, err);
   }
 }
 
@@ -2597,11 +2594,9 @@ async function phaseCupidonTimer(token: string, data: any, ctx: ExecutionContext
   const { cupidonMessageId, cupidonThreadId } = data;
   if (!cupidonMessageId || !cupidonThreadId) return;
 
-  const result = await runVisualTimer({
-    token, channelId: cupidonThreadId, messageId: cupidonMessageId,
-    totalSeconds: CUPIDON_TIMEOUT_SECONDS, label: "cupidonTimer",
-  });
-  if (result === "resolved") return;
+  // Check if already resolved (user acted before timeout)
+  const checkMsg: any = await getMessage(token, cupidonThreadId, cupidonMessageId);
+  if (!checkMsg.components?.length) { console.log("[cupidonTimer] Already resolved"); return; }
 
   // Timeout — pick random couple
   const msg: any = await getMessage(token, cupidonThreadId, cupidonMessageId);
@@ -2791,7 +2786,7 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
 
   const chasseurMsg: any = await sendMessage(token, game.gameChannelId, buildChasseurEmbed(chasseurState));
 
-  await dispatchPhase(token, "chasseur_timer", { chasseurMessageId: chasseurMsg.id, gameChannelId: game.gameChannelId }, ctx, env);
+  await schedulePhase(env, "chasseur_timer", { chasseurMessageId: chasseurMsg.id, gameChannelId: game.gameChannelId }, CHASSEUR_TIMEOUT_SECONDS);
 }
 
 async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -2878,11 +2873,9 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
   const { chasseurMessageId, gameChannelId } = data;
   if (!chasseurMessageId || !gameChannelId) return;
 
-  const result = await runVisualTimer({
-    token, channelId: gameChannelId, messageId: chasseurMessageId,
-    totalSeconds: CHASSEUR_TIMEOUT_SECONDS, label: "chasseurTimer",
-  });
-  if (result === "resolved") return;
+  // Check if already resolved (user acted before timeout)
+  const checkMsg: any = await getMessage(token, gameChannelId, chasseurMessageId);
+  if (!checkMsg.components?.length) { console.log("[chasseurTimer] Already resolved"); return; }
 
   // Timeout — random target
   const msg: any = await getMessage(token, gameChannelId, chasseurMessageId);
@@ -3104,7 +3097,7 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     }
   }
 
-  await dispatchPhase(token, "night_vote_timer", { voteMessageId: voteMsg.id, wolfChannelId: wolfThread.id }, ctx, env);
+  await schedulePhase(env, "night_vote_timer", { voteMessageId: voteMsg.id, wolfChannelId: wolfThread.id }, NIGHT_VOTE_SECONDS);
 }
 
 // ── Night Phase Orchestrator ────────────────────────────────────────
@@ -3117,6 +3110,32 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
 
   // Increment night count and persist
   game.nightCount = (game.nightCount ?? 0) + 1;
+
+  // Clean up game channel: delete all messages except the lobby/storytelling embed
+  if (game.nightCount > 1 && game.lobbyMessageId) {
+    try {
+      const allMsgs: any[] = [];
+      let lastId: string | undefined;
+      // Fetch all messages (paginated)
+      for (let page = 0; page < 10; page++) {
+        const batch: any[] = await getChannelMessages(token, game.gameChannelId, lastId, 100);
+        if (!batch.length) break;
+        allMsgs.push(...batch);
+        lastId = batch[batch.length - 1]!.id;
+        if (batch.length < 100) break;
+      }
+      const toDelete = allMsgs
+        .filter((m: any) => m.id !== game.lobbyMessageId)
+        .map((m: any) => m.id);
+      if (toDelete.length > 0) {
+        console.log(`[nightStart] Cleaning ${toDelete.length} messages from game channel`);
+        await bulkDeleteMessages(token, game.gameChannelId, toDelete);
+      }
+    } catch (err) {
+      console.error("[nightStart] Failed to clean game channel:", err);
+    }
+  }
+
   await updatePhaseStatus(token, game,
     `🌙 Nuit ${game.nightCount} — Le village s'endort...`,
     "*Chaque villageois ferme les yeux...*\n*Le silence envahit le village...*",
@@ -3203,7 +3222,7 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
       });
       const cupidonMsg: any = await sendMessage(token, cupidonThread.id, buildCupidonEmbed(cupidonState));
 
-      triggerPhase(ctx, env, "cupidon_timer", { cupidonMessageId: cupidonMsg.id, cupidonThreadId: cupidonThread.id });
+      await schedulePhase(env, "cupidon_timer", { cupidonMessageId: cupidonMsg.id, cupidonThreadId: cupidonThread.id }, CUPIDON_TIMEOUT_SECONDS);
 
       return;
     }
@@ -3283,19 +3302,17 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
   });
   const vyMsg: any = await sendMessage(token, voyanteThread.id, buildVoyanteEmbed(vyState));
 
-  // Schedule timer
-  triggerPhase(ctx, env, "voyante_timer", { voyanteMessageId: vyMsg.id, voyanteThreadId: voyanteThread.id, game });
+  // Schedule timeout via queue (fresh worker invocation)
+  await schedulePhase(env, "voyante_timer", { voyanteMessageId: vyMsg.id, voyanteThreadId: voyanteThread.id, game }, VOYANTE_TIMEOUT_SECONDS);
 }
 
 async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { voyanteMessageId, voyanteThreadId, game } = data;
   if (!voyanteMessageId || !voyanteThreadId) return;
 
-  const result = await runVisualTimer({
-    token, channelId: voyanteThreadId, messageId: voyanteMessageId,
-    totalSeconds: VOYANTE_TIMEOUT_SECONDS, label: "voyanteTimer",
-  });
-  if (result === "resolved") return;
+  // Check if already resolved (user acted before timeout)
+  const checkMsg: any = await getMessage(token, voyanteThreadId, voyanteMessageId);
+  if (!checkMsg.components?.length) { console.log("[voyanteTimer] Already resolved"); return; }
 
   // Timeout — voyante didn't act
   await editMessage(token, voyanteThreadId, voyanteMessageId, {
@@ -3374,18 +3391,12 @@ async function handleVoyanteSee(interaction: any, env: Env, ctx: ExecutionContex
 // ── Phase: night_vote_timer — poll until deadline then auto-resolve ──
 async function phaseVoteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { voteMessageId, wolfChannelId } = data;
-  console.log(`[voteTimer] Starting visual countdown, voteMsg=${voteMessageId}, wolfChannel=${wolfChannelId}`);
+  console.log(`[voteTimer] Timeout triggered, voteMsg=${voteMessageId}, wolfChannel=${wolfChannelId}`);
   if (!voteMessageId || !wolfChannelId) { console.error("[voteTimer] Missing fields!"); return; }
 
-  const result = await runVisualTimer({
-    token, channelId: wolfChannelId, messageId: voteMessageId,
-    totalSeconds: NIGHT_VOTE_SECONDS, label: "voteTimer",
-  });
-  if (result === "resolved") return;
-
-  // Timeout — resolve night vote
+  // Check if already resolved (users voted before timeout)
   const currentMsg: any = await getMessage(token, wolfChannelId, voteMessageId);
-  if (!currentMsg.components?.length) return;
+  if (!currentMsg.components?.length) { console.log("[voteTimer] Already resolved"); return; }
   const currentVote = parseVoteFromEmbed(currentMsg);
   if (!currentVote) return;
   console.log("[voteTimer] Deadline reached, resolving...");
@@ -3890,19 +3901,17 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
   });
   const soMsg: any = await sendMessage(token, sorciereThread.id, buildSorciereEmbed(soState));
 
-  // Schedule timer
-  triggerPhase(ctx, env, "sorciere_timer", { sorciereMessageId: soMsg.id, sorciereThreadId: sorciereThread.id, game, _wolfVictimId, _wolfVictimName });
+  // Schedule timeout via queue (fresh worker invocation)
+  await schedulePhase(env, "sorciere_timer", { sorciereMessageId: soMsg.id, sorciereThreadId: sorciereThread.id, game, _wolfVictimId, _wolfVictimName }, SORCIERE_TIMEOUT_SECONDS);
 }
 
 async function phaseSorciereTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { sorciereMessageId, sorciereThreadId, game, _wolfVictimId, _wolfVictimName } = data;
   if (!sorciereMessageId || !sorciereThreadId) return;
 
-  const result = await runVisualTimer({
-    token, channelId: sorciereThreadId, messageId: sorciereMessageId,
-    totalSeconds: SORCIERE_TIMEOUT_SECONDS, label: "sorciereTimer",
-  });
-  if (result === "resolved") return;
+  // Check if already resolved (user acted before timeout)
+  const checkMsg: any = await getMessage(token, sorciereThreadId, sorciereMessageId);
+  if (!checkMsg.components?.length) { console.log("[sorciereTimer] Already resolved"); return; }
 
   // Timeout — sorciere didn't act
   await editMessage(token, sorciereThreadId, sorciereMessageId, {
@@ -4251,8 +4260,8 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
     components: buttonRows,
   });
 
-  // Schedule timer
-  triggerPhase(ctx, env, "loup_blanc_timer", { lbDmChannelId: dmChannel.id, lbDmMessageId: dmMsg.id, gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId });
+  // Schedule timeout via queue (fresh worker invocation)
+  await schedulePhase(env, "loup_blanc_timer", { lbDmChannelId: dmChannel.id, lbDmMessageId: dmMsg.id, gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId }, LOUP_BLANC_VOTE_SECONDS);
 }
 
 async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -4393,11 +4402,9 @@ async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionConte
   const dmMessageId = data.lbDmMessageId;
   if (!dmChannelId || !dmMessageId) return;
 
-  const result = await runVisualTimer({
-    token, channelId: dmChannelId, messageId: dmMessageId,
-    totalSeconds: LOUP_BLANC_VOTE_SECONDS, label: "loupBlancTimer",
-  });
-  if (result === "resolved") return;
+  // Check if already resolved (user acted before timeout)
+  const checkMsg: any = await getMessage(token, dmChannelId, dmMessageId);
+  if (!checkMsg.components?.length) { console.log("[loupBlancTimer] Already resolved"); return; }
 
   // Timeout — no kill
   await editMessage(token, dmChannelId, dmMessageId, {
@@ -4548,14 +4555,13 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
     })());
   }
 
-  // Dispatch discussion timer — pure sleep, zero API calls during countdown
-  console.log(`[discussion] ⏱️ dispatching discussion_timer, discMsgId=${discMsg.id}, seconds=${discussionSeconds}`);
-  await dispatchPhase(token, "discussion_timer", {
+  // Schedule discussion timeout via queue — gets a FRESH worker invocation after delay
+  // No sleep needed: the queue delivers the message after discussionSeconds
+  console.log(`[discussion] ⏱️ scheduling discussion_end via queue in ${discussionSeconds}s`);
+  await schedulePhase(env, "discussion_end", {
     _discMsgId: discMsg.id,
-    _remainingSeconds: discussionSeconds,
-    _originalTotal: discussionSeconds,
     game,
-  }, ctx, env);
+  }, discussionSeconds);
 }
 
 /** Build alive players list for bot context */
@@ -4575,18 +4581,12 @@ async function buildBotAlivePlayersList(
   return result;
 }
 
-/** Discussion countdown — pure sleep, ZERO API calls during countdown.
- *  Discord's <t:DEADLINE:R> in the initial embed handles the visual timer.
- *  This preserves Cloudflare execution budget for the rest of the game chain. */
-async function phaseDiscussionTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+/** Discussion end — triggered by Cloudflare Queue after the discussion delay.
+ *  Runs in a FRESH worker invocation with full CPU budget. No sleep needed. */
+async function phaseDiscussionEnd(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { game, _discMsgId } = data;
   if (!game || !_discMsgId) return;
-  const totalSeconds: number = data._remainingSeconds ?? (game.discussionTime ?? 120);
-  console.log(`[discussionTimer] ⏱️ START: sleeping ${totalSeconds}s (zero API calls)`);
-
-  await sleep(totalSeconds * 1000);
-
-  console.log(`[discussionTimer] ⏱️ DONE — locking chat`);
+  console.log(`[discussionEnd] ⏱️ Locking chat, transitioning to day_vote`);
 
   // Discussion over — lock chat
   const dead = game.dead ?? [];
@@ -4740,13 +4740,23 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
     }
   } catch {}
 
-  // Start vote timer + bot voting in fresh ctx.waitUntil
-  triggerPhase(ctx, env, "day_vote_timer", {
+  // Bot voting (non-blocking) + schedule timeout via queue
+  ctx.waitUntil((async () => {
+    const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+    const aliveBots = bots.filter((b) => b.alive);
+    for (const bot of aliveBots) {
+      await sleep(2000 + Math.floor(Math.random() * 2000));
+      try {
+        await executeBotDayVote(token, env, bot, bots, game.gameChannelId, voteMsg.id, game.gameNumber, "villageois", ctx);
+      } catch (err) {
+        console.error(`[dayVote] Bot ${bot.name} vote failed:`, err);
+      }
+    }
+  })());
+  await schedulePhase(env, "day_vote_timer", {
     voteMessageId: voteMsg.id,
     gameChannelId: game.gameChannelId,
-    botVotePending: true,
-    gameNumber: game.gameNumber,
-  });
+  }, voteSeconds);
 }
 
 async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -4817,43 +4827,16 @@ async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext):
 }
 
 async function phaseDayVoteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
-  const { voteMessageId, gameChannelId, botVotePending, gameNumber } = data;
+  const { voteMessageId, gameChannelId } = data;
   if (!voteMessageId || !gameChannelId) return;
-  console.log("[dayVoteTimer] Starting visual countdown");
+  console.log("[dayVoteTimer] Timeout triggered");
 
-  // Bots vote first (random, staggered)
-  if (botVotePending && gameNumber) {
-    const bots = await loadBots(env.ACTIVE_PLAYERS, gameNumber);
-    const aliveBots = bots.filter((b) => b.alive);
-    for (const bot of aliveBots) {
-      await sleep(2000 + Math.floor(Math.random() * 2000));
-      try {
-        await executeBotDayVote(token, env, bot, bots, gameChannelId, voteMessageId, gameNumber, "villageois", ctx);
-      } catch (err) {
-        console.error(`[dayVoteTimer] Bot ${bot.name} vote failed:`, err);
-      }
-    }
-    const checkMsg: any = await getMessage(token, gameChannelId, voteMessageId);
-    if (!checkMsg.components?.length) { console.log("[dayVoteTimer] Already resolved after bot votes"); return; }
-  }
-
-  // Calculate remaining from embed deadline
-  const initMsg: any = await getMessage(token, gameChannelId, voteMessageId);
-  const initDv = parseDayVoteFromEmbed(initMsg);
-  const totalSeconds = initDv ? Math.max(1, Math.round(initDv.deadline - Date.now() / 1000)) : 60;
-
-  const result = await runVisualTimer({
-    token, channelId: gameChannelId, messageId: voteMessageId,
-    totalSeconds, label: "dayVoteTimer",
-  });
-  if (result === "resolved") return;
-
-  // Timeout — resolve day vote
+  // Check if already resolved (all users voted before timeout)
   const msg: any = await getMessage(token, gameChannelId, voteMessageId);
-  if (!msg.components?.length) return;
+  if (!msg.components?.length) { console.log("[dayVoteTimer] Already resolved"); return; }
   const dv = parseDayVoteFromEmbed(msg);
   if (!dv) return;
-  console.log("[dayVoteTimer] Resolving vote...");
+  console.log("[dayVoteTimer] Deadline reached, resolving...");
   await editMessage(token, gameChannelId, voteMessageId, {
     embeds: msg.embeds,
     components: [],
@@ -5074,8 +5057,8 @@ async function startNextNight(token: string, dv: DayVoteState, ctx: ExecutionCon
     return;
   }
 
-  await sleep(3000);
-  await dispatchPhase(token, "night_start", { game }, ctx, env);
+  // Schedule next night via queue (fresh worker, guaranteed delivery)
+  await schedulePhase(env, "night_start", { game }, 3);
 }
 
 // ── Wolf Vote (Night) ───────────────────────────────────────────────
@@ -5385,5 +5368,22 @@ export default {
 
     console.error("Unknown interaction:", JSON.stringify({ type: interaction.type, customId: interaction.data?.custom_id, component_type: interaction.data?.component_type }));
     return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
+  },
+
+  /** Queue consumer — each message gets a FRESH worker invocation with full CPU budget.
+   *  Used for delayed phase dispatch (discussion timer, vote transitions, etc.) */
+  async queue(batch: MessageBatch, env: Env, ctx: ExecutionContext): Promise<void> {
+    for (const msg of batch.messages) {
+      const payload = msg.body as any;
+      const { phase } = payload;
+      console.log(`[queue] ✅ Received delayed phase: ${phase}`);
+      const token = env.DISCORD_BOT_TOKEN;
+      try {
+        await dispatchPhase(token, phase, payload, ctx, env);
+      } catch (err) {
+        console.error(`[queue] ❌ ${phase} FAILED:`, err);
+      }
+      msg.ack();
+    }
   },
 };
