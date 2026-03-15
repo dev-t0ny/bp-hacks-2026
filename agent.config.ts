@@ -1,7 +1,7 @@
 import { z, defineConfig } from "@botpress/runtime";
 
 export default defineConfig({
-  name: "Adam-Bot",
+  name: "garou",
   description: "An AI agent built with Botpress ADK",
 
   defaultModels: {
