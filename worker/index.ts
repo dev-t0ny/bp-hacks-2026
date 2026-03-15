@@ -1668,18 +1668,50 @@ function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, data: Reco
   ctx.waitUntil(dispatchPhase(token, phase, data, ctx, env));
 }
 
-/** Self-invoke the worker via HTTP to get a fresh 30s ctx.waitUntil budget.
- *  Used for long-running timers (discussion 90s, vote 60s) that exceed
- *  Cloudflare Workers' 30s wall-time limit per invocation. */
-async function selfInvoke(env: Env, phase: string, data: Record<string, unknown>) {
-  const url = env.WORKER_URL;
-  if (!url) {
-    console.error("[selfInvoke] No WORKER_URL set! Cannot self-invoke.");
-    return;
+/** Lightweight timer — polls getMessage every 5s to detect early resolution.
+ *  Discord's native <t:DEADLINE:R> handles the visual countdown (zero API cost).
+ *  ZERO editMessage calls — the entire game runs in one ctx.waitUntil chain
+ *  and any extra API calls risk hitting Cloudflare's execution limits. */
+async function runVisualTimer(opts: {
+  token: string;
+  channelId: string;
+  messageId: string;
+  totalSeconds: number;
+  label: string;
+}): Promise<"timeout" | "resolved"> {
+  const { token, channelId, messageId, totalSeconds, label } = opts;
+  const startTime = Date.now();
+  console.log(`[${label}] ⏱️ START: ${totalSeconds}s (poll-only, no editMessage)`);
+
+  while (true) {
+    await sleep(5000);
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const remaining = Math.max(0, totalSeconds - elapsed);
+
+    try {
+      const msg: any = await getMessage(token, channelId, messageId);
+      if (!msg.components?.length) {
+        console.log(`[${label}] ⏱️ RESOLVED at ${remaining}s remaining`);
+        return "resolved";
+      }
+      if (remaining <= 0) {
+        console.log(`[${label}] ⏱️ TIMEOUT`);
+        return "timeout";
+      }
+    } catch (err) {
+      console.error(`[${label}] ⏱️ ERROR:`, err);
+    }
   }
-  console.log(`[selfInvoke] → ${phase}`);
+}
+
+/** Self-invoke the worker via HTTP to get a FRESH execution context.
+ *  Each invocation gets its own 30s CPU budget + subrequest quota.
+ *  This breaks the long await chain so timers don't share budget. */
+async function selfInvoke(env: Env, phase: string, data: Record<string, unknown>) {
+  const url = env.WORKER_URL || WORKER_URL;
+  console.log(`[selfInvoke] → ${phase} via ${url}`);
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method: "POST",
       headers: {
         "X-Internal": env.DISCORD_BOT_TOKEN,
@@ -1687,8 +1719,9 @@ async function selfInvoke(env: Env, phase: string, data: Record<string, unknown>
       },
       body: JSON.stringify({ phase, ...data }),
     });
+    console.log(`[selfInvoke] → ${phase}: ${res.status} ${res.statusText}`);
   } catch (err) {
-    console.error(`[selfInvoke] Failed to invoke ${phase}:`, err);
+    console.error(`[selfInvoke] → ${phase} FAILED:`, err);
   }
 }
 
@@ -2563,39 +2596,34 @@ const CUPIDON_TIMEOUT_SECONDS = 60;
 async function phaseCupidonTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { cupidonMessageId, cupidonThreadId } = data;
   if (!cupidonMessageId || !cupidonThreadId) return;
-  console.log("[cupidonTimer] Starting poll");
 
-  while (true) {
-    await sleep(5000);
-    try {
-      const msg: any = await getMessage(token, cupidonThreadId, cupidonMessageId);
-      if (!msg.components?.length) return;
-      const s = parseCupidonFromEmbed(msg);
-      if (!s) return;
-      if (Date.now() / 1000 >= s.deadline) {
-        const available = s.players.filter(p => p.id !== s.cupidonId);
-        const shuffled = [...available].sort(() => Math.random() - 0.5);
-        const couple: [string, string] = [shuffled[0]!.id, shuffled[1]!.id];
-        const names = couple.map(id => s.players.find(p => p.id === id)?.name ?? "?");
+  const result = await runVisualTimer({
+    token, channelId: cupidonThreadId, messageId: cupidonMessageId,
+    totalSeconds: CUPIDON_TIMEOUT_SECONDS, label: "cupidonTimer",
+  });
+  if (result === "resolved") return;
 
-        await editMessage(token, cupidonThreadId, cupidonMessageId, {
-          embeds: [{
-            title: `💘 Temps écoulé! Couple aléatoire — Partie #${s.gameNumber}`,
-            url: `https://garou.bot/cu/${encodeCupidonState(s)}`,
-            description: `**${names[0]}** & **${names[1]}** sont liés par l'amour.\n\n*Cupidon n'a pas choisi à temps...*`,
-            color: 0xe91e63,
-          }],
-          components: [],
-        });
+  // Timeout — pick random couple
+  const msg: any = await getMessage(token, cupidonThreadId, cupidonMessageId);
+  const s = parseCupidonFromEmbed(msg);
+  if (!s) return;
 
-        await finalizeCupidonAndStartWolves(token, s, couple, cupidonThreadId, ctx, env);
-        return;
-      }
-    } catch (err) {
-      console.error("[cupidonTimer] Error:", err);
-      await sleep(5000);
-    }
-  }
+  const available = s.players.filter(p => p.id !== s.cupidonId);
+  const shuffled = [...available].sort(() => Math.random() - 0.5);
+  const couple: [string, string] = [shuffled[0]!.id, shuffled[1]!.id];
+  const names = couple.map(id => s.players.find(p => p.id === id)?.name ?? "?");
+
+  await editMessage(token, cupidonThreadId, cupidonMessageId, {
+    embeds: [{
+      title: `💘 Temps écoulé! Couple aléatoire — Partie #${s.gameNumber}`,
+      url: `https://garou.bot/cu/${encodeCupidonState(s)}`,
+      description: `**${names[0]}** & **${names[1]}** sont liés par l'amour.\n\n*Cupidon n'a pas choisi à temps...*`,
+      color: 0xe91e63,
+    }],
+    components: [],
+  });
+
+  await finalizeCupidonAndStartWolves(token, s, couple, cupidonThreadId, ctx, env);
 }
 
 // ── Chasseur State ──────────────────────────────────────────────────
@@ -2849,68 +2877,62 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
 async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { chasseurMessageId, gameChannelId } = data;
   if (!chasseurMessageId || !gameChannelId) return;
-  console.log("[chasseurTimer] Starting poll");
 
-  while (true) {
-    await sleep(5000);
-    try {
-      const msg: any = await getMessage(token, gameChannelId, chasseurMessageId);
-      if (!msg.components?.length) return;
-      const s = parseChasseurFromEmbed(msg);
-      if (!s) return;
-      if (Date.now() / 1000 >= s.deadline) {
-        const target = s.targets[Math.floor(Math.random() * s.targets.length)]!;
-        await editMessage(token, gameChannelId, chasseurMessageId, {
-          embeds: [{
-            title: `🏹 Le chasseur tire! — Partie #${s.gameNumber}`,
-            url: `https://garou.bot/hs/${encodeChasseurState(s)}`,
-            description: `Temps écoulé... **${target.name}** est abattu(e) au hasard!`,
-            color: 0xe67e22,
-          }],
-          components: [],
-        });
-        await sendMessage(token, s.gameChannelId, {
-          embeds: [{
-            title: "🏹 Le chasseur tire une dernière flèche!",
-            description: `Dans un dernier souffle, le chasseur abat **${target.name}** (<@${target.id}>)!`,
-            color: 0xe67e22, image: { url: SCENE_IMAGES.snipe_reveal },
-          }],
-        });
+  const result = await runVisualTimer({
+    token, channelId: gameChannelId, messageId: chasseurMessageId,
+    totalSeconds: CHASSEUR_TIMEOUT_SECONDS, label: "chasseurTimer",
+  });
+  if (result === "resolved") return;
 
-        let game: GameState | null = null;
-        try { const lm: any = await getMessage(token, s.gameChannelId, s.lobbyMessageId); game = parseGameFromEmbed(lm); } catch {}
-        if (!game) return;
-        if (!game.dead) game.dead = [];
-        game.dead.push(target.id);
-        try { await setChannelPermission(token, s.gameChannelId, target.id, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+  // Timeout — random target
+  const msg: any = await getMessage(token, gameChannelId, chasseurMessageId);
+  const s = parseChasseurFromEmbed(msg);
+  if (!s) return;
 
-        if (game.couple && game.couple.includes(target.id)) {
-          const pid = target.id === game.couple[0] ? game.couple[1] : game.couple[0];
-          if (!game.dead.includes(pid)) {
-            game.dead.push(pid);
-            try { await setChannelPermission(token, s.gameChannelId, pid, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
-            const pm: any = await getGuildMember(token, game.guildId, pid).catch(() => null);
-            const pn = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
-            await sendMessage(token, s.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: `**${pn}** (<@${pid}>) meurt de chagrin.`, color: 0xe91e63 }] });
-          }
-        }
+  const target = s.targets[Math.floor(Math.random() * s.targets.length)]!;
+  await editMessage(token, gameChannelId, chasseurMessageId, {
+    embeds: [{
+      title: `🏹 Le chasseur tire! — Partie #${s.gameNumber}`,
+      url: `https://garou.bot/hs/${encodeChasseurState(s)}`,
+      description: `Temps écoulé... **${target.name}** est abattu(e) au hasard!`,
+      color: 0xe67e22,
+    }],
+    components: [],
+  });
+  await sendMessage(token, s.gameChannelId, {
+    embeds: [{
+      title: "🏹 Le chasseur tire une dernière flèche!",
+      description: `Dans un dernier souffle, le chasseur abat **${target.name}** (<@${target.id}>)!`,
+      color: 0xe67e22, image: { url: SCENE_IMAGES.snipe_reveal },
+    }],
+  });
 
-        if (game.lobbyMessageId) {
-          const su = `https://garou.bot/s/${encodeState(game)}`;
-          try { const m: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId); const e = m.embeds?.[0]; if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); } } catch {}
-        }
-        const wr = checkWinCondition(game);
-        if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); return; }
-        // No win → start day discussion
-        await sleep(2000);
-        await dispatchPhase(token, "day_discussion", { game }, ctx, env);
-        return;
-      }
-    } catch (err) {
-      console.error("[chasseurTimer] Error:", err);
-      await sleep(5000);
+  let game: GameState | null = null;
+  try { const lm: any = await getMessage(token, s.gameChannelId, s.lobbyMessageId); game = parseGameFromEmbed(lm); } catch {}
+  if (!game) return;
+  if (!game.dead) game.dead = [];
+  game.dead.push(target.id);
+  try { await setChannelPermission(token, s.gameChannelId, target.id, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+
+  if (game.couple && game.couple.includes(target.id)) {
+    const pid = target.id === game.couple[0] ? game.couple[1] : game.couple[0];
+    if (!game.dead.includes(pid)) {
+      game.dead.push(pid);
+      try { await setChannelPermission(token, s.gameChannelId, pid, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+      const pm: any = await getGuildMember(token, game.guildId, pid).catch(() => null);
+      const pn = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
+      await sendMessage(token, s.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: `**${pn}** (<@${pid}>) meurt de chagrin.`, color: 0xe91e63 }] });
     }
   }
+
+  if (game.lobbyMessageId) {
+    const su = `https://garou.bot/s/${encodeState(game)}`;
+    try { const m: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId); const e = m.embeds?.[0]; if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); } } catch {}
+  }
+  const wr = checkWinCondition(game);
+  if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); return; }
+  await sleep(2000);
+  await dispatchPhase(token, "day_discussion", { game }, ctx, env);
 }
 
 // ── Wolf Phase (extracted for reuse by cupidon flow) ────────────────
@@ -3268,41 +3290,27 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
 async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { voyanteMessageId, voyanteThreadId, game } = data;
   if (!voyanteMessageId || !voyanteThreadId) return;
-  console.log("[voyanteTimer] Starting poll");
 
-  while (true) {
-    await sleep(5000);
-    try {
-      const msg: any = await getMessage(token, voyanteThreadId, voyanteMessageId);
-      // If handler already resolved (removed components), just stop — handler chains to wolf_phase
-      if (!msg.components?.length) {
-        console.log("[voyanteTimer] Already resolved by handler, stopping");
-        return;
-      }
-      const vy = parseVoyanteFromEmbed(msg);
-      if (!vy) return;
-      if (Date.now() / 1000 >= vy.deadline) {
-        // TIMEOUT only — handler didn't act in time
-        await editMessage(token, voyanteThreadId, voyanteMessageId, {
-          embeds: [{
-            title: `🔮 Vision de la Voyante — Temps écoulé`,
-            description: "La Voyante n'a pas choisi à temps.",
-            color: EMBED_COLOR_PURPLE,
-            thumbnail: { url: getRoleImage("voyante") },
-          }],
-          components: [],
-        });
-        await sleep(2000);
-        try { await deleteChannel(token, voyanteThreadId); } catch {}
-        console.log("[voyanteTimer] Timeout → wolf_phase");
-        await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
-        return;
-      }
-    } catch (err) {
-      console.error("[voyanteTimer] Error:", err);
-      await sleep(5000);
-    }
-  }
+  const result = await runVisualTimer({
+    token, channelId: voyanteThreadId, messageId: voyanteMessageId,
+    totalSeconds: VOYANTE_TIMEOUT_SECONDS, label: "voyanteTimer",
+  });
+  if (result === "resolved") return;
+
+  // Timeout — voyante didn't act
+  await editMessage(token, voyanteThreadId, voyanteMessageId, {
+    embeds: [{
+      title: `🔮 Vision de la Voyante — Temps écoulé`,
+      description: "La Voyante n'a pas choisi à temps.",
+      color: EMBED_COLOR_PURPLE,
+      thumbnail: { url: getRoleImage("voyante") },
+    }],
+    components: [],
+  });
+  await sleep(2000);
+  try { await deleteChannel(token, voyanteThreadId); } catch {}
+  console.log("[voyanteTimer] Timeout → wolf_phase");
+  await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
 }
 
 async function handleVoyanteSee(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -3366,30 +3374,22 @@ async function handleVoyanteSee(interaction: any, env: Env, ctx: ExecutionContex
 // ── Phase: night_vote_timer — poll until deadline then auto-resolve ──
 async function phaseVoteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { voteMessageId, wolfChannelId } = data;
-  console.log(`[voteTimer] Starting poll, voteMsg=${voteMessageId}, wolfChannel=${wolfChannelId}`);
+  console.log(`[voteTimer] Starting visual countdown, voteMsg=${voteMessageId}, wolfChannel=${wolfChannelId}`);
   if (!voteMessageId || !wolfChannelId) { console.error("[voteTimer] Missing fields!"); return; }
 
-  // Loop until deadline (no re-invocation needed)
-  while (true) {
-    await sleep(5000);
-    try {
-      const currentMsg: any = await getMessage(token, wolfChannelId, voteMessageId);
-      if (!currentMsg.components?.length) { console.log("[voteTimer] Already resolved"); return; }
-      const currentVote = parseVoteFromEmbed(currentMsg);
-      if (!currentVote) { console.error("[voteTimer] Could not parse vote state!"); return; }
-      const votedCount = Object.keys(currentVote.votes).length;
-      const secsLeft = Math.round(currentVote.deadline - Date.now() / 1000);
-      console.log(`[voteTimer] Votes: ${votedCount}/${currentVote.wolves.length}, ${secsLeft}s left`);
-      if (Date.now() / 1000 >= currentVote.deadline) {
-        console.log("[voteTimer] Deadline reached, resolving...");
-        await resolveNightVote(token, currentVote, voteMessageId, ctx, env);
-        return;
-      }
-    } catch (err) {
-      console.error("[voteTimer] Error:", err);
-      await sleep(5000); // retry after error
-    }
-  }
+  const result = await runVisualTimer({
+    token, channelId: wolfChannelId, messageId: voteMessageId,
+    totalSeconds: NIGHT_VOTE_SECONDS, label: "voteTimer",
+  });
+  if (result === "resolved") return;
+
+  // Timeout — resolve night vote
+  const currentMsg: any = await getMessage(token, wolfChannelId, voteMessageId);
+  if (!currentMsg.components?.length) return;
+  const currentVote = parseVoteFromEmbed(currentMsg);
+  if (!currentVote) return;
+  console.log("[voteTimer] Deadline reached, resolving...");
+  await resolveNightVote(token, currentVote, voteMessageId, ctx, env);
 }
 
 // ── Win Conditions ──────────────────────────────────────────────────
@@ -3897,41 +3897,27 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
 async function phaseSorciereTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { sorciereMessageId, sorciereThreadId, game, _wolfVictimId, _wolfVictimName } = data;
   if (!sorciereMessageId || !sorciereThreadId) return;
-  console.log("[sorciereTimer] Starting poll");
 
-  while (true) {
-    await sleep(5000);
-    try {
-      const msg: any = await getMessage(token, sorciereThreadId, sorciereMessageId);
-      // If handler already resolved, just stop — handler chains to dawn_phase
-      if (!msg.components?.length) {
-        console.log("[sorciereTimer] Already resolved by handler, stopping");
-        return;
-      }
-      const so = parseSorciereFromEmbed(msg);
-      if (!so) return;
-      if (Date.now() / 1000 >= so.deadline) {
-        // TIMEOUT only
-        await editMessage(token, sorciereThreadId, sorciereMessageId, {
-          embeds: [{
-            title: `🧪 Sorcière — Temps écoulé`,
-            description: "La Sorcière n'a pas agi à temps.",
-            color: EMBED_COLOR_PURPLE,
-            thumbnail: { url: getRoleImage("sorciere") },
-          }],
-          components: [],
-        });
-        await sleep(2000);
-        try { await deleteChannel(token, sorciereThreadId); } catch {}
-        console.log("[sorciereTimer] Timeout → dawn_phase");
-        await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
-        return;
-      }
-    } catch (err) {
-      console.error("[sorciereTimer] Error:", err);
-      await sleep(5000);
-    }
-  }
+  const result = await runVisualTimer({
+    token, channelId: sorciereThreadId, messageId: sorciereMessageId,
+    totalSeconds: SORCIERE_TIMEOUT_SECONDS, label: "sorciereTimer",
+  });
+  if (result === "resolved") return;
+
+  // Timeout — sorciere didn't act
+  await editMessage(token, sorciereThreadId, sorciereMessageId, {
+    embeds: [{
+      title: `🧪 Sorcière — Temps écoulé`,
+      description: "La Sorcière n'a pas agi à temps.",
+      color: EMBED_COLOR_PURPLE,
+      thumbnail: { url: getRoleImage("sorciere") },
+    }],
+    components: [],
+  });
+  await sleep(2000);
+  try { await deleteChannel(token, sorciereThreadId); } catch {}
+  console.log("[sorciereTimer] Timeout → dawn_phase");
+  await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
 }
 
 async function handleSorciereLife(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -4406,46 +4392,33 @@ async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionConte
   const dmChannelId = data.lbDmChannelId;
   const dmMessageId = data.lbDmMessageId;
   if (!dmChannelId || !dmMessageId) return;
-  console.log("[loupBlancTimer] Starting poll");
 
-  while (true) {
-    await sleep(5000);
+  const result = await runVisualTimer({
+    token, channelId: dmChannelId, messageId: dmMessageId,
+    totalSeconds: LOUP_BLANC_VOTE_SECONDS, label: "loupBlancTimer",
+  });
+  if (result === "resolved") return;
+
+  // Timeout — no kill
+  await editMessage(token, dmChannelId, dmMessageId, {
+    embeds: [{
+      title: "⚪ Loup-Garou Blanc — Temps écoulé",
+      description: "Tu n'as pas choisi à temps. Aucun loup n'est éliminé cette nuit.",
+      color: 0xffffff,
+      thumbnail: { url: getRoleImage("loup_blanc") },
+    }],
+    components: [],
+  });
+  if (data.gameChannelId && data.lobbyMessageId) {
     try {
-      const msg: any = await getMessage(token, dmChannelId, dmMessageId);
-      if (!msg.components?.length) return;
-      const lb = (() => {
-        const embed = msg.embeds?.[0];
-        if (!embed?.url?.includes("/lb/")) return null;
-        return decodeLBState(embed.url);
-      })();
-      if (!lb) return;
-      if (Date.now() / 1000 >= lb.deadline) {
-        await editMessage(token, dmChannelId, dmMessageId, {
-          embeds: [{
-            title: "⚪ Loup-Garou Blanc — Temps écoulé",
-            description: "Tu n'as pas choisi à temps. Aucun loup n'est éliminé cette nuit.",
-            color: 0xffffff,
-            thumbnail: { url: getRoleImage("loup_blanc") },
-          }],
-          components: [],
-        });
-        if (data.gameChannelId && data.lobbyMessageId) {
-          try {
-            const lobbyMsg: any = await getMessage(token, data.gameChannelId, data.lobbyMessageId);
-            const game = parseGameFromEmbed(lobbyMsg);
-            if (game) {
-              await sleep(2000);
-              console.log("[loupBlancTimer] Timeout → day_discussion");
-              await dispatchPhase(token, "day_discussion", { game }, ctx, env);
-            }
-          } catch {}
-        }
-        return;
+      const lobbyMsg: any = await getMessage(token, data.gameChannelId, data.lobbyMessageId);
+      const game = parseGameFromEmbed(lobbyMsg);
+      if (game) {
+        await sleep(2000);
+        console.log("[loupBlancTimer] Timeout → day_discussion");
+        await dispatchPhase(token, "day_discussion", { game }, ctx, env);
       }
-    } catch (err) {
-      console.error("[loupBlancTimer] Error:", err);
-      await sleep(5000);
-    }
+    } catch {}
   }
 }
 
@@ -4515,7 +4488,7 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
 
   const dead = game.dead ?? [];
   const livingPlayers = game.players.filter((id) => !dead.includes(id));
-  const discussionSeconds = 90; // 1 minute 30 seconds
+  const discussionSeconds = game.discussionTime ?? 120;
   const deadline = Math.floor(Date.now() / 1000) + discussionSeconds;
 
   // Unlock SEND_MESSAGES for living players
@@ -4530,18 +4503,20 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
 
   // Update lobby status
   await updatePhaseStatus(token, game,
-    "💬 Discussion — 1m30s",
-    `*Les villageois discutent librement...*\n\n⏰ Fin de la discussion: <t:${deadline}:R>`,
+    `💬 Discussion — ${discussionSeconds}s`,
+    `*Les villageois discutent librement...*\n\n⏰ Discussion en cours...`,
     EMBED_COLOR_ORANGE, SCENE_IMAGES.dawn_breaks,
   );
 
+  // Send countdown embed with Discord's native <t:DEADLINE:R> (auto-updates client-side)
+  console.log(`[discussion] ⏱️ START: ${discussionSeconds}s, gameChannel=${game.gameChannelId}`);
   const discMsg: any = await sendMessage(token, game.gameChannelId, {
     embeds: [{
-      title: "☀️ Période de discussion — 1m30s",
+      title: `☀️ Période de discussion — ${discussionSeconds}s`,
       description: [
         "Les villageois peuvent maintenant discuter librement!",
         "",
-        `⏰ Fin de la discussion: <t:${deadline}:R>`,
+        `⏰ Fin de la discussion <t:${deadline}:R>`,
         "",
         "*Débattez, accusez, défendez-vous... le vote approche!*",
       ].join("\n"),
@@ -4549,53 +4524,38 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
       image: { url: SCENE_IMAGES.dawn_breaks },
     }],
   });
+  console.log(`[discussion] ⏱️ countdown embed sent: ${discMsg.id}`);
 
-  // Bots send 5-6 messages, then poll until 10 total messages → launch vote
+  // Fire bot messages concurrently (non-blocking)
   const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
   const aliveBots = bots.filter((b) => b.alive);
-  const botMsgCount = 5 + Math.floor(Math.random() * 2); // 5 or 6
   if (aliveBots.length > 0 && game.roles) {
     const botAlivePlayers = await buildBotAlivePlayersList(token, game, livingPlayers, aliveBots);
-    for (let i = 0; i < botMsgCount; i++) {
-      const bot = aliveBots[Math.floor(Math.random() * aliveBots.length)]!;
-      const role = game.roles[bot.id] ?? "villageois";
-      await sleep(2000 + Math.floor(Math.random() * 2000));
-      await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers);
-    }
+    const botMsgCount = 5 + Math.floor(Math.random() * 2);
+    console.log(`[discussion] ⏱️ launching ${botMsgCount} bot messages (ctx.waitUntil)`);
+    ctx.waitUntil((async () => {
+      for (let i = 0; i < botMsgCount; i++) {
+        const bot = aliveBots[Math.floor(Math.random() * aliveBots.length)]!;
+        const role = game.roles![bot.id] ?? "villageois";
+        await sleep(2000 + Math.floor(Math.random() * 2000));
+        try {
+          await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers);
+        } catch (e) {
+          console.error(`[discussion] ⏱️ bot msg error:`, e);
+        }
+      }
+      console.log(`[discussion] ⏱️ all bot messages sent`);
+    })());
   }
 
-  // Wait for 10 total messages in channel (poll every 3s)
-  while (true) {
-    await sleep(3000);
-    try {
-      const msgs: any[] = await getChannelMessages(token, game.gameChannelId, discMsg.id);
-      console.log(`[discussion] ${msgs.length}/10 messages`);
-      if (msgs.length >= 10) break;
-    } catch { break; }
-  }
-
-  // Discussion over — lock chat and start vote
-  for (const playerId of livingPlayers) {
-    try {
-      await setChannelPermission(token, game.gameChannelId, playerId, {
-        allow: String(1 << 10),
-        deny: String(1 << 11),
-        type: 1,
-      });
-    } catch {}
-  }
-
-  try {
-    await editMessage(token, game.gameChannelId, discMsg.id, {
-      embeds: [{
-        title: "☀️ Discussion terminée!",
-        description: "Place au vote!",
-        color: EMBED_COLOR_ORANGE,
-      }],
-    });
-  } catch {}
-
-  await dispatchPhase(token, "day_vote", { game }, ctx, env);
+  // Dispatch discussion timer — pure sleep, zero API calls during countdown
+  console.log(`[discussion] ⏱️ dispatching discussion_timer, discMsgId=${discMsg.id}, seconds=${discussionSeconds}`);
+  await dispatchPhase(token, "discussion_timer", {
+    _discMsgId: discMsg.id,
+    _remainingSeconds: discussionSeconds,
+    _originalTotal: discussionSeconds,
+    game,
+  }, ctx, env);
 }
 
 /** Build alive players list for bot context */
@@ -4615,9 +4575,43 @@ async function buildBotAlivePlayersList(
   return result;
 }
 
-// phaseDiscussionTimer kept for backward compat but no longer used
-async function phaseDiscussionTimer(_token: string, _data: any, _ctx: ExecutionContext, _env: Env) {
-  console.log("[discussionTimer] DEPRECATED — discussion is now inline");
+/** Discussion countdown — pure sleep, ZERO API calls during countdown.
+ *  Discord's <t:DEADLINE:R> in the initial embed handles the visual timer.
+ *  This preserves Cloudflare execution budget for the rest of the game chain. */
+async function phaseDiscussionTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
+  const { game, _discMsgId } = data;
+  if (!game || !_discMsgId) return;
+  const totalSeconds: number = data._remainingSeconds ?? (game.discussionTime ?? 120);
+  console.log(`[discussionTimer] ⏱️ START: sleeping ${totalSeconds}s (zero API calls)`);
+
+  await sleep(totalSeconds * 1000);
+
+  console.log(`[discussionTimer] ⏱️ DONE — locking chat`);
+
+  // Discussion over — lock chat
+  const dead = game.dead ?? [];
+  const livingPlayers = game.players.filter((id: string) => !dead.includes(id));
+  for (const playerId of livingPlayers) {
+    try {
+      await setChannelPermission(token, game.gameChannelId, playerId, {
+        allow: String(1 << 10),
+        deny: String(1 << 11),
+        type: 1,
+      });
+    } catch {}
+  }
+
+  try {
+    await editMessage(token, game.gameChannelId, _discMsgId, {
+      embeds: [{
+        title: "☀️ Discussion terminée!",
+        description: "Place au vote!",
+        color: EMBED_COLOR_ORANGE,
+      }],
+    });
+  } catch {}
+
+  await dispatchPhase(token, "day_vote", { game }, ctx, env);
 }
 
 // ── Day Vote Phase ──────────────────────────────────────────────────
@@ -4825,7 +4819,7 @@ async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext):
 async function phaseDayVoteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { voteMessageId, gameChannelId, botVotePending, gameNumber } = data;
   if (!voteMessageId || !gameChannelId) return;
-  console.log("[dayVoteTimer] Starting");
+  console.log("[dayVoteTimer] Starting visual countdown");
 
   // Bots vote first (random, staggered)
   if (botVotePending && gameNumber) {
@@ -4839,38 +4833,32 @@ async function phaseDayVoteTimer(token: string, data: any, ctx: ExecutionContext
         console.error(`[dayVoteTimer] Bot ${bot.name} vote failed:`, err);
       }
     }
-    // Check if all voted after bots
-    const msg: any = await getMessage(token, gameChannelId, voteMessageId);
-    if (!msg.components?.length) { console.log("[dayVoteTimer] Already resolved after bot votes"); return; }
+    const checkMsg: any = await getMessage(token, gameChannelId, voteMessageId);
+    if (!checkMsg.components?.length) { console.log("[dayVoteTimer] Already resolved after bot votes"); return; }
   }
 
-  // Poll for human votes or deadline
-  while (true) {
-    await sleep(5000);
-    try {
-      const msg: any = await getMessage(token, gameChannelId, voteMessageId);
-      if (!msg.components?.length) { console.log("[dayVoteTimer] Already resolved"); return; }
-      const dv = parseDayVoteFromEmbed(msg);
-      if (!dv) return;
+  // Calculate remaining from embed deadline
+  const initMsg: any = await getMessage(token, gameChannelId, voteMessageId);
+  const initDv = parseDayVoteFromEmbed(initMsg);
+  const totalSeconds = initDv ? Math.max(1, Math.round(initDv.deadline - Date.now() / 1000)) : 60;
 
-      const remaining = Math.round(dv.deadline - Date.now() / 1000);
-      console.log(`[dayVoteTimer] ${remaining}s left`);
+  const result = await runVisualTimer({
+    token, channelId: gameChannelId, messageId: voteMessageId,
+    totalSeconds, label: "dayVoteTimer",
+  });
+  if (result === "resolved") return;
 
-      const allVoted = dv.voters.every((id) => dv.votes[id]);
-      if (allVoted || Date.now() / 1000 >= dv.deadline) {
-        console.log("[dayVoteTimer] Resolving vote...");
-        await editMessage(token, gameChannelId, voteMessageId, {
-          embeds: msg.embeds,
-          components: [],
-        });
-        await resolveDayVote(token, dv, ctx, env);
-        return;
-      }
-    } catch (err) {
-      console.error("[dayVoteTimer] Error:", err);
-      await sleep(5000);
-    }
-  }
+  // Timeout — resolve day vote
+  const msg: any = await getMessage(token, gameChannelId, voteMessageId);
+  if (!msg.components?.length) return;
+  const dv = parseDayVoteFromEmbed(msg);
+  if (!dv) return;
+  console.log("[dayVoteTimer] Resolving vote...");
+  await editMessage(token, gameChannelId, voteMessageId, {
+    embeds: msg.embeds,
+    components: [],
+  });
+  await resolveDayVote(token, dv, ctx, env);
 }
 
 async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionContext, env: Env) {
@@ -5065,7 +5053,6 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
     return;
   }
 
-  // Start next night via self-invocation (fresh 30s budget)
   await sleep(3000);
   await dispatchPhase(token, "night_start", { game }, ctx, env);
 }
@@ -5322,11 +5309,12 @@ export default {
       return new Response("🐺 Garou Interaction Server", { status: 200 });
     }
 
-    // ── Internal phase calls (kept for backward compat, but triggerPhase now calls dispatchPhase directly) ──
+    // ── Internal phase calls (selfInvoke receives here — fresh worker with full budget) ──
     const internalToken = req.headers.get("X-Internal");
     if (internalToken === env.DISCORD_BOT_TOKEN) {
       const payload = await req.json() as any;
       const { phase } = payload;
+      console.log(`[internal] ✅ Received selfInvoke for phase: ${phase}`);
       const token = env.DISCORD_BOT_TOKEN;
       ctx.waitUntil(dispatchPhase(token, phase, payload, ctx, env));
       return new Response("OK", { status: 200 });
