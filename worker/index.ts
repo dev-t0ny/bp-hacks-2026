@@ -36,11 +36,10 @@ interface Env {
   DISCORD_BOT_TOKEN: string;
   ACTIVE_PLAYERS: KVNamespace;
   PRESETS_KV?: KVNamespace;
-  VOICE_SERVICE_URL?: string;
-  VOICE_SERVICE_TOKEN?: string;
   GATEWAY_URL?: string;
   GATEWAY_TOKEN?: string;
   ANTHROPIC_API_KEY?: string;
+  WORKER_URL?: string; // auto-set from request URL for self-invocation
 }
 
 const PLAYER_TTL = 86400;
@@ -475,7 +474,6 @@ interface GameState {
   petiteFilleThreadId?: string; // permanent spy thread for petite fille
   nightCount?: number; // how many nights have passed (cupidon acts night 1 only)
   dead?: string[]; // dead player IDs
-  voiceChannelId?: string; // voice channel for sound effects
   witchPotions?: { life: boolean; death: boolean }; // true = available
   discussionTime?: number; // seconds for day discussion
   voteTime?: number; // seconds for day vote
@@ -503,7 +501,6 @@ function encodeState(game: GameState): string {
   if (game.petiteFilleThreadId) compact.pf = game.petiteFilleThreadId;
   if (game.nightCount) compact.nc = game.nightCount;
   if (game.dead?.length) compact.d = game.dead;
-  if (game.voiceChannelId) compact.vc = game.voiceChannelId;
   if (game.witchPotions) compact.wp = game.witchPotions;
   if (game.discussionTime) compact.dt = game.discussionTime;
   if (game.voteTime) compact.vt = game.voteTime;
@@ -535,7 +532,6 @@ function decodeState(url: string): GameState | null {
       petiteFilleThreadId: compact.pf,
       nightCount: compact.nc ?? 0,
       dead: compact.d ?? [],
-      voiceChannelId: compact.vc,
       witchPotions: compact.wp,
       discussionTime: compact.dt ?? 120,
       voteTime: compact.vt ?? 60,
@@ -569,7 +565,7 @@ function buildRoleCheckEmbed(game: GameState) {
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
-        `✅ **${seen.length}/${game.players.length}** ont vu leur rôle`,
+        `✅ **${seen.filter(id => !id.startsWith("bot_")).length}/${game.players.length}** ont vu leur rôle`,
       ].join("\n"),
       color: EMBED_COLOR_PURPLE,
       image: { url: SCENE_IMAGES.game_start },
@@ -753,6 +749,7 @@ function sleep(ms: number) {
 // ── LLM Call via Botpress ADK (for bot decisions) ───────────────────
 
 async function callLLM(prompt: string, env: Env): Promise<string> {
+  console.log(`[callLLM] Starting, prompt length: ${prompt.length}, BOTPRESS_PAT: ${env.BOTPRESS_PAT ? "SET" : "UNSET"}, BOTPRESS_BOT_ID: ${env.BOTPRESS_BOT_ID ?? "UNSET"}`);
   // Use Botpress ADK action (zai) for AI generation
   if (env.BOTPRESS_PAT && env.BOTPRESS_BOT_ID) {
     const controller = new AbortController();
@@ -825,54 +822,23 @@ async function executeBotWolfVote(
   gameNumber: number,
   ctx: ExecutionContext,
 ): Promise<void> {
+  console.log(`[botWolfVote] 🐺 Bot ${bot.name} (${bot.id}) voting in game #${gameNumber}`);
   // Re-read VoteState from embed to avoid race conditions
   const currentMsg: any = await getMessage(token, wolfChannelId, voteMessageId);
-  if (!currentMsg.components?.length) return; // Already resolved
+  if (!currentMsg.components?.length) { console.log(`[botWolfVote] Already resolved, skipping ${bot.name}`); return; }
   const voteState = parseVoteFromEmbed(currentMsg);
-  if (!voteState) return;
+  if (!voteState) { console.log(`[botWolfVote] No vote state found for ${bot.name}`); return; }
 
-  const gameHistory = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
-
-  // Build known info for wolf: list wolf teammates
-  const wolfBots = allBots.filter((b) => b.alive && voteState.wolves.includes(b.id));
-  const knownInfo = wolfBots.length > 1
-    ? `Tes alliés loups: ${wolfBots.filter((b) => b.id !== bot.id).map((b) => b.name).join(", ")}`
-    : "";
-
-  const req: BotDecisionRequest = {
-    bot,
-    role: "loup",
-    phase: "night_vote",
-    alivePlayers: voteState.targets,
-    aliveHumans: voteState.targets.filter((t) => !t.id.startsWith("bot_")),
-    aliveBots: allBots.filter((b) => b.alive),
-    gameHistory,
-    knownInfo,
-  };
-
-  let decision: BotDecisionResult;
-  try {
-    const prompt = buildBotPrompt(req);
-    const llmResponse = await callLLM(prompt, env);
-    const parsed = JSON.parse(llmResponse.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
-    const targetName = parsed.target ?? "";
-    const target = voteState.targets.find((t) =>
-      t.name.toLowerCase().includes(targetName.toLowerCase())
-    );
-    decision = {
-      action: target?.id ?? voteState.targets[0]?.id ?? "skip",
-      message: parsed.message ?? `Je vote pour ${target?.name ?? "quelqu'un"}.`,
-    };
-  } catch {
-    decision = fallbackDecision(voteState.targets, bot.id);
-  }
+  // Instant random decision — pick a random non-wolf target
+  const decision = fallbackDecision(voteState.targets, bot.id);
+  console.log(`[botWolfVote] ${bot.name} randomly chose: ${decision.action}`);
 
   // Apply vote
   voteState.votes[bot.id] = decision.action;
 
   // Post bot message in wolf thread
   await sendMessage(token, wolfChannelId, {
-    content: `🤖 **${bot.name}** : "${decision.message}"`,
+    content: `**${bot.emoji} ${bot.name}** : "${decision.message}"`,
   });
 
   // Update vote embed with new state
@@ -890,40 +856,68 @@ async function executeBotWolfVote(
 
 async function executeBotDiscussion(
   token: string,
-  env: Env,
+  _env: Env,
   bot: BotPlayer,
-  allBots: BotPlayer[],
+  _allBots: BotPlayer[],
   gameChannelId: string,
-  gameNumber: number,
+  _gameNumber: number,
   role: string,
   alivePlayers: { id: string; name: string }[],
 ): Promise<void> {
-  if (!botSpeaks()) return;
+  console.log(`[botDiscussion] 💬 Bot ${bot.name} (${bot.id}), role: ${role}`);
 
-  const gameHistory = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
+  const others = alivePlayers.filter(p => p.id !== bot.id);
+  const randomTarget = others[Math.floor(Math.random() * others.length)];
+  const randomTarget2 = others.filter(p => p.id !== randomTarget?.id)[Math.floor(Math.random() * Math.max(1, others.length - 1))];
 
-  const req: BotDecisionRequest = {
-    bot,
-    role,
-    phase: "day_discussion",
-    alivePlayers,
-    aliveHumans: alivePlayers.filter((p) => !p.id.startsWith("bot_")),
-    aliveBots: allBots.filter((b) => b.alive),
-    gameHistory,
-    knownInfo: "",
-  };
+  const phrases = role === "loup" ? [
+    `Hmm, je trouve ${randomTarget?.name ?? "quelqu'un"} un peu louche...`,
+    `Moi je dis qu'on devrait surveiller ${randomTarget?.name ?? "certains"} de plus près.`,
+    `J'ai rien vu de suspect, mais ${randomTarget?.name ?? "quelqu'un"} me donne un mauvais feeling.`,
+    `C'est bizarre que personne n'accuse ${randomTarget?.name ?? "cette personne"}...`,
+    `Perso je fais confiance à personne. Surtout pas à ${randomTarget?.name ?? "certains"}.`,
+    `Moi j'accuse ${randomTarget?.name ?? "quelqu'un"}, y'a quelque chose qui cloche.`,
+    `Faut regarder du côté de ${randomTarget?.name ?? "certains"}, sérieux.`,
+    `Wsh ${randomTarget?.name ?? "toi là"}, t'as été bien silencieux cette nuit...`,
+    `Perso je vote ${randomTarget?.name ?? "quelqu'un"}, c'est clair que c'est un loup.`,
+    `Non mais attendez, ${randomTarget?.name ?? "quelqu'un"} a dit quoi exactement hier??`,
+    `Moi je dis c'est entre ${randomTarget?.name ?? "quelqu'un"} et ${randomTarget2?.name ?? "l'autre"}.`,
+    `${randomTarget?.name ?? "Quelqu'un"} fait trop l'innocent, ça pue le loup.`,
+    `On s'emballe pas, mais ${randomTarget?.name ?? "cette personne"} me dit rien de bon.`,
+    `Quelqu'un peut m'expliquer pourquoi ${randomTarget?.name ?? "lui/elle"} a rien dit hier?`,
+    `Moi je kiffe pas l'attitude de ${randomTarget?.name ?? "certains"}, c'est tout.`,
+    `Ouais non, ${randomTarget?.name ?? "toi"}, tu nous caches quelque chose.`,
+    `Bon on fait quoi? Moi je suis chaud pour virer ${randomTarget?.name ?? "quelqu'un"}.`,
+  ] : [
+    `Je suis pas sûr(e) mais ${randomTarget?.name ?? "quelqu'un"} agit bizarre non?`,
+    `On devrait voter contre ${randomTarget?.name ?? "quelqu'un"}, j'ai un mauvais pressentiment.`,
+    `Moi je suis innocent(e)! Regardez plutôt du côté de ${randomTarget?.name ?? "certains"}.`,
+    `${randomTarget?.name ?? "Quelqu'un"} parle pas beaucoup... c'est suspect.`,
+    `Faisons attention, les loups sont parmi nous. Je suspecte ${randomTarget?.name ?? "quelqu'un"}.`,
+    `Je fais confiance à personne ici. Surtout pas ${randomTarget?.name ?? "certains"}.`,
+    `Bon, moi je pense que ${randomTarget?.name ?? "quelqu'un"} nous ment depuis le début.`,
+    `Nah fr ${randomTarget?.name ?? "toi"}, explique-nous pourquoi tu dis rien?`,
+    `Moi je suis clean wallah, c'est ${randomTarget?.name ?? "quelqu'un"} le loup ici.`,
+    `On devrait focus ${randomTarget?.name ?? "cette personne"}, ses arguments tiennent pas la route.`,
+    `Écoutez moi, je vous jure c'est ${randomTarget?.name ?? "quelqu'un"} le problème.`,
+    `${randomTarget?.name ?? "Toi"} et ${randomTarget2?.name ?? "l'autre"}, vous votez toujours pareil, c'est louche.`,
+    `Les gars, faut se réveiller! ${randomTarget?.name ?? "Quelqu'un"} nous manipule depuis le début!`,
+    `Moi j'ai confiance en personne sauf moi-même. ${randomTarget?.name ?? "Quelqu'un"} est suspect.`,
+    `Honnêtement? ${randomTarget?.name ?? "Quelqu'un"} me donne des vibes de loup-garou.`,
+    `C'est la guerre les amis, et ${randomTarget?.name ?? "quelqu'un"} est dans le camp adverse.`,
+    `Attendez, ${randomTarget?.name ?? "cette personne"} a changé d'avis trop vite, non?`,
+    `Moi j'ai dormi tranquille cette nuit. Par contre ${randomTarget?.name ?? "certains"}... 👀`,
+  ];
+
+  const message = phrases[Math.floor(Math.random() * phrases.length)]!;
 
   try {
-    const prompt = buildBotPrompt(req);
-    const llmResponse = await callLLM(prompt, env);
-    const message = llmResponse.trim().slice(0, 200);
-    if (message) {
-      await sendMessage(token, gameChannelId, {
-        content: `🤖 **${bot.name}** : "${message}"`,
-      });
-    }
-  } catch {
-    // Silent fail — bot just doesn't speak this round
+    await sendMessage(token, gameChannelId, {
+      content: `**${bot.emoji} ${bot.name}** : ${message}`,
+    });
+    console.log(`[botDiscussion] ${bot.name} posted: ${message}`);
+  } catch (err) {
+    console.error(`[botDiscussion] Failed to send message for ${bot.name}:`, err);
   }
 }
 
@@ -931,53 +925,27 @@ async function executeBotDiscussion(
 
 async function executeBotDayVote(
   token: string,
-  env: Env,
+  _env: Env,
   bot: BotPlayer,
   allBots: BotPlayer[],
   gameChannelId: string,
   voteMessageId: string,
-  gameNumber: number,
-  role: string,
+  _gameNumber: number,
+  _role: string,
   ctx: ExecutionContext,
 ): Promise<void> {
+  console.log(`[botDayVote] 🗳️ Bot ${bot.name} (${bot.id}) voting`);
   // Re-read DayVoteState from embed
   const currentMsg: any = await getMessage(token, gameChannelId, voteMessageId);
   if (!currentMsg.components?.length) return;
   const dv = parseDayVoteFromEmbed(currentMsg);
   if (!dv) return;
 
-  const gameHistory = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
-
-  const req: BotDecisionRequest = {
-    bot,
-    role,
-    phase: "day_vote",
-    alivePlayers: dv.targets,
-    aliveHumans: dv.targets.filter((t) => !t.id.startsWith("bot_")),
-    aliveBots: allBots.filter((b) => b.alive),
-    gameHistory,
-    knownInfo: role === "loup"
-      ? `Ne vote pas contre: ${allBots.filter((b) => b.alive && b.id !== bot.id && dv.allRoles?.[b.id] === "loup").map((b) => b.name).join(", ")}`
-      : "",
-  };
-
-  let targetId: string;
-  let message: string;
-  try {
-    const prompt = buildBotPrompt(req);
-    const llmResponse = await callLLM(prompt, env);
-    const parsed = JSON.parse(llmResponse.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
-    const targetName = parsed.target ?? "";
-    const target = dv.targets.find((t) =>
-      t.name.toLowerCase().includes(targetName.toLowerCase())
-    );
-    targetId = target?.id ?? dv.targets[0]?.id ?? "skip";
-    message = parsed.message ?? `Je vote pour ${target?.name ?? "quelqu'un"}.`;
-  } catch {
-    const fd = fallbackDecision(dv.targets, bot.id);
-    targetId = fd.action;
-    message = fd.message;
-  }
+  // Instant random decision
+  const fd = fallbackDecision(dv.targets, bot.id);
+  const targetId = fd.action;
+  const message = fd.message;
+  console.log(`[botDayVote] ${bot.name} randomly chose: ${targetId}`);
 
   dv.votes[bot.id] = targetId;
 
@@ -987,7 +955,7 @@ async function executeBotDayVote(
     if (!vote) return `⬜ <@${id}> — *en attente...*`;
     if (id.startsWith("bot_")) {
       const b = allBots.find((b) => b.id === id);
-      const bName = b ? `🤖 ${b.name}` : id;
+      const bName = b ? `${b.emoji} ${b.name}` : id;
       if (vote === "skip") return `⏭️ ${bName} — **Passe**`;
       const target = dv.targets.find((t) => t.id === vote);
       return `✅ ${bName} — a voté pour **${target?.name ?? "?"}**`;
@@ -1020,7 +988,7 @@ async function executeBotDayVote(
 
   // Post message
   await sendMessage(token, gameChannelId, {
-    content: `🤖 **${bot.name}** vote pour éliminer **${dv.targets.find((t) => t.id === targetId)?.name ?? "quelqu'un"}** : "${message}"`,
+    content: `**${bot.emoji} ${bot.name}** vote : "${message}"`,
   });
 
   // Check all voted
@@ -1367,24 +1335,6 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         ],
       });
 
-      // Create a voice channel for sound effects (type 2 = GUILD_VOICE)
-      // Bot needs CONNECT (1<<20) and SPEAK (1<<21)
-      let voiceChannelId: string | undefined;
-      try {
-        const voiceChannel: any = await createChannel(token, guildId, {
-          name: `vocal-partie-${gameNumber}`,
-          type: 2,
-          parent_id: categoryId,
-          permission_overwrites: [
-            { id: guildId, type: 0, deny: String(1 << 10) },
-            { id: botUser.id, type: 1, allow: ((1n << 10n) | (1n << 20n) | (1n << 21n)).toString() },
-            { id: userId, type: 1, allow: ((1n << 10n) | (1n << 20n)).toString() },
-          ],
-        });
-        voiceChannelId = voiceChannel.id;
-      } catch (err) {
-        console.error("Failed to create voice channel:", err);
-      }
 
       await markPlayerActive(env.ACTIVE_PLAYERS, userId, gameNumber, gameChannel.id);
       await env.ACTIVE_PLAYERS.put(`gp:${gameNumber}:${userId}`, "1", { expirationTtl: PLAYER_TTL });
@@ -1398,7 +1348,6 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         maxPlayers,
         players: [userId],
         announceChannelId: channelId,
-        voiceChannelId,
         discussionTime: config.discussionTime,
         voteTime: config.voteTime,
         selectedRoleIds: config.selectedRoles,
@@ -1551,14 +1500,6 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
         type: 1,
       });
 
-      if (game.voiceChannelId) {
-        try {
-          await setChannelPermission(token, game.voiceChannelId, userId, {
-            allow: ((1n << 10n) | (1n << 20n)).toString(),
-            type: 1,
-          });
-        } catch {}
-      }
 
       // ── Step 4: Add player + update embeds ──
       await kv.put(playerKey, "1", { expirationTtl: PLAYER_TTL });
@@ -1647,9 +1588,6 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
   try { await env.ACTIVE_PLAYERS.delete(`gp:${game.gameNumber}:${userId}`); } catch {}
 
   try { await deleteChannelPermission(token, game.gameChannelId, userId); } catch {}
-  if (game.voiceChannelId) {
-    try { await deleteChannelPermission(token, game.voiceChannelId, userId); } catch {}
-  }
 
   const member: any = await getGuildMember(token, game.guildId, userId);
   const playerName = member.nick || member.user.global_name || member.user.username;
@@ -1661,9 +1599,6 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
     try { await deleteChannel(token, game.gameChannelId); } catch {}
     if (game.wolfChannelId) {
       try { await deleteChannel(token, game.wolfChannelId); } catch {}
-    }
-    if (game.voiceChannelId) {
-      try { await deleteChannel(token, game.voiceChannelId); } catch {}
     }
     if (game.announceChannelId && game.announceMessageId) {
       try { await deleteMessage(token, game.announceChannelId, game.announceMessageId); } catch {}
@@ -1695,67 +1630,68 @@ const COUNTDOWN_SECONDS = 30;
 const EMBED_COLOR_NIGHT = 0x0d1b2a;
 const EMBED_COLOR_PURPLE = 0x6c3483;
 
-// ── Self-invoke: call the worker itself to run the next phase ──
-// Each phase stays under 30s to respect Cloudflare free plan waitUntil limits.
+// ── Phase dispatch: directly call the phase handler in ctx.waitUntil ──
+// (Self-invocation via HTTP was returning 404 — Cloudflare blocks it from within ctx.waitUntil)
 const WORKER_URL = "https://garou-interactions.gabgingras.workers.dev";
 
-function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, data: Record<string, unknown>) {
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Internal": env.DISCORD_BOT_TOKEN,
-      },
-      body: JSON.stringify({ phase, ...data }),
-    }).then(async (res) => {
-      if (!res.ok) console.error(`Phase ${phase} HTTP ${res.status}: ${await res.text()}`);
-      else console.log(`Phase ${phase} triggered OK`);
-    }).catch((err) => console.error(`Phase ${phase} fetch error:`, err))
-  );
+async function dispatchPhase(token: string, phase: string, payload: any, ctx: ExecutionContext, env: Env) {
+  console.log(`[phase] ▶ Dispatching: ${phase}`);
+  try {
+    if (phase === "start_game") await startGame(token, payload.game, ctx, env);
+    else if (phase === "night_start") await startNightPhase(token, payload.game, ctx, env);
+    else if (phase === "voyante_phase") await phaseVoyante(token, payload.game, ctx, env);
+    else if (phase === "voyante_timer") await phaseVoyanteTimer(token, payload, ctx, env);
+    else if (phase === "wolf_phase") await startWolfPhase(token, payload.game, ctx, env);
+    else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
+    else if (phase === "post_wolf") await phasePostWolf(token, payload, ctx, env);
+    else if (phase === "sorciere_phase") await phaseSorciere(token, payload, ctx, env);
+    else if (phase === "sorciere_timer") await phaseSorciereTimer(token, payload, ctx, env);
+    else if (phase === "dawn_phase") await phaseDawn(token, payload, ctx, env);
+    else if (phase === "cupidon_timer") await phaseCupidonTimer(token, payload, ctx, env);
+    else if (phase === "chasseur_timer") await phaseChasseurTimer(token, payload, ctx, env);
+    else if (phase === "loup_blanc_vote") await phaseLoupBlancVote(token, payload.game, ctx, env);
+    else if (phase === "loup_blanc_timer") await phaseLoupBlancTimer(token, payload, ctx, env);
+    else if (phase === "day_discussion") await phaseDiscussion(token, payload, ctx, env);
+    else if (phase === "discussion_timer") await phaseDiscussionTimer(token, payload, ctx, env);
+    else if (phase === "day_vote") await phaseDayVote(token, payload, ctx, env);
+    else if (phase === "day_vote_timer") await phaseDayVoteTimer(token, payload, ctx, env);
+    else console.error(`[phase] ❌ Unknown phase: ${phase}`);
+    console.log(`[phase] ✅ ${phase} completed`);
+  } catch (err) {
+    console.error(`[phase] ❌ ${phase} FAILED:`, err);
+  }
 }
 
-// ── Voice Service ────────────────────────────────────────────────────
+function triggerPhase(ctx: ExecutionContext, env: Env, phase: string, data: Record<string, unknown>) {
+  console.log(`[triggerPhase] Scheduling: ${phase}`);
+  const token = env.DISCORD_BOT_TOKEN;
+  ctx.waitUntil(dispatchPhase(token, phase, data, ctx, env));
+}
 
-const VOICE_SERVICE_TIMEOUT_MS = 10_000;
-
-async function triggerStartSound(env: Env, game: GameState): Promise<void> {
-  if (!env.VOICE_SERVICE_URL || !game.voiceChannelId) {
-    if (!env.VOICE_SERVICE_URL) console.log("[garou] Voice service skipped: VOICE_SERVICE_URL not set");
-    else console.log("[garou] Voice service skipped: no voiceChannelId");
+/** Self-invoke the worker via HTTP to get a fresh 30s ctx.waitUntil budget.
+ *  Used for long-running timers (discussion 90s, vote 60s) that exceed
+ *  Cloudflare Workers' 30s wall-time limit per invocation. */
+async function selfInvoke(env: Env, phase: string, data: Record<string, unknown>) {
+  const url = env.WORKER_URL;
+  if (!url) {
+    console.error("[selfInvoke] No WORKER_URL set! Cannot self-invoke.");
     return;
   }
-  const endpoint = `${env.VOICE_SERVICE_URL.replace(/\/+$/, "")}/play-start-sfx`;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (env.VOICE_SERVICE_TOKEN) headers.Authorization = `Bearer ${env.VOICE_SERVICE_TOKEN}`;
-  console.log(`[garou] Triggering start sound: guildId=${game.guildId} voiceChannelId=${game.voiceChannelId}`);
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), VOICE_SERVICE_TIMEOUT_MS);
+  console.log(`[selfInvoke] → ${phase}`);
   try {
-    const res = await fetch(endpoint, {
+    await fetch(url, {
       method: "POST",
-      headers,
-      body: JSON.stringify({ guildId: game.guildId, voiceChannelId: game.voiceChannelId }),
-      signal: controller.signal,
+      headers: {
+        "X-Internal": env.DISCORD_BOT_TOKEN,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ phase, ...data }),
     });
-    clearTimeout(timeoutId);
-    if (!res.ok) {
-      const body = await res.text();
-      console.error(`[garou] Voice service error ${res.status}: ${body}`);
-    } else {
-      const data: any = await res.json();
-      if (data.skipped) console.log("[garou] Voice service skipped playback (e.g. no one in voice channel)");
-      else console.log("[garou] Start sound played successfully");
-    }
-  } catch (err: any) {
-    clearTimeout(timeoutId);
-    if (err?.name === "AbortError") {
-      console.error("[garou] Voice service timeout");
-    } else {
-      console.error("[garou] Voice service fetch error:", err);
-    }
+  } catch (err) {
+    console.error(`[selfInvoke] Failed to invoke ${phase}:`, err);
   }
 }
+
 
 // ── Gateway Service (message mirroring for Petite Fille) ────────────
 
@@ -1817,12 +1753,32 @@ async function gatewayUntrackThread(env: Env, wolfThreadId: string): Promise<voi
   }
 }
 
+// ── Phase Status Helper ─────────────────────────────────────────────
+// Updates the lobby embed to show which phase is currently active
+
+async function updatePhaseStatus(token: string, game: GameState, title: string, description: string, color: number, image?: string) {
+  if (!game.lobbyMessageId) return;
+  const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
+  try {
+    await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
+      embeds: [{
+        title: `${title} — Partie #${game.gameNumber}`,
+        url: stateUrl,
+        description,
+        color,
+        image: image ? { url: image } : undefined,
+      }],
+      components: [],
+    });
+  } catch (err) {
+    console.error(`[phaseStatus] Failed to update: ${title}`, err);
+  }
+}
+
 async function startGame(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.lobbyMessageId) return;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
-  // Play sound effect in voice channel (non-blocking)
-  triggerStartSound(env, game).catch(() => {});
 
   // ── Phase 1: Night falls ──
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
@@ -1891,13 +1847,17 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
 }
 
 
-// ── Countdown + Night — runs in ctx.waitUntil from handleRevealRole (~25s) ──
+// ── Countdown + Night — runs in ctx.waitUntil from handleRevealRole (~15s) ──
 async function runCountdownAndNight(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
+  console.log(`[countdown] Starting for game #${game.gameNumber}`);
+
   try {
     const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
     const latest = parseGameFromEmbed(msg);
     if (latest) game = latest;
-  } catch {}
+  } catch (e) {
+    console.error("[countdown] Re-read failed:", e);
+  }
 
   const nightStateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
@@ -1923,30 +1883,35 @@ async function runCountdownAndNight(token: string, game: GameState, ctx: Executi
         components: [],
       });
     } catch (err) {
-      console.error("Countdown edit failed:", err);
+      console.error("[countdown] Edit failed:", err);
     }
     await sleep(1000);
   }
 
   // "Le village s'endort..."
-  await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
-    embeds: [{
-      title: `🌙 Le village s'endort... — Partie #${game.gameNumber}`,
-      url: nightStateUrl,
-      description: [
-        "*Chaque villageois ferme les yeux...*",
-        "*Le silence envahit le village...*",
-      ].join("\n"),
-      color: EMBED_COLOR_NIGHT,
-      image: { url: SCENE_IMAGES.night_falls },
-    }],
-    components: [],
-  });
+  try {
+    await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
+      embeds: [{
+        title: `🌙 Le village s'endort... — Partie #${game.gameNumber}`,
+        url: nightStateUrl,
+        description: [
+          "*Chaque villageois ferme les yeux...*",
+          "*Le silence envahit le village...*",
+        ].join("\n"),
+        color: EMBED_COLOR_NIGHT,
+        image: { url: SCENE_IMAGES.night_falls },
+      }],
+      components: [],
+    });
+  } catch (err) {
+    console.error("[countdown] 'Village s'endort' edit failed:", err);
+  }
 
   await sleep(3000);
 
   // Trigger night orchestrator (cupidon night 1 → voyante → wolves → sorciere → dawn)
-  triggerPhase(ctx, env, "night_start", { game });
+  console.log(`[countdown] Triggering night_start for game #${game.gameNumber}`);
+  await dispatchPhase(token, "night_start", { game }, ctx, env);
 }
 
 // ── Countdown when game is full ──────────────────────────────────────
@@ -2042,7 +2007,7 @@ async function runCountdown(token: string, game: GameState, ctx: ExecutionContex
     if (isGameStarted(title)) return;
     const currentGame = parseGameFromEmbed(msg);
     if (!currentGame || currentGame.players.length < MIN_PLAYERS) return;
-    triggerPhase(ctx, env, "start_game", { game: currentGame });
+    await dispatchPhase(token, "start_game", { game: currentGame }, ctx, env);
   } catch (err) {
     console.error("Countdown auto-start failed:", err);
   }
@@ -2563,7 +2528,7 @@ async function finalizeCupidonAndStartWolves(token: string, s: CupidonState, cou
   }
 
   // Chain to voyante phase (which chains to wolf_phase)
-  triggerPhase(ctx, env, "voyante_phase", { game });
+  await dispatchPhase(token, "voyante_phase", { game }, ctx, env);
 }
 
 async function handleCupidonConfirm(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -2598,9 +2563,9 @@ const CUPIDON_TIMEOUT_SECONDS = 60;
 async function phaseCupidonTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { cupidonMessageId, cupidonThreadId } = data;
   if (!cupidonMessageId || !cupidonThreadId) return;
+  console.log("[cupidonTimer] Starting poll");
 
-  const start = Date.now();
-  while (Date.now() - start < 25000) {
+  while (true) {
     await sleep(5000);
     try {
       const msg: any = await getMessage(token, cupidonThreadId, cupidonMessageId);
@@ -2626,15 +2591,11 @@ async function phaseCupidonTimer(token: string, data: any, ctx: ExecutionContext
         await finalizeCupidonAndStartWolves(token, s, couple, cupidonThreadId, ctx, env);
         return;
       }
-    } catch { return; }
+    } catch (err) {
+      console.error("[cupidonTimer] Error:", err);
+      await sleep(5000);
+    }
   }
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "cupidon_timer", cupidonMessageId, cupidonThreadId }),
-    }).catch(err => console.error("Cupidon timer re-trigger failed:", err))
-  );
 }
 
 // ── Chasseur State ──────────────────────────────────────────────────
@@ -2718,15 +2679,79 @@ function buildChasseurEmbed(s: ChasseurState) {
 const CHASSEUR_TIMEOUT_SECONDS = 30;
 
 async function triggerChasseurShoot(token: string, game: GameState, chasseurId: string, ctx: ExecutionContext, env: Env) {
+  // Update lobby status
+  await updatePhaseStatus(token, game,
+    "🏹 Le Chasseur tire sa dernière flèche!",
+    "*Dans un dernier souffle, le chasseur vise...*",
+    0xe67e22, getRoleImage("chasseur"),
+  );
+
   const dead = game.dead ?? [];
   const livingTargets = game.players.filter(id => !dead.includes(id) && id !== chasseurId);
-  const targets = await Promise.all(
+  const humanTargets = await Promise.all(
     livingTargets.map(async (id) => {
       const member: any = await getGuildMember(token, game.guildId, id);
       return { id, name: member.nick || member.user.global_name || member.user.username };
     })
   );
+  const chBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const chBotTargets = chBots.filter(b => b.alive && b.id !== chasseurId && !dead.includes(b.id)).map(b => ({ id: b.id, name: b.name }));
+  const targets = [...humanTargets, ...chBotTargets];
   if (targets.length === 0) return;
+
+  // BOT AUTO-PLAY: If chasseur is a bot, pick a random target instantly
+  if (chasseurId.startsWith("bot_")) {
+    const target = targets[Math.floor(Math.random() * targets.length)]!;
+    console.log(`[chasseur] Bot ${chasseurId} auto-shooting ${target.name}`);
+
+    await sendMessage(token, game.gameChannelId, {
+      embeds: [{
+        title: "🏹 Le chasseur tire une dernière flèche!",
+        description: `Dans un dernier souffle, le chasseur abat **${target.name}**!`,
+        color: 0xe67e22, image: { url: SCENE_IMAGES.snipe_reveal },
+      }],
+    });
+
+    if (!game.dead) game.dead = [];
+    game.dead.push(target.id);
+
+    // Mark bot target as dead
+    if (target.id.startsWith("bot_")) {
+      const b2 = chBots.find(b => b.id === target.id);
+      if (b2) { b2.alive = false; await saveBots(env.ACTIVE_PLAYERS, game.gameNumber, chBots); }
+    } else {
+      try { await setChannelPermission(token, game.gameChannelId, target.id, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+    }
+
+    // Couple death chain
+    if (game.couple && game.couple.includes(target.id)) {
+      const pid = target.id === game.couple[0] ? game.couple[1] : game.couple[0];
+      if (pid && !game.dead.includes(pid)) {
+        game.dead.push(pid);
+        if (!pid.startsWith("bot_")) {
+          try { await setChannelPermission(token, game.gameChannelId, pid, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+        }
+        const pName = pid.startsWith("bot_") ? chBots.find(b => b.id === pid)?.name ?? "?" : ((await getGuildMember(token, game.guildId, pid).catch(() => null) as any)?.nick || "?");
+        await sendMessage(token, game.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: `**${pName}** meurt de chagrin.`, color: 0xe91e63 }] });
+      }
+    }
+
+    // Persist state
+    if (game.lobbyMessageId) {
+      const su = `https://garou.bot/s/${encodeState(game)}`;
+      try {
+        const m: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+        const e = m.embeds?.[0];
+        if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); }
+      } catch {}
+    }
+
+    const wr = checkWinCondition(game);
+    if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); return; }
+    await sleep(2000);
+    await dispatchPhase(token, "day_discussion", { game }, ctx, env);
+    return;
+  }
 
   const deadline = Math.floor(Date.now() / 1000) + CHASSEUR_TIMEOUT_SECONDS;
   const chasseurState: ChasseurState = {
@@ -2738,13 +2763,7 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
 
   const chasseurMsg: any = await sendMessage(token, game.gameChannelId, buildChasseurEmbed(chasseurState));
 
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "chasseur_timer", chasseurMessageId: chasseurMsg.id, gameChannelId: game.gameChannelId }),
-    }).catch(err => console.error("Chasseur timer trigger failed:", err))
-  );
+  await dispatchPhase(token, "chasseur_timer", { chasseurMessageId: chasseurMsg.id, gameChannelId: game.gameChannelId }, ctx, env);
 }
 
 async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -2821,7 +2840,7 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
 
     // No win → start day discussion
     await sleep(2000);
-    triggerPhase(ctx, env, "day_discussion", { game });
+    await dispatchPhase(token, "day_discussion", { game }, ctx, env);
   })());
 
   return ackResponse;
@@ -2830,9 +2849,9 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
 async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { chasseurMessageId, gameChannelId } = data;
   if (!chasseurMessageId || !gameChannelId) return;
+  console.log("[chasseurTimer] Starting poll");
 
-  const start = Date.now();
-  while (Date.now() - start < 25000) {
+  while (true) {
     await sleep(5000);
     try {
       const msg: any = await getMessage(token, gameChannelId, chasseurMessageId);
@@ -2884,44 +2903,28 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
         if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); return; }
         // No win → start day discussion
         await sleep(2000);
-        triggerPhase(ctx, env, "day_discussion", { game });
+        await dispatchPhase(token, "day_discussion", { game }, ctx, env);
         return;
       }
-    } catch { return; }
+    } catch (err) {
+      console.error("[chasseurTimer] Error:", err);
+      await sleep(5000);
+    }
   }
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "chasseur_timer", chasseurMessageId, gameChannelId }),
-    }).catch(err => console.error("Chasseur timer re-trigger failed:", err))
-  );
 }
 
 // ── Wolf Phase (extracted for reuse by cupidon flow) ────────────────
 
 async function startWolfPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  if (!game.roles) return;
+  console.log(`[wolfPhase] 🐺 Starting wolf phase for game #${game.gameNumber}`);
+  if (!game.roles) { console.error("[wolfPhase] No roles!"); return; }
 
   // Show wolf wake-up animation in game channel
-  if (game.lobbyMessageId) {
-    const nightStateUrl = `https://garou.bot/s/${encodeState(game)}`;
-    await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
-      embeds: [{
-        title: `🐺 Les loups-garous se réveillent... — Partie #${game.gameNumber}`,
-        url: nightStateUrl,
-        description: [
-          "*Des ombres se faufilent dans la nuit...*",
-          "*Les loups-garous ouvrent les yeux et choisissent leur victime.*",
-          "",
-          `⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour décider.`,
-        ].join("\n"),
-        color: EMBED_COLOR_NIGHT,
-        image: { url: getRoleImage("loup") },
-      }],
-      components: [],
-    });
-  }
+  await updatePhaseStatus(token, game,
+    "🐺 Les loups-garous se réveillent...",
+    `*Des ombres se faufilent dans la nuit...*\n*Les loups-garous ouvrent les yeux et choisissent leur victime.*\n\n⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour décider.`,
+    EMBED_COLOR_NIGHT, getRoleImage("loup"),
+  );
 
   const dead = game.dead ?? [];
   const livingPlayers = game.players.filter(id => !dead.includes(id));
@@ -2936,6 +2939,8 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     .filter((b) => b.alive && (game.roles?.[b.id] === "loup" || game.roles?.[b.id] === "loup_blanc"))
     .map((b) => b.id);
   const allWolfIds = [...humanWolfIds, ...botWolfIds];
+  console.log(`[wolfPhase] Wolves: ${allWolfIds.length} total (${humanWolfIds.length} humans, ${botWolfIds.length} bots)`);
+  console.log(`[wolfPhase] Bot wolves: ${bots.filter(b => botWolfIds.includes(b.id)).map(b => b.name).join(", ") || "none"}`);
 
   // Human non-wolf targets
   const humanTargetIds = livingPlayers.filter(id => !allWolfIds.includes(id));
@@ -3006,29 +3011,78 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     ctx.waitUntil(gatewayTrackThread(env, wolfThread.id, spyThread.id, wolfIndices).catch(() => {}));
   }
 
+  // If ALL wolves are bots, skip the whole thread/vote UI — just pick a random victim after 5s
+  if (humanWolfIds.length === 0) {
+    console.log(`[wolfPhase] All wolves are bots — auto-picking victim in 5s`);
+    await sendMessage(token, wolfThread.id, {
+      content: `🌙 **La nuit est tombée!** Les loups choisissent leur victime...`,
+    });
+
+    await sleep(5000);
+
+    // Pick a random non-wolf target
+    const victim = targets[Math.floor(Math.random() * targets.length)];
+    if (!victim) {
+      console.error("[wolfPhase] No targets available!");
+      try { await deleteChannel(token, wolfThread.id); } catch {}
+      return;
+    }
+    console.log(`[wolfPhase] Bots chose victim: ${victim.name} (${victim.id})`);
+
+    // Post result in wolf thread
+    await sendMessage(token, wolfThread.id, {
+      embeds: [{
+        title: `☠️ La meute a choisi — Partie #${game.gameNumber}`,
+        description: `**${victim.name}** sera dévoré(e) cette nuit.`,
+        color: EMBED_COLOR,
+        image: { url: SCENE_IMAGES.night_kill },
+      }],
+    });
+
+    // Clean up and chain to post_wolf (sorciere phase)
+    await sleep(2000);
+    try { await deleteChannel(token, wolfThread.id); } catch {}
+    if (game.petiteFilleThreadId) {
+      try { await deleteChannel(token, game.petiteFilleThreadId); } catch {}
+    }
+
+    await dispatchPhase(token, "sorciere_phase", {
+      game, _wolfVictimId: victim.id, _wolfVictimName: victim.name,
+    }, ctx, env);
+    return;
+  }
+
+  // There are human wolves — use the normal vote UI
   const wolfMentions = humanWolfIds.map(id => `<@${id}>`).join(" ");
   await sendMessage(token, wolfThread.id, {
     content: `${wolfMentions}\n\n🌙 **La nuit est tombée!** Choisissez votre victime ci-dessous.`,
   });
   const voteMsg: any = await sendMessage(token, wolfThread.id, buildVoteEmbed(voteState));
 
-  // Schedule bot wolf votes with random delays
+  // Pre-fill bot wolf votes immediately (no delay, no LLM)
   for (const botWolf of bots.filter((b) => b.alive && botWolfIds.includes(b.id))) {
-    const delay = botDelay(NIGHT_VOTE_SECONDS);
-    ctx.waitUntil(
-      sleep(delay).then(() =>
-        executeBotWolfVote(token, env, botWolf, bots, wolfThread.id, voteMsg.id, game.gameNumber, ctx)
-      )
-    );
+    const fd = fallbackDecision(targets, botWolf.id);
+    voteState.votes[botWolf.id] = fd.action;
+    console.log(`[wolfPhase] Bot ${botWolf.name} pre-voted for ${fd.action}`);
+    await sendMessage(token, wolfThread.id, {
+      content: `**${botWolf.emoji} ${botWolf.name}** : "${fd.message}"`,
+    });
   }
 
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "night_vote_timer", voteMessageId: voteMsg.id, wolfChannelId: wolfThread.id }),
-    }).catch(err => console.error("Vote timer trigger failed:", err))
-  );
+  // Update vote embed with bot votes already applied
+  await editMessage(token, wolfThread.id, voteMsg.id, buildVoteEmbed(voteState));
+
+  // Check if all wolves already voted (bots filled + maybe only bots)
+  const allVoted = voteState.wolves.every((wId) => voteState.votes[wId]);
+  if (allVoted) {
+    const allSameTarget = new Set(Object.values(voteState.votes)).size === 1;
+    if (allSameTarget) {
+      await resolveNightVote(token, voteState, voteMsg.id, ctx, env);
+      return;
+    }
+  }
+
+  await dispatchPhase(token, "night_vote_timer", { voteMessageId: voteMsg.id, wolfChannelId: wolfThread.id }, ctx, env);
 }
 
 // ── Night Phase Orchestrator ────────────────────────────────────────
@@ -3036,21 +3090,16 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
 //             Night 2+ → Voyante → Wolves directly
 
 async function startNightPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  if (!game.roles) return;
+  console.log(`[nightStart] 🌙 Starting night #${(game.nightCount ?? 0) + 1} for game #${game.gameNumber}, players: ${game.players.length}, dead: ${(game.dead ?? []).length}`);
+  if (!game.roles) { console.error("[nightStart] No roles assigned!"); return; }
 
   // Increment night count and persist
   game.nightCount = (game.nightCount ?? 0) + 1;
-  if (game.lobbyMessageId) {
-    const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
-    try {
-      const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
-      const embed = msg.embeds?.[0];
-      if (embed) {
-        embed.url = stateUrl;
-        await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [embed], components: msg.components ?? [] });
-      }
-    } catch {}
-  }
+  await updatePhaseStatus(token, game,
+    `🌙 Nuit ${game.nightCount} — Le village s'endort...`,
+    "*Chaque villageois ferme les yeux...*\n*Le silence envahit le village...*",
+    EMBED_COLOR_NIGHT, SCENE_IMAGES.night_falls,
+  );
 
   // Night 1 + cupidon alive → cupidon picks couple first, then chains to voyante → wolves
   if (game.nightCount === 1) {
@@ -3060,11 +3109,57 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
       const cupidonId = cupidonEntry[0];
       const livingPlayers = game.players.filter(id => !dead.includes(id));
 
-      const playerTargets = await Promise.all(
+      const humanTargets = await Promise.all(
         livingPlayers.filter(id => id !== cupidonId).map(async (id) => {
           const member: any = await getGuildMember(token, game.guildId, id);
           return { id, name: member.nick || member.user.global_name || member.user.username };
         })
+      );
+      // Include bots as cupidon targets
+      const cupBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+      const botTargets = cupBots.filter(b => b.alive && b.id !== cupidonId && !dead.includes(b.id)).map(b => ({ id: b.id, name: b.name }));
+      const playerTargets = [...humanTargets, ...botTargets];
+
+      // BOT AUTO-PLAY: If cupidon is a bot, pick 2 random targets instantly
+      if (cupidonId.startsWith("bot_")) {
+        await updatePhaseStatus(token, game,
+          "💘 Cupidon se réveille...",
+          "*Cupidon bande son arc et choisit deux âmes à lier...*",
+          EMBED_COLOR_PURPLE, getRoleImage("cupidon"),
+        );
+        await sleep(3000);
+        console.log(`[cupidon] Bot ${cupidonId} auto-picking couple`);
+        if (playerTargets.length >= 2) {
+          const shuffled = [...playerTargets].sort(() => Math.random() - 0.5);
+          const pick1 = shuffled[0]!;
+          const pick2 = shuffled[1]!;
+          game.couple = [pick1.id, pick2.id];
+          console.log(`[cupidon] Bot chose couple: ${pick1.name} + ${pick2.name}`);
+          await sendMessage(token, game.gameChannelId, {
+            embeds: [{
+              title: "💘 Cupidon a tiré ses flèches!",
+              description: "Deux âmes sont désormais liées par l'amour...",
+              color: 0xe91e63,
+            }],
+          });
+          // Persist couple in game state
+          if (game.lobbyMessageId) {
+            const su = `https://garou.bot/s/${encodeState(game)}`;
+            try {
+              const m: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+              const e = m.embeds?.[0];
+              if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); }
+            } catch {}
+          }
+        }
+        await dispatchPhase(token, "voyante_phase", { game }, ctx, env);
+        return;
+      }
+
+      await updatePhaseStatus(token, game,
+        "💘 Cupidon se réveille...",
+        "*Cupidon bande son arc et choisit deux âmes à lier...*",
+        EMBED_COLOR_PURPLE, getRoleImage("cupidon"),
       );
 
       const deadline = Math.floor(Date.now() / 1000) + CUPIDON_TIMEOUT_SECONDS;
@@ -3086,43 +3181,57 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
       });
       const cupidonMsg: any = await sendMessage(token, cupidonThread.id, buildCupidonEmbed(cupidonState));
 
-      ctx.waitUntil(
-        fetch(WORKER_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-          body: JSON.stringify({ phase: "cupidon_timer", cupidonMessageId: cupidonMsg.id, cupidonThreadId: cupidonThread.id }),
-        }).catch(err => console.error("Cupidon timer trigger failed:", err))
-      );
+      triggerPhase(ctx, env, "cupidon_timer", { cupidonMessageId: cupidonMsg.id, cupidonThreadId: cupidonThread.id });
 
       return;
     }
   }
 
   // No cupidon (or not night 1) → go to voyante phase which chains to wolf_phase
-  triggerPhase(ctx, env, "voyante_phase", { game });
+  await dispatchPhase(token, "voyante_phase", { game }, ctx, env);
 }
 
 // ── Voyante Phase ────────────────────────────────────────────────────
 
 async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  if (!game.roles) { triggerPhase(ctx, env, "wolf_phase", { game }); return; }
+  if (!game.roles) { await dispatchPhase(token, "wolf_phase", { game }, ctx, env); return; }
   const dead = game.dead ?? [];
 
   const voyanteEntry = Object.entries(game.roles).find(([id, r]) => r === "voyante" && !dead.includes(id));
   if (!voyanteEntry) {
-    triggerPhase(ctx, env, "wolf_phase", { game });
+    await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
     return;
   }
   const voyanteId = voyanteEntry[0];
 
-  // Targets = all living players except voyante
+  // Update lobby status
+  await updatePhaseStatus(token, game,
+    "🔮 La Voyante se réveille...",
+    "*La Voyante ouvre les yeux et scrute le village...*",
+    EMBED_COLOR_PURPLE, getRoleImage("voyante"),
+  );
+
+  // Targets = all living players (humans + bots) except voyante
   const targetIds = game.players.filter((id) => id !== voyanteId && !dead.includes(id));
-  const targets = await Promise.all(
+  const humanTargets = await Promise.all(
     targetIds.map(async (id) => {
       const member: any = await getGuildMember(token, game.guildId, id);
       return { id, name: member.nick || member.user.global_name || member.user.username };
     })
   );
+  // Also include alive bots as targets
+  const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const botTargets = bots.filter((b) => b.alive && b.id !== voyanteId && !dead.includes(b.id)).map((b) => ({ id: b.id, name: b.name }));
+  const targets = [...humanTargets, ...botTargets];
+  console.log(`[voyante] Targets: ${targets.map(t => t.name).join(", ")} (${humanTargets.length} humans, ${botTargets.length} bots)`);
+
+  // BOT AUTO-PLAY: If voyante is a bot, skip instantly (just look at a random person, no visible effect)
+  if (voyanteId.startsWith("bot_")) {
+    const pick = targets[Math.floor(Math.random() * targets.length)];
+    console.log(`[voyante] Bot ${voyanteId} auto-spied on ${pick?.name ?? "nobody"}`);
+    await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
+    return;
+  }
 
   const deadline = Math.floor(Date.now() / 1000) + VOYANTE_TIMEOUT_SECONDS;
 
@@ -3153,34 +3262,27 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
   const vyMsg: any = await sendMessage(token, voyanteThread.id, buildVoyanteEmbed(vyState));
 
   // Schedule timer
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "voyante_timer", voyanteMessageId: vyMsg.id, voyanteThreadId: voyanteThread.id, game }),
-    }).catch((err) => console.error("Voyante timer trigger failed:", err))
-  );
+  triggerPhase(ctx, env, "voyante_timer", { voyanteMessageId: vyMsg.id, voyanteThreadId: voyanteThread.id, game });
 }
 
 async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { voyanteMessageId, voyanteThreadId, game } = data;
   if (!voyanteMessageId || !voyanteThreadId) return;
+  console.log("[voyanteTimer] Starting poll");
 
-  const start = Date.now();
-  while (Date.now() - start < 25000) {
+  while (true) {
     await sleep(5000);
     try {
       const msg: any = await getMessage(token, voyanteThreadId, voyanteMessageId);
+      // If handler already resolved (removed components), just stop — handler chains to wolf_phase
       if (!msg.components?.length) {
-        // Resolved — delete thread, move to wolf phase
-        try { await deleteChannel(token, voyanteThreadId); } catch {}
-        triggerPhase(ctx, env, "wolf_phase", { game });
+        console.log("[voyanteTimer] Already resolved by handler, stopping");
         return;
       }
       const vy = parseVoyanteFromEmbed(msg);
       if (!vy) return;
       if (Date.now() / 1000 >= vy.deadline) {
-        // Timeout — remove buttons, delete thread, move on
+        // TIMEOUT only — handler didn't act in time
         await editMessage(token, voyanteThreadId, voyanteMessageId, {
           embeds: [{
             title: `🔮 Vision de la Voyante — Temps écoulé`,
@@ -3192,22 +3294,18 @@ async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext
         });
         await sleep(2000);
         try { await deleteChannel(token, voyanteThreadId); } catch {}
-        triggerPhase(ctx, env, "wolf_phase", { game });
+        console.log("[voyanteTimer] Timeout → wolf_phase");
+        await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
         return;
       }
-    } catch { return; }
+    } catch (err) {
+      console.error("[voyanteTimer] Error:", err);
+      await sleep(5000);
+    }
   }
-  // Re-invoke
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "voyante_timer", voyanteMessageId, voyanteThreadId, game }),
-    }).catch((err) => console.error("Voyante timer re-trigger failed:", err))
-  );
 }
 
-async function handleVoyanteSee(interaction: any, env: Env): Promise<Response> {
+async function handleVoyanteSee(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (!userId) return json({ type: 4, data: { content: "❌ Erreur.", flags: 64 } });
 
@@ -3226,6 +3324,21 @@ async function handleVoyanteSee(interaction: any, env: Env): Promise<Response> {
   // Mark resolved
   vy.resolved = true;
   const stateUrl = `https://garou.bot/vy/${encodeVoyanteState(vy)}`;
+
+  const token = env.DISCORD_BOT_TOKEN;
+
+  // Chain to wolf phase after a short delay (don't rely on timer)
+  ctx.waitUntil((async () => {
+    await sleep(3000);
+    try { await deleteChannel(token, vy.voyanteThreadId); } catch {}
+    // Re-read game state from lobby embed
+    const lobbyMsg: any = await getMessage(token, vy.gameChannelId, vy.lobbyMessageId);
+    const game = parseGameFromEmbed(lobbyMsg);
+    if (game) {
+      console.log("[voyanteSee] → wolf_phase");
+      await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
+    }
+  })());
 
   return json({
     type: 7,
@@ -3253,30 +3366,30 @@ async function handleVoyanteSee(interaction: any, env: Env): Promise<Response> {
 // ── Phase: night_vote_timer — poll until deadline then auto-resolve ──
 async function phaseVoteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { voteMessageId, wolfChannelId } = data;
-  if (!voteMessageId || !wolfChannelId) return;
+  console.log(`[voteTimer] Starting poll, voteMsg=${voteMessageId}, wolfChannel=${wolfChannelId}`);
+  if (!voteMessageId || !wolfChannelId) { console.error("[voteTimer] Missing fields!"); return; }
 
-  const start = Date.now();
-  while (Date.now() - start < 25000) {
+  // Loop until deadline (no re-invocation needed)
+  while (true) {
     await sleep(5000);
     try {
       const currentMsg: any = await getMessage(token, wolfChannelId, voteMessageId);
-      if (!currentMsg.components?.length) return; // Already resolved
+      if (!currentMsg.components?.length) { console.log("[voteTimer] Already resolved"); return; }
       const currentVote = parseVoteFromEmbed(currentMsg);
-      if (!currentVote) return;
+      if (!currentVote) { console.error("[voteTimer] Could not parse vote state!"); return; }
+      const votedCount = Object.keys(currentVote.votes).length;
+      const secsLeft = Math.round(currentVote.deadline - Date.now() / 1000);
+      console.log(`[voteTimer] Votes: ${votedCount}/${currentVote.wolves.length}, ${secsLeft}s left`);
       if (Date.now() / 1000 >= currentVote.deadline) {
+        console.log("[voteTimer] Deadline reached, resolving...");
         await resolveNightVote(token, currentVote, voteMessageId, ctx, env);
         return;
       }
-    } catch { return; }
+    } catch (err) {
+      console.error("[voteTimer] Error:", err);
+      await sleep(5000); // retry after error
+    }
   }
-  // Not resolved yet — re-invoke
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "night_vote_timer", voteMessageId, wolfChannelId }),
-    }).catch((err) => console.error("Vote timer re-trigger failed:", err))
-  );
 }
 
 // ── Win Conditions ──────────────────────────────────────────────────
@@ -3388,18 +3501,15 @@ async function announceVictory(token: string, game: GameState, result: WinResult
     try { await deleteChannel(token, game.wolfChannelId); } catch {}
   }
 
-  // Clean up voice channel if exists
-  if (game.voiceChannelId) {
-    try { await deleteChannel(token, game.voiceChannelId); } catch {}
-  }
 }
 
 async function resolveNightVote(token: string, vote: VoteState, voteMessageId: string, ctx?: ExecutionContext, env?: Env) {
+  console.log(`[resolveNightVote] Resolving for game #${vote.gameNumber}, votes: ${JSON.stringify(vote.votes)}`);
   // Safety: check if already resolved
   try {
     const check: any = await getMessage(token, vote.wolfChannelId, voteMessageId);
-    if (!check.components?.length) return;
-  } catch { return; }
+    if (!check.components?.length) { console.log("[resolveNightVote] Already resolved"); return; }
+  } catch (err) { console.error("[resolveNightVote] Safety check failed:", err); return; }
 
   // Determine victim
   const voteCounts: Record<string, number> = {};
@@ -3485,7 +3595,7 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
       } catch {}
     }
     if (game) {
-      triggerPhase(ctx, env, "post_wolf", { game, _wolfVictimId: victimId, _wolfVictimName: victim.name });
+      await dispatchPhase(token, "post_wolf", { game, _wolfVictimId: victimId, _wolfVictimName: victim.name }, ctx, env);
       return;
     }
   }
@@ -3519,9 +3629,9 @@ async function phasePostWolf(token: string, data: any, ctx: ExecutionContext, en
   const hasPotions = potions.life || potions.death;
 
   if (sorciereEntry && hasPotions) {
-    triggerPhase(ctx, env, "sorciere_phase", { game, _wolfVictimId, _wolfVictimName });
+    await dispatchPhase(token, "sorciere_phase", { game, _wolfVictimId, _wolfVictimName }, ctx, env);
   } else {
-    triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false, _witchKillId: undefined });
+    await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false, _witchKillId: undefined }, ctx, env);
   }
 }
 
@@ -3533,6 +3643,13 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
     _witchSaved?: boolean; _witchKillId?: string;
   };
   if (!game) return;
+
+  // Update lobby status
+  await updatePhaseStatus(token, game,
+    "☀️ Le jour se lève...",
+    "*Les premiers rayons du soleil éclairent le village...*",
+    EMBED_COLOR_ORANGE, SCENE_IMAGES.dawn_breaks,
+  );
 
   if (!game.dead) game.dead = [];
   const deaths: { id: string; name: string; cause: string }[] = [];
@@ -3691,39 +3808,57 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
   if (game.nightCount && game.nightCount % 2 === 0) {
     const loupBlancEntry = Object.entries(game.roles ?? {}).find(([id, r]) => r === "loup_blanc" && !game.dead!.includes(id));
     if (loupBlancEntry) {
-      triggerPhase(ctx, env, "loup_blanc_vote", { game });
+      await dispatchPhase(token, "loup_blanc_vote", { game }, ctx, env);
       return;
     }
   }
 
-  // No special phases → start day discussion
+  // No special phases → start day discussion (fresh budget via self-invocation)
   await sleep(3000);
-  triggerPhase(ctx, env, "day_discussion", { game });
+  await dispatchPhase(token, "day_discussion", { game }, ctx, env);
 }
 
 // ── Sorciere Phase ───────────────────────────────────────────────────
 
 async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { game, _wolfVictimId, _wolfVictimName } = data as { game: GameState; _wolfVictimId: string; _wolfVictimName: string };
-  if (!game?.roles) { triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }); return; }
+  if (!game?.roles) { await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env); return; }
 
   const dead = game.dead ?? [];
   const sorciereEntry = Object.entries(game.roles).find(([id, r]) => r === "sorciere" && !dead.includes(id));
   if (!sorciereEntry) {
-    triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false });
+    await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
     return;
   }
   const sorciereId = sorciereEntry[0];
   const potions = game.witchPotions ?? { life: false, death: false };
 
-  // Build targets for death potion (all living players except sorciere)
+  // Update lobby status
+  await updatePhaseStatus(token, game,
+    "🧪 La Sorcière se réveille...",
+    "*La Sorcière ouvre les yeux et prépare ses potions...*",
+    EMBED_COLOR_PURPLE, getRoleImage("sorciere"),
+  );
+
+  // BOT AUTO-PLAY: If sorciere is a bot, skip instantly (don't use potions)
+  if (sorciereId.startsWith("bot_")) {
+    console.log(`[sorciere] Bot ${sorciereId} auto-skipping (no potions used)`);
+    await sleep(3000);
+    await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
+    return;
+  }
+
+  // Build targets for death potion (all living players + bots except sorciere)
   const targetIds = game.players.filter((id) => id !== sorciereId && !dead.includes(id));
-  const targets = await Promise.all(
+  const humanTargets = await Promise.all(
     targetIds.map(async (id) => {
       const member: any = await getGuildMember(token, game.guildId, id);
       return { id, name: member.nick || member.user.global_name || member.user.username };
     })
   );
+  const soBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const soBotTargets = soBots.filter(b => b.alive && b.id !== sorciereId && !dead.includes(b.id)).map(b => ({ id: b.id, name: b.name }));
+  const targets = [...humanTargets, ...soBotTargets];
 
   const deadline = Math.floor(Date.now() / 1000) + SORCIERE_TIMEOUT_SECONDS;
 
@@ -3756,44 +3891,27 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
   const soMsg: any = await sendMessage(token, sorciereThread.id, buildSorciereEmbed(soState));
 
   // Schedule timer
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({
-        phase: "sorciere_timer",
-        sorciereMessageId: soMsg.id,
-        sorciereThreadId: sorciereThread.id,
-        game,
-        _wolfVictimId,
-        _wolfVictimName,
-      }),
-    }).catch((err) => console.error("Sorciere timer trigger failed:", err))
-  );
+  triggerPhase(ctx, env, "sorciere_timer", { sorciereMessageId: soMsg.id, sorciereThreadId: sorciereThread.id, game, _wolfVictimId, _wolfVictimName });
 }
 
 async function phaseSorciereTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { sorciereMessageId, sorciereThreadId, game, _wolfVictimId, _wolfVictimName } = data;
   if (!sorciereMessageId || !sorciereThreadId) return;
+  console.log("[sorciereTimer] Starting poll");
 
-  const start = Date.now();
-  while (Date.now() - start < 25000) {
+  while (true) {
     await sleep(5000);
     try {
       const msg: any = await getMessage(token, sorciereThreadId, sorciereMessageId);
+      // If handler already resolved, just stop — handler chains to dawn_phase
       if (!msg.components?.length) {
-        // Resolved — read decision from embed state
-        const so = parseSorciereFromEmbed(msg);
-        const witchSaved = so?.witchSaved ?? false;
-        const witchKillId = so?.witchKillTargetId;
-        try { await deleteChannel(token, sorciereThreadId); } catch {}
-        triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: witchSaved, _witchKillId: witchKillId });
+        console.log("[sorciereTimer] Already resolved by handler, stopping");
         return;
       }
       const so = parseSorciereFromEmbed(msg);
       if (!so) return;
       if (Date.now() / 1000 >= so.deadline) {
-        // Timeout — skip
+        // TIMEOUT only
         await editMessage(token, sorciereThreadId, sorciereMessageId, {
           embeds: [{
             title: `🧪 Sorcière — Temps écoulé`,
@@ -3805,22 +3923,18 @@ async function phaseSorciereTimer(token: string, data: any, ctx: ExecutionContex
         });
         await sleep(2000);
         try { await deleteChannel(token, sorciereThreadId); } catch {}
-        triggerPhase(ctx, env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false });
+        console.log("[sorciereTimer] Timeout → dawn_phase");
+        await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
         return;
       }
-    } catch { return; }
+    } catch (err) {
+      console.error("[sorciereTimer] Error:", err);
+      await sleep(5000);
+    }
   }
-  // Re-invoke
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "sorciere_timer", sorciereMessageId, sorciereThreadId, game, _wolfVictimId, _wolfVictimName }),
-    }).catch((err) => console.error("Sorciere timer re-trigger failed:", err))
-  );
 }
 
-async function handleSorciereLife(interaction: any, env: Env): Promise<Response> {
+async function handleSorciereLife(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const so = parseSorciereFromEmbed(interaction.message);
   if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
@@ -3830,6 +3944,20 @@ async function handleSorciereLife(interaction: any, env: Env): Promise<Response>
   so.witchSaved = true;
   so.resolved = true;
   const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
+
+  const token = env.DISCORD_BOT_TOKEN;
+  // Chain to dawn after response
+  ctx.waitUntil((async () => {
+    await sleep(3000);
+    try { await deleteChannel(token, so.sorciereThreadId); } catch {}
+    const lobbyMsg: any = await getMessage(token, so.gameChannelId, so.lobbyMessageId);
+    const game = parseGameFromEmbed(lobbyMsg);
+    if (game) {
+      if (game.witchPotions) game.witchPotions.life = false;
+      console.log("[sorciereLife] → dawn_phase (saved)");
+      await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId: so.wolfVictimId, _wolfVictimName: so.wolfVictimName, _witchSaved: true }, ctx, env);
+    }
+  })());
 
   return json({
     type: 7,
@@ -3861,7 +3989,7 @@ async function handleSorciereDeath(interaction: any, env: Env): Promise<Response
   return json({ type: 7, data: buildSorciereTargetEmbed(so) });
 }
 
-async function handleSorciereTarget(interaction: any, env: Env): Promise<Response> {
+async function handleSorciereTarget(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const so = parseSorciereFromEmbed(interaction.message);
   if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
@@ -3875,6 +4003,20 @@ async function handleSorciereTarget(interaction: any, env: Env): Promise<Respons
   so.witchKillTargetId = targetId;
   so.resolved = true;
   const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
+
+  const token = env.DISCORD_BOT_TOKEN;
+  // Chain to dawn after response
+  ctx.waitUntil((async () => {
+    await sleep(3000);
+    try { await deleteChannel(token, so.sorciereThreadId); } catch {}
+    const lobbyMsg: any = await getMessage(token, so.gameChannelId, so.lobbyMessageId);
+    const game = parseGameFromEmbed(lobbyMsg);
+    if (game) {
+      if (game.witchPotions) game.witchPotions.death = false;
+      console.log("[sorciereTarget] → dawn_phase (killed)");
+      await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId: so.wolfVictimId, _wolfVictimName: so.wolfVictimName, _witchSaved: false, _witchKillId: targetId }, ctx, env);
+    }
+  })());
 
   return json({
     type: 7,
@@ -3895,7 +4037,7 @@ async function handleSorciereTarget(interaction: any, env: Env): Promise<Respons
   });
 }
 
-async function handleSorciereSkip(interaction: any, env: Env): Promise<Response> {
+async function handleSorciereSkip(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const so = parseSorciereFromEmbed(interaction.message);
   if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
@@ -3903,6 +4045,19 @@ async function handleSorciereSkip(interaction: any, env: Env): Promise<Response>
 
   so.resolved = true;
   const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
+
+  const token = env.DISCORD_BOT_TOKEN;
+  // Chain to dawn after response
+  ctx.waitUntil((async () => {
+    await sleep(3000);
+    try { await deleteChannel(token, so.sorciereThreadId); } catch {}
+    const lobbyMsg: any = await getMessage(token, so.gameChannelId, so.lobbyMessageId);
+    const game = parseGameFromEmbed(lobbyMsg);
+    if (game) {
+      console.log("[sorciereSkip] → dawn_phase");
+      await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId: so.wolfVictimId, _wolfVictimName: so.wolfVictimName, _witchSaved: false }, ctx, env);
+    }
+  })());
 
   return json({
     type: 7,
@@ -3964,6 +4119,13 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
 
   const loupBlancEntry = Object.entries(game.roles).find(([id, r]) => r === "loup_blanc" && !dead.includes(id));
   if (!loupBlancEntry) return;
+
+  // Update lobby status
+  await updatePhaseStatus(token, game,
+    "⚪ Le Loup-Garou Blanc rôde...",
+    "*Une ombre plus pâle que les autres se faufile parmi les loups...*",
+    0xffffff, getRoleImage("loup_blanc"),
+  );
   const loupBlancId = loupBlancEntry[0];
 
   // Targets = living regular wolves (not loup_blanc itself)
@@ -3973,12 +4135,56 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
 
   if (wolfTargetIds.length === 0) return; // No wolves to kill
 
-  const targets = await Promise.all(
-    wolfTargetIds.map(async (id) => {
+  // BOT AUTO-PLAY: If loup blanc is a bot, randomly kill a wolf or skip
+  if (loupBlancId.startsWith("bot_")) {
+    const doKill = Math.random() < 0.5;
+    if (doKill && wolfTargetIds.length > 0) {
+      const victimId = wolfTargetIds[Math.floor(Math.random() * wolfTargetIds.length)]!;
+      console.log(`[loupBlanc] Bot ${loupBlancId} auto-killing wolf ${victimId}`);
+
+      // Mark as dead
+      if (!game.dead) game.dead = [];
+      game.dead.push(victimId);
+
+      // Mark bot as dead if it's a bot
+      if (victimId.startsWith("bot_")) {
+        const lbBots2 = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+        const victimBot = lbBots2.find(b => b.id === victimId);
+        if (victimBot) {
+          victimBot.alive = false;
+          await saveBots(env.ACTIVE_PLAYERS, game.gameNumber, lbBots2);
+        }
+      } else {
+        // Set spectator perms for human
+        try { await setChannelPermission(token, game.gameChannelId, victimId, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+      }
+
+      // Persist state
+      if (game.lobbyMessageId) {
+        const su = `https://garou.bot/s/${encodeState(game)}`;
+        try {
+          const m: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+          const e = m.embeds?.[0];
+          if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); }
+        } catch {}
+      }
+    } else {
+      console.log(`[loupBlanc] Bot ${loupBlancId} auto-skipped`);
+    }
+    return;
+  }
+
+  const lbBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const targets: { id: string; name: string }[] = [];
+  for (const id of wolfTargetIds) {
+    if (id.startsWith("bot_")) {
+      const bot = lbBots.find(b => b.id === id);
+      if (bot) targets.push({ id, name: bot.name });
+    } else {
       const member: any = await getGuildMember(token, game.guildId, id);
-      return { id, name: member.nick || member.user.global_name || member.user.username };
-    })
-  );
+      targets.push({ id, name: member.nick || member.user.global_name || member.user.username });
+    }
+  }
 
   const deadline = Math.floor(Date.now() / 1000) + LOUP_BLANC_VOTE_SECONDS;
 
@@ -4059,14 +4265,8 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
     components: buttonRows,
   });
 
-  // Schedule timer via direct self-invocation (not triggerPhase, since we need custom payload)
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "loup_blanc_timer", lbDmChannelId: dmChannel.id, lbDmMessageId: dmMsg.id, gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId }),
-    }).catch((err) => console.error("LB timer trigger failed:", err))
-  );
+  // Schedule timer
+  triggerPhase(ctx, env, "loup_blanc_timer", { lbDmChannelId: dmChannel.id, lbDmMessageId: dmMsg.id, gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId });
 }
 
 async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -4096,7 +4296,7 @@ async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionCon
         const game = parseGameFromEmbed(lobbyMsg);
         if (game) {
           await sleep(2000);
-          triggerPhase(ctx, env, "day_discussion", { game });
+          await dispatchPhase(token, "day_discussion", { game }, ctx, env);
         }
       } catch {}
     })());
@@ -4193,7 +4393,7 @@ async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionCon
 
       // No win → start day discussion
       await sleep(3000);
-      triggerPhase(ctx, env, "day_discussion", { game });
+      await dispatchPhase(token, "day_discussion", { game }, ctx, env);
     } catch (err) {
       console.error("Loup Blanc kill error:", err);
     }
@@ -4206,13 +4406,13 @@ async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionConte
   const dmChannelId = data.lbDmChannelId;
   const dmMessageId = data.lbDmMessageId;
   if (!dmChannelId || !dmMessageId) return;
+  console.log("[loupBlancTimer] Starting poll");
 
-  const start = Date.now();
-  while (Date.now() - start < 25000) {
+  while (true) {
     await sleep(5000);
     try {
       const msg: any = await getMessage(token, dmChannelId, dmMessageId);
-      if (!msg.components?.length) return; // Already resolved (player clicked)
+      if (!msg.components?.length) return;
       const lb = (() => {
         const embed = msg.embeds?.[0];
         if (!embed?.url?.includes("/lb/")) return null;
@@ -4220,7 +4420,6 @@ async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionConte
       })();
       if (!lb) return;
       if (Date.now() / 1000 >= lb.deadline) {
-        // Auto-skip: remove buttons
         await editMessage(token, dmChannelId, dmMessageId, {
           embeds: [{
             title: "⚪ Loup-Garou Blanc — Temps écoulé",
@@ -4230,29 +4429,24 @@ async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionConte
           }],
           components: [],
         });
-        // Recover game and start day discussion
         if (data.gameChannelId && data.lobbyMessageId) {
           try {
             const lobbyMsg: any = await getMessage(token, data.gameChannelId, data.lobbyMessageId);
             const game = parseGameFromEmbed(lobbyMsg);
             if (game) {
               await sleep(2000);
-              triggerPhase(ctx, env, "day_discussion", { game });
+              console.log("[loupBlancTimer] Timeout → day_discussion");
+              await dispatchPhase(token, "day_discussion", { game }, ctx, env);
             }
           } catch {}
         }
         return;
       }
-    } catch { return; }
+    } catch (err) {
+      console.error("[loupBlancTimer] Error:", err);
+      await sleep(5000);
+    }
   }
-  // Re-invoke if not resolved yet
-  ctx.waitUntil(
-    fetch(WORKER_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal": env.DISCORD_BOT_TOKEN },
-      body: JSON.stringify({ phase: "loup_blanc_timer", ...data }),
-    }).catch((err) => console.error("LB timer re-trigger failed:", err))
-  );
 }
 
 // ── Day Discussion & Village Vote ────────────────────────────────────
@@ -4321,7 +4515,7 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
 
   const dead = game.dead ?? [];
   const livingPlayers = game.players.filter((id) => !dead.includes(id));
-  const discussionSeconds = game.discussionTime ?? 120;
+  const discussionSeconds = 90; // 1 minute 30 seconds
   const deadline = Math.floor(Date.now() / 1000) + discussionSeconds;
 
   // Unlock SEND_MESSAGES for living players
@@ -4334,13 +4528,16 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
     } catch {}
   }
 
-  const mins = Math.floor(discussionSeconds / 60);
-  const secs = discussionSeconds % 60;
-  const timeStr = secs > 0 ? `${mins}m${secs}s` : `${mins} minute${mins > 1 ? "s" : ""}`;
+  // Update lobby status
+  await updatePhaseStatus(token, game,
+    "💬 Discussion — 1m30s",
+    `*Les villageois discutent librement...*\n\n⏰ Fin de la discussion: <t:${deadline}:R>`,
+    EMBED_COLOR_ORANGE, SCENE_IMAGES.dawn_breaks,
+  );
 
   const discMsg: any = await sendMessage(token, game.gameChannelId, {
     embeds: [{
-      title: `☀️ Période de discussion — ${timeStr}`,
+      title: "☀️ Période de discussion — 1m30s",
       description: [
         "Les villageois peuvent maintenant discuter librement!",
         "",
@@ -4353,95 +4550,74 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
     }],
   });
 
-  triggerPhase(ctx, env, "discussion_timer", {
-    discussionMsgId: discMsg.id,
-    gameChannelId: game.gameChannelId,
-    deadline,
-    lobbyMessageId: game.lobbyMessageId,
-    game,
-  });
-
-  // Schedule bot discussion messages
+  // Bots send 5-6 messages, then poll until 10 total messages → launch vote
   const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
   const aliveBots = bots.filter((b) => b.alive);
+  const botMsgCount = 5 + Math.floor(Math.random() * 2); // 5 or 6
   if (aliveBots.length > 0 && game.roles) {
-    // Build alive players list for bot context
-    const botAlivePlayers: { id: string; name: string }[] = [];
-    for (const id of livingPlayers) {
-      try {
-        const m: any = await getGuildMember(token, game.guildId, id);
-        botAlivePlayers.push({ id, name: m.nick || m.user.global_name || m.user.username });
-      } catch { botAlivePlayers.push({ id, name: id }); }
-    }
-    for (const b of aliveBots) {
-      botAlivePlayers.push({ id: b.id, name: b.name });
-    }
-
-    for (const bot of aliveBots) {
+    const botAlivePlayers = await buildBotAlivePlayersList(token, game, livingPlayers, aliveBots);
+    for (let i = 0; i < botMsgCount; i++) {
+      const bot = aliveBots[Math.floor(Math.random() * aliveBots.length)]!;
       const role = game.roles[bot.id] ?? "villageois";
-      const delay = botDelay(discussionSeconds);
-      ctx.waitUntil(
-        sleep(delay).then(() =>
-          executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers)
-        )
-      );
+      await sleep(2000 + Math.floor(Math.random() * 2000));
+      await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers);
     }
   }
+
+  // Wait for 10 total messages in channel (poll every 3s)
+  while (true) {
+    await sleep(3000);
+    try {
+      const msgs: any[] = await getChannelMessages(token, game.gameChannelId, discMsg.id);
+      console.log(`[discussion] ${msgs.length}/10 messages`);
+      if (msgs.length >= 10) break;
+    } catch { break; }
+  }
+
+  // Discussion over — lock chat and start vote
+  for (const playerId of livingPlayers) {
+    try {
+      await setChannelPermission(token, game.gameChannelId, playerId, {
+        allow: String(1 << 10),
+        deny: String(1 << 11),
+        type: 1,
+      });
+    } catch {}
+  }
+
+  try {
+    await editMessage(token, game.gameChannelId, discMsg.id, {
+      embeds: [{
+        title: "☀️ Discussion terminée!",
+        description: "Place au vote!",
+        color: EMBED_COLOR_ORANGE,
+      }],
+    });
+  } catch {}
+
+  await dispatchPhase(token, "day_vote", { game }, ctx, env);
 }
 
-async function phaseDiscussionTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
-  const { discussionMsgId, gameChannelId, deadline, game } = data as {
-    discussionMsgId: string; gameChannelId: string; deadline: number;
-    lobbyMessageId: string; game: GameState;
-  };
-  if (!discussionMsgId || !gameChannelId) return;
-
-  const start = Date.now();
-  while (Date.now() - start < 25000) {
-    await sleep(5000);
-    if (Date.now() / 1000 >= deadline) {
-      // Time's up — clean up discussion messages
-      try {
-        const msgs: any[] = await getChannelMessages(token, gameChannelId, discussionMsgId);
-        const idsToDelete = msgs.map((m: any) => m.id);
-        if (idsToDelete.length > 0) {
-          await bulkDeleteMessages(token, gameChannelId, idsToDelete);
-        }
-      } catch (err) {
-        console.error("Discussion cleanup error:", err);
-      }
-
-      // Re-lock SEND_MESSAGES for all living players
-      const dead = game.dead ?? [];
-      const livingPlayers = game.players.filter((id) => !dead.includes(id));
-      for (const playerId of livingPlayers) {
-        try {
-          await setChannelPermission(token, game.gameChannelId, playerId, {
-            allow: String(1 << 10), // VIEW only
-            deny: String(1 << 11), // deny SEND
-            type: 1,
-          });
-        } catch {}
-      }
-
-      // Edit discussion embed to show it's over
-      try {
-        await editMessage(token, gameChannelId, discussionMsgId, {
-          embeds: [{
-            title: "☀️ Discussion terminée!",
-            description: "Le temps de parole est écoulé. Place au vote!",
-            color: EMBED_COLOR_ORANGE,
-          }],
-        });
-      } catch {}
-
-      // Trigger vote phase
-      triggerPhase(ctx, env, "day_vote", { game });
-      return;
-    }
+/** Build alive players list for bot context */
+async function buildBotAlivePlayersList(
+  token: string, game: GameState, livingPlayers: string[], aliveBots: BotPlayer[],
+): Promise<{ id: string; name: string }[]> {
+  const result: { id: string; name: string }[] = [];
+  for (const id of livingPlayers) {
+    try {
+      const m: any = await getGuildMember(token, game.guildId, id);
+      result.push({ id, name: m.nick || m.user.global_name || m.user.username });
+    } catch { result.push({ id, name: id }); }
   }
-  // Re-invoke if deadline not reached
-  triggerPhase(ctx, env, "discussion_timer", data);
+  for (const b of aliveBots) {
+    result.push({ id: b.id, name: b.name });
+  }
+  return result;
+}
+
+// phaseDiscussionTimer kept for backward compat but no longer used
+async function phaseDiscussionTimer(_token: string, _data: any, _ctx: ExecutionContext, _env: Env) {
+  console.log("[discussionTimer] DEPRECATED — discussion is now inline");
 }
 
 // ── Day Vote Phase ──────────────────────────────────────────────────
@@ -4453,6 +4629,14 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
   const dead = game.dead ?? [];
   const livingPlayers = game.players.filter((id) => !dead.includes(id));
   const voteSeconds = game.voteTime ?? 60;
+
+  // Update lobby status
+  const deadline2 = Math.floor(Date.now() / 1000) + voteSeconds;
+  await updatePhaseStatus(token, game,
+    "🗳️ Vote du village",
+    `*Le village doit choisir qui éliminer...*\n\n⏰ Fin du vote: <t:${deadline2}:R>`,
+    EMBED_COLOR, SCENE_IMAGES.day_elimination,
+  );
   const deadline = Math.floor(Date.now() / 1000) + voteSeconds;
 
   // Load bots
@@ -4562,24 +4746,13 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
     }
   } catch {}
 
-  // Start vote timer
+  // Start vote timer + bot voting in fresh ctx.waitUntil
   triggerPhase(ctx, env, "day_vote_timer", {
     voteMessageId: voteMsg.id,
     gameChannelId: game.gameChannelId,
+    botVotePending: true,
+    gameNumber: game.gameNumber,
   });
-
-  // Schedule bot day votes
-  if (aliveBots.length > 0 && game.roles) {
-    for (const bot of aliveBots) {
-      const role = game.roles[bot.id] ?? "villageois";
-      const delay = botDelay(voteSeconds);
-      ctx.waitUntil(
-        sleep(delay).then(() =>
-          executeBotDayVote(token, env, bot, bots, game.gameChannelId, voteMsg.id, game.gameNumber, role, ctx)
-        )
-      );
-    }
-  }
 }
 
 async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -4650,19 +4823,42 @@ async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext):
 }
 
 async function phaseDayVoteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
-  const { voteMessageId, gameChannelId } = data;
+  const { voteMessageId, gameChannelId, botVotePending, gameNumber } = data;
   if (!voteMessageId || !gameChannelId) return;
+  console.log("[dayVoteTimer] Starting");
 
-  const start = Date.now();
-  while (Date.now() - start < 25000) {
+  // Bots vote first (random, staggered)
+  if (botVotePending && gameNumber) {
+    const bots = await loadBots(env.ACTIVE_PLAYERS, gameNumber);
+    const aliveBots = bots.filter((b) => b.alive);
+    for (const bot of aliveBots) {
+      await sleep(2000 + Math.floor(Math.random() * 2000));
+      try {
+        await executeBotDayVote(token, env, bot, bots, gameChannelId, voteMessageId, gameNumber, "villageois", ctx);
+      } catch (err) {
+        console.error(`[dayVoteTimer] Bot ${bot.name} vote failed:`, err);
+      }
+    }
+    // Check if all voted after bots
+    const msg: any = await getMessage(token, gameChannelId, voteMessageId);
+    if (!msg.components?.length) { console.log("[dayVoteTimer] Already resolved after bot votes"); return; }
+  }
+
+  // Poll for human votes or deadline
+  while (true) {
     await sleep(5000);
     try {
       const msg: any = await getMessage(token, gameChannelId, voteMessageId);
-      if (!msg.components?.length) return; // Already resolved
+      if (!msg.components?.length) { console.log("[dayVoteTimer] Already resolved"); return; }
       const dv = parseDayVoteFromEmbed(msg);
       if (!dv) return;
-      if (Date.now() / 1000 >= dv.deadline) {
-        // Time's up — resolve with whatever votes we have
+
+      const remaining = Math.round(dv.deadline - Date.now() / 1000);
+      console.log(`[dayVoteTimer] ${remaining}s left`);
+
+      const allVoted = dv.voters.every((id) => dv.votes[id]);
+      if (allVoted || Date.now() / 1000 >= dv.deadline) {
+        console.log("[dayVoteTimer] Resolving vote...");
         await editMessage(token, gameChannelId, voteMessageId, {
           embeds: msg.embeds,
           components: [],
@@ -4670,10 +4866,11 @@ async function phaseDayVoteTimer(token: string, data: any, ctx: ExecutionContext
         await resolveDayVote(token, dv, ctx, env);
         return;
       }
-    } catch { return; }
+    } catch (err) {
+      console.error("[dayVoteTimer] Error:", err);
+      await sleep(5000);
+    }
   }
-  // Re-invoke
-  triggerPhase(ctx, env, "day_vote_timer", data);
 }
 
 async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionContext, env: Env) {
@@ -4868,9 +5065,9 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
     return;
   }
 
-  // Start next night
+  // Start next night via self-invocation (fresh 30s budget)
   await sleep(3000);
-  triggerPhase(ctx, env, "night_start", { game });
+  await dispatchPhase(token, "night_start", { game }, ctx, env);
 }
 
 async function startNextNight(token: string, dv: DayVoteState, ctx: ExecutionContext, env: Env) {
@@ -4882,8 +5079,16 @@ async function startNextNight(token: string, dv: DayVoteState, ctx: ExecutionCon
   } catch {}
   if (!game) return;
 
+  // Check win conditions before starting next night
+  const winResult = checkWinCondition(game);
+  if (winResult) {
+    await sleep(2000);
+    await announceVictory(token, game, winResult, env);
+    return;
+  }
+
   await sleep(3000);
-  triggerPhase(ctx, env, "night_start", { game });
+  await dispatchPhase(token, "night_start", { game }, ctx, env);
 }
 
 // ── Wolf Vote (Night) ───────────────────────────────────────────────
@@ -4976,10 +5181,18 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
           const verifyMsg: any = await getMessage(token, channelId, lobbyId);
           const verify = parseGameFromEmbed(verifyMsg);
           if (verify?.seen?.includes(userId)) {
-            // All players seen → trigger countdown + night
-            if (verify.seen.length >= verify.players.length) {
+            // All HUMAN players seen → trigger countdown + night
+            const humansSeen = (verify.seen ?? []).filter((id: string) => !id.startsWith("bot_")).length;
+            if (humansSeen >= verify.players.length) {
               const title: string = verifyMsg.embeds?.[0]?.title ?? "";
               if (title.includes("Découvrez vos rôles")) {
+                // Mark title to prevent duplicate triggers from concurrent handlers
+                try {
+                  const embed = verifyMsg.embeds[0];
+                  embed.title = `⏳ Lancement... — Partie #${verify.gameNumber}`;
+                  await editMessage(token, channelId, lobbyId, { embeds: [embed], components: [] });
+                } catch {}
+                console.log(`[reveal] All ${verify.seen.length} seen, starting countdown`);
                 await runCountdownAndNight(token, verify, ctx, env);
               }
             }
@@ -5102,43 +5315,20 @@ async function handleSkipCountdown(interaction: any, env: Env, ctx: ExecutionCon
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // Set worker URL for self-invocation (fresh 30s budget per HTTP call)
+    env.WORKER_URL = new URL(req.url).origin;
+
     if (req.method !== "POST") {
       return new Response("🐺 Garou Interaction Server", { status: 200 });
     }
 
-    // ── Internal phase calls (self-invocation for long-running flows) ──
-    // Return immediately and run the phase in waitUntil so each phase gets its own 30s budget.
+    // ── Internal phase calls (kept for backward compat, but triggerPhase now calls dispatchPhase directly) ──
     const internalToken = req.headers.get("X-Internal");
     if (internalToken === env.DISCORD_BOT_TOKEN) {
       const payload = await req.json() as any;
       const { phase } = payload;
       const token = env.DISCORD_BOT_TOKEN;
-      const work = (async () => {
-        try {
-          if (phase === "start_game") await startGame(token, payload.game, ctx, env);
-          else if (phase === "night_start") await startNightPhase(token, payload.game, ctx, env);
-          else if (phase === "voyante_phase") await phaseVoyante(token, payload.game, ctx, env);
-          else if (phase === "voyante_timer") await phaseVoyanteTimer(token, payload, ctx, env);
-          else if (phase === "wolf_phase") await startWolfPhase(token, payload.game, ctx, env);
-          else if (phase === "night_vote_timer") await phaseVoteTimer(token, payload, ctx, env);
-          else if (phase === "post_wolf") await phasePostWolf(token, payload, ctx, env);
-          else if (phase === "sorciere_phase") await phaseSorciere(token, payload, ctx, env);
-          else if (phase === "sorciere_timer") await phaseSorciereTimer(token, payload, ctx, env);
-          else if (phase === "dawn_phase") await phaseDawn(token, payload, ctx, env);
-          else if (phase === "cupidon_timer") await phaseCupidonTimer(token, payload, ctx, env);
-          else if (phase === "chasseur_timer") await phaseChasseurTimer(token, payload, ctx, env);
-          else if (phase === "loup_blanc_vote") await phaseLoupBlancVote(token, payload.game, ctx, env);
-          else if (phase === "loup_blanc_timer") await phaseLoupBlancTimer(token, payload, ctx, env);
-          else if (phase === "day_discussion") await phaseDiscussion(token, payload, ctx, env);
-          else if (phase === "discussion_timer") await phaseDiscussionTimer(token, payload, ctx, env);
-          else if (phase === "day_vote") await phaseDayVote(token, payload, ctx, env);
-          else if (phase === "day_vote_timer") await phaseDayVoteTimer(token, payload, ctx, env);
-          else console.error("Unknown phase:", phase);
-        } catch (err) {
-          console.error(`Phase ${phase} failed:`, err);
-        }
-      })();
-      ctx.waitUntil(work);
+      ctx.waitUntil(dispatchPhase(token, phase, payload, ctx, env));
       return new Response("OK", { status: 200 });
     }
 
@@ -5177,7 +5367,7 @@ export default {
 
       if (customId.startsWith("reveal_role_")) return handleRevealRole(interaction, env, ctx);
 
-      if (customId.startsWith("voyante_see_")) return handleVoyanteSee(interaction, env);
+      if (customId.startsWith("voyante_see_")) return handleVoyanteSee(interaction, env, ctx);
 
       if (customId.startsWith("vote_kill_")) return handleVoteKill(interaction, env, ctx);
 
@@ -5185,10 +5375,10 @@ export default {
       if (customId.startsWith("cupidon_confirm_")) return handleCupidonConfirm(interaction, env, ctx);
       if (customId.startsWith("chasseur_shoot_")) return handleChasseurShoot(interaction, env, ctx);
 
-      if (customId.startsWith("sorciere_life_")) return handleSorciereLife(interaction, env);
+      if (customId.startsWith("sorciere_life_")) return handleSorciereLife(interaction, env, ctx);
       if (customId.startsWith("sorciere_death_")) return handleSorciereDeath(interaction, env);
-      if (customId.startsWith("sorciere_target_")) return handleSorciereTarget(interaction, env);
-      if (customId.startsWith("sorciere_skip_")) return handleSorciereSkip(interaction, env);
+      if (customId.startsWith("sorciere_target_")) return handleSorciereTarget(interaction, env, ctx);
+      if (customId.startsWith("sorciere_skip_")) return handleSorciereSkip(interaction, env, ctx);
 
       if (customId.startsWith("lb_kill_") || customId.startsWith("lb_skip_")) return handleLoupBlancKill(interaction, env, ctx);
 
