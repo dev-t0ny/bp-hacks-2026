@@ -28,6 +28,7 @@ import {
   fallbackDecision,
   loadHistory,
   appendHistory,
+  clearGameHistory,
   loadBotMemory,
   saveBotMemory,
   initBotMemory,
@@ -283,7 +284,10 @@ async function executeWebhook(
   webhookToken: string,
   body: { content?: string; username?: string; avatar_url?: string; embeds?: unknown[]; thread_id?: string },
 ) {
-  const params = body.thread_id ? `?thread_id=${body.thread_id}` : "";
+  const qs = new URLSearchParams();
+  if (body.thread_id) qs.set("thread_id", body.thread_id);
+  qs.set("wait", "true");
+  const params = `?${qs.toString()}`;
   const { thread_id: _, ...payload } = body;
   const res = await fetch(
     `https://discord.com/api/v10/webhooks/${webhookId}/${webhookToken}${params}`,
@@ -300,17 +304,26 @@ async function sendBotMessage(
   content: string,
   channelId?: string,
 ) {
+  const targetChannel = channelId ?? game.gameChannelId;
   if (game.webhookId && game.webhookToken) {
-    const isThread = channelId && channelId !== game.gameChannelId;
-    await executeWebhook(game.webhookId, game.webhookToken, {
-      content,
-      username: `${bot.emoji} ${bot.name}`,
-      avatar_url: bot.avatarUrl,
-      ...(isThread ? { thread_id: channelId } : {}),
-    });
-  } else {
-    const targetChannel = channelId ?? game.gameChannelId;
+    try {
+      const isThread = channelId && channelId !== game.gameChannelId;
+      console.log(`[sendBotMessage] ${bot.name} → channel=${targetChannel} isThread=${isThread} webhookId=${game.webhookId}`);
+      await executeWebhook(game.webhookId, game.webhookToken, {
+        content,
+        username: `${bot.emoji} ${bot.name}`,
+        avatar_url: bot.avatarUrl,
+        ...(isThread ? { thread_id: channelId } : {}),
+      });
+      return;
+    } catch (err) {
+      console.error(`[sendBotMessage] Webhook failed for ${bot.name}, falling back to sendMessage:`, err);
+    }
+  }
+  try {
     await sendMessage(token, targetChannel, { content: `**${bot.emoji} ${bot.name}** : ${content}` });
+  } catch (err) {
+    console.error(`[sendBotMessage] Fallback sendMessage also failed for ${bot.name} in ${targetChannel}:`, err);
   }
 }
 
@@ -446,6 +459,7 @@ async function executeBotWolfVote(
   gameNumber: number,
   ctx: ExecutionContext,
   game: GameState,
+  wolfIndex: number,
 ): Promise<void> {
   console.log(`[botWolfVote] 🐺 Bot ${bot.name} (${bot.id}) voting in game #${gameNumber}`);
   // Re-read VoteState from embed to avoid race conditions
@@ -486,6 +500,10 @@ async function executeBotWolfVote(
 
   // Post bot message in wolf thread
   await sendBotMessage(token, game, bot, `"${decision.message}"`, wolfChannelId);
+  // Mirror to spy thread for Petite Fille (anonymous)
+  if (game.petiteFilleThreadId) {
+    try { await sendMessage(token, game.petiteFilleThreadId, { content: `👀 **🐺 Loup #${wolfIndex}**: "${decision.message}"` }); } catch {}
+  }
 
   // Update vote embed with new state
   await editMessage(token, wolfChannelId, voteMessageId, buildVoteEmbed(voteState));
@@ -1066,7 +1084,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         parent_id: categoryId,
         permission_overwrites: [
           { id: guildId, type: 0, deny: String(1 << 10) },
-          { id: botUser.id, type: 1, allow: ((1n << 10n) | (1n << 11n) | (1n << 14n) | (1n << 15n) | (1n << 34n) | (1n << 38n)).toString() },
+          { id: botUser.id, type: 1, allow: ((1n << 10n) | (1n << 11n) | (1n << 14n) | (1n << 15n) | (1n << 29n) | (1n << 34n) | (1n << 38n)).toString() },
           { id: userId, type: 1, allow: String(1 << 10) },
         ],
       });
@@ -1604,6 +1622,9 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   game.roles = assignRoles(game.players, botIds, game.selectedRoleIds);
   game.witchPotions = { life: true, death: true };
 
+  // ── Clear stale data from previous games with same number ──
+  await clearGameHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+
   // ── Init bot memory for each bot ──
   const wolfBotIds = botIds.filter((id) => game.roles![id] === "loup" || game.roles![id] === "loup_blanc");
   for (const botId of botIds) {
@@ -1995,6 +2016,7 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
 
   // BOT AUTO-PLAY: If chasseur is a bot, use LLM to pick target
   if (chasseurId.startsWith("bot_")) {
+    await sleep(3000 + Math.floor(Math.random() * 3000));
     let target = targets[Math.floor(Math.random() * targets.length)]!;
     const botChasseur = chBots.find((b) => b.id === chasseurId);
     if (botChasseur) {
@@ -2376,10 +2398,11 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
       content: i18n.game.wolfNightFallenBots,
     });
 
-    await sleep(3000);
+    await sleep(5000 + Math.floor(Math.random() * 5000));
 
     // Use first wolf bot's perspective for LLM decision
     const leadWolf = bots.find((b) => botWolfIds.includes(b.id) && b.alive);
+    console.log(`[wolfPhase] leadWolf: ${leadWolf?.name ?? "NONE"}, targets: ${targets.length} (${targets.map(t => t.name).join(", ")})`);
     let victim: { id: string; name: string } | undefined;
     if (leadWolf && targets.length > 0) {
       try {
@@ -2401,6 +2424,11 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
             console.log(`[wolfPhase] All-bots chose: ${victim.name}`);
             // Post the wolf's message
             await sendBotMessage(token, game, leadWolf, `"${(parsed as BotDecisionResult).message}"`, wolfThread.id);
+            // Mirror to spy thread for Petite Fille (anonymous)
+            if (game.petiteFilleThreadId) {
+              const wolfNum = allWolfIds.indexOf(leadWolf.id) + 1;
+              try { await sendMessage(token, game.petiteFilleThreadId, { content: `👀 **🐺 Loup #${wolfNum}**: "${(parsed as BotDecisionResult).message}"` }); } catch {}
+            }
           }
         }
       } catch (err) {
@@ -2411,24 +2439,47 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
       victim = targets[Math.floor(Math.random() * targets.length)];
     }
     if (!victim) {
-      console.error("[wolfPhase] No targets available!");
+      console.error("[wolfPhase] No targets available — forcing random from all living non-wolf players");
+      // Last resort: pick any living player
+      const allLiving = game.players.filter(id => !(game.dead ?? []).includes(id) && !allWolfIds.includes(id));
+      const botLiving = bots.filter(b => b.alive && !botWolfIds.includes(b.id));
+      if (allLiving.length > 0) {
+        const pickId = allLiving[Math.floor(Math.random() * allLiving.length)]!;
+        victim = { id: pickId, name: pickId };
+      } else if (botLiving.length > 0) {
+        victim = { id: botLiving[0]!.id, name: botLiving[0]!.name };
+      }
+    }
+    if (!victim) {
+      console.error("[wolfPhase] Truly no targets — skipping to post_wolf with no victim");
       try { await deleteChannel(token, wolfThread.id); } catch {}
+      if (game.petiteFilleThreadId) {
+        try { await deleteChannel(token, game.petiteFilleThreadId); } catch {}
+      }
+      await schedulePhase(env, "post_wolf", {
+        game, _wolfVictimId: "", _wolfVictimName: "",
+      }, 1);
       return;
     }
     console.log(`[wolfPhase] Bots chose victim: ${victim.name} (${victim.id})`);
 
-    // Post result in wolf thread
-    await sendMessage(token, wolfThread.id, {
-      embeds: [{
-        title: i18n.game.wolfChose(game.gameNumber),
-        description: i18n.game.wolfVictim(victim.name, ""),
-        color: EMBED_COLOR,
-        image: { url: SCENE_IMAGES.night_kill },
-      }],
-    });
+    // Wait before revealing the vote result (feels more natural)
+    await sleep(5000 + Math.floor(Math.random() * 5000));
 
-    // Clean up and chain to post_wolf via queue (fresh worker invocation)
-    await sleep(2000);
+    // Post result in wolf thread + clean up (all in try/catch to guarantee post_wolf)
+    try {
+      await sendMessage(token, wolfThread.id, {
+        embeds: [{
+          title: i18n.game.wolfChose(game.gameNumber),
+          description: i18n.game.wolfVictim(victim.name, ""),
+          color: EMBED_COLOR,
+          image: { url: SCENE_IMAGES.night_kill },
+        }],
+      });
+      await sleep(2000);
+    } catch (err) {
+      console.error("[wolfPhase] Failed to post wolf result:", err);
+    }
     try { await deleteChannel(token, wolfThread.id); } catch {}
     if (game.petiteFilleThreadId) {
       try { await deleteChannel(token, game.petiteFilleThreadId); } catch {}
@@ -2474,7 +2525,17 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     }
     voteState.votes[botWolf.id] = decision.action;
     console.log(`[wolfPhase] Bot ${botWolf.name} pre-voted for ${decision.action}`);
-    await sendBotMessage(token, game, botWolf, `"${decision.message}"`, wolfThread.id);
+    await sleep(3000 + Math.floor(Math.random() * 3000));
+    try {
+      await sendBotMessage(token, game, botWolf, `"${decision.message}"`, wolfThread.id);
+      // Mirror to spy thread for Petite Fille (anonymous)
+      if (game.petiteFilleThreadId) {
+        const wolfNum = allWolfIds.indexOf(botWolf.id) + 1;
+        try { await sendMessage(token, game.petiteFilleThreadId, { content: `👀 **🐺 Loup #${wolfNum}**: "${decision.message}"` }); } catch {}
+      }
+    } catch (err) {
+      console.error(`[wolfPhase] Failed to send pre-vote message for ${botWolf.name}:`, err);
+    }
   }
 
   // Update vote embed with bot votes already applied
@@ -2562,7 +2623,7 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
           i18n.game.cupidonWakeDesc,
           EMBED_COLOR_PURPLE, getRoleImage("cupidon"),
         );
-        await sleep(3000);
+        await sleep(3000 + Math.floor(Math.random() * 3000));
         console.log(`[cupidon] Bot ${cupidonId} auto-picking couple`);
         if (playerTargets.length >= 2) {
           let pick1 = playerTargets[0]!;
@@ -2620,7 +2681,8 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
             } catch {}
           }
         }
-        await dispatchPhase(token, "voyante_phase", { game }, ctx, env);
+        // Use queue to get fresh worker for next phase (avoids timeout cascading)
+        await schedulePhase(env, "voyante_phase", { game }, 1);
         return;
       }
 
@@ -2660,19 +2722,19 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
     }
   }
 
-  // No cupidon (or not night 1) → go to voyante phase which chains to wolf_phase
-  await dispatchPhase(token, "voyante_phase", { game }, ctx, env);
+  // No cupidon (or not night 1) → go to voyante phase via queue (fresh worker)
+  await schedulePhase(env, "voyante_phase", { game }, 1);
 }
 
 // ── Voyante Phase ────────────────────────────────────────────────────
 
 async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
-  if (!game.roles) { await dispatchPhase(token, "wolf_phase", { game }, ctx, env); return; }
+  if (!game.roles) { await schedulePhase(env, "wolf_phase", { game }, 1); return; }
   const dead = game.dead ?? [];
 
   const voyanteEntry = Object.entries(game.roles).find(([id, r]) => r === "voyante" && !dead.includes(id));
   if (!voyanteEntry) {
-    await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
+    await schedulePhase(env, "wolf_phase", { game }, 1);
     return;
   }
   const voyanteId = voyanteEntry[0];
@@ -2701,6 +2763,7 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
 
   // BOT AUTO-PLAY: If voyante is a bot, use LLM to pick target and store result
   if (voyanteId.startsWith("bot_")) {
+    await sleep(3000 + Math.floor(Math.random() * 3000));
     const botVoyante = bots.find((b) => b.id === voyanteId);
     let pick = targets[Math.floor(Math.random() * targets.length)];
 
@@ -2752,7 +2815,8 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
       }
     }
 
-    await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
+    // Use queue to get fresh worker for wolf phase (avoids timeout cascading)
+    await schedulePhase(env, "wolf_phase", { game }, 1);
     return;
   }
 
@@ -3201,6 +3265,21 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
     }
   }
 
+  // Mark dead bots as dead in KV
+  const botDeaths = deaths.filter(d => d.id.startsWith("bot_"));
+  if (botDeaths.length > 0) {
+    try {
+      const allBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+      for (const d of botDeaths) {
+        const bot = allBots.find(b => b.id === d.id);
+        if (bot) bot.alive = false;
+      }
+      await saveBots(env.ACTIVE_PLAYERS, game.gameNumber, allBots);
+    } catch (err) {
+      console.error("[phaseDawn] Failed to mark bots as dead:", err);
+    }
+  }
+
   // Enrich game history with dawn events
   for (const d of deaths) {
     const roleKey = game.roles?.[d.id] ?? "villageois";
@@ -3359,12 +3438,12 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
 
 async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { game, _wolfVictimId, _wolfVictimName } = data as { game: GameState; _wolfVictimId: string; _wolfVictimName: string };
-  if (!game?.roles) { await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env); return; }
+  if (!game?.roles) { await schedulePhase(env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, 1); return; }
 
   const dead = game.dead ?? [];
   const sorciereEntry = Object.entries(game.roles).find(([id, r]) => r === "sorciere" && !dead.includes(id));
   if (!sorciereEntry) {
-    await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
+    await schedulePhase(env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, 1);
     return;
   }
   const sorciereId = sorciereEntry[0];
@@ -3381,6 +3460,7 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
 
   // BOT AUTO-PLAY: If sorciere is a bot, use LLM to decide
   if (sorciereId.startsWith("bot_")) {
+    await sleep(3000 + Math.floor(Math.random() * 3000));
     const botSorciere = (await loadBots(env.ACTIVE_PLAYERS, game.gameNumber)).find((b) => b.id === sorciereId);
     let witchSaved = false;
     let witchKillId: string | undefined;
@@ -3454,7 +3534,7 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
         if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); }
       } catch {}
     }
-    await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: witchSaved, _witchKillId: witchKillId }, ctx, env);
+    await schedulePhase(env, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: witchSaved, _witchKillId: witchKillId }, 1);
     return;
   }
 
@@ -3752,6 +3832,7 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
 
   // BOT AUTO-PLAY: If loup blanc is a bot, use LLM to decide kill or skip
   if (loupBlancId.startsWith("bot_")) {
+    await sleep(3000 + Math.floor(Math.random() * 3000));
     const lbBotsForLLM = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
     const botLoupBlanc = lbBotsForLLM.find((b) => b.id === loupBlancId);
 
@@ -4152,7 +4233,7 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
       for (let i = 0; i < botMsgCount; i++) {
         const bot = aliveBots[Math.floor(Math.random() * aliveBots.length)]!;
         const role = game.roles![bot.id] ?? "villageois";
-        await sleep(2000 + Math.floor(Math.random() * 2000));
+        await sleep(3000 + Math.floor(Math.random() * 5000));
         try {
           await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers, game);
         } catch (e) {
@@ -4345,7 +4426,7 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
     const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
     const aliveBots = bots.filter((b) => b.alive);
     for (const bot of aliveBots) {
-      await sleep(2000 + Math.floor(Math.random() * 2000));
+      await sleep(8000 + Math.floor(Math.random() * 7000));
       try {
         const botRole = game.roles?.[bot.id] ?? "villageois";
         await executeBotDayVote(token, env, bot, bots, game.gameChannelId, voteMsg.id, game.gameNumber, botRole, ctx, game);
