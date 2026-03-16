@@ -3954,6 +3954,7 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
       const partnerRole = game.roles?.[partnerId] ?? "villageois";
       const partnerRoleInfo = ROLES[partnerRole] ?? ROLES.villageois!;
       const partnerDisplay = partnerIsBot ? `🤖 **${pName}**` : `**${pName}** (<@${partnerId}>)`;
+      await sleep(2000);
       await sendMessage(token, dv.gameChannelId, {
         embeds: [{
           title: "💔 Le couple est brisé...",
@@ -4010,7 +4011,7 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
   // Check win conditions
   const winResult = checkWinCondition(game);
   if (winResult) {
-    await sleep(2000);
+    await sleep(3000);
     await announceVictory(token, game, winResult, env);
     return;
   }
