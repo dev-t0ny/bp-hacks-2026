@@ -2233,13 +2233,6 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
           const pick2 = shuffled[1]!;
           game.couple = [pick1.id, pick2.id];
           console.log(`[cupidon] Bot chose couple: ${pick1.name} + ${pick2.name}`);
-          await sendMessage(token, game.gameChannelId, {
-            embeds: [{
-              title: "💘 Cupidon a tiré ses flèches!",
-              description: "Deux âmes sont désormais liées par l'amour...",
-              color: 0xe91e63,
-            }],
-          });
           // Persist couple in game state
           if (game.lobbyMessageId) {
             const su = `https://garou.bot/s/${encodeState(game)}`;
