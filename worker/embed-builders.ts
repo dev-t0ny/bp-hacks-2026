@@ -628,19 +628,24 @@ export function buildRoleCheckEmbed(game: GameState) {
   };
 }
 
-export function buildAnnounceEmbed(game: GameState) {
-  const playerCount = game.players.length;
-  const isFull = playerCount >= game.maxPlayers;
+export function buildAnnounceEmbed(game: GameState, bots: BotPlayer[] = []) {
+  const totalCount = game.players.length + (game.botCount ?? bots.length);
+  const isFull = totalCount >= game.maxPlayers;
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
   const lines = [
-    progressBar(playerCount, game.maxPlayers),
-    `**${playerCount}/${game.maxPlayers}** joueurs`,
+    progressBar(totalCount, game.maxPlayers),
+    `**${totalCount}/${game.maxPlayers}** joueurs`,
     "",
   ];
 
-  if (playerCount > 0) {
+  if (game.players.length > 0) {
     lines.push(game.players.map((id) => `> <@${id}>`).join("\n"));
+  }
+  if ((game.botCount ?? bots.length) > 0) {
+    lines.push(`> 🤖 **${game.botCount ?? bots.length} bot(s)**`);
+  }
+  if (game.players.length > 0 || (game.botCount ?? bots.length) > 0) {
     lines.push("");
   }
 

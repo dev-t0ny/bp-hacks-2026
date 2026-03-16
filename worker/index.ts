@@ -622,7 +622,7 @@ async function updateAllEmbeds(token: string, game: GameState, lastEvent?: strin
     await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildLobbyEmbed(game, bots, lastEvent));
   }
   if (game.announceChannelId && game.announceMessageId) {
-    await editMessage(token, game.announceChannelId, game.announceMessageId, buildAnnounceEmbed(game));
+    await editMessage(token, game.announceChannelId, game.announceMessageId, buildAnnounceEmbed(game, bots));
   }
 }
 
@@ -941,7 +941,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
       gameState.lobbyMessageId = lobbyMsg.id;
 
       // Send announce embed in the original channel (public)
-      const announceMsg: any = await sendMessage(token, channelId, buildAnnounceEmbed(gameState));
+      const announceMsg: any = await sendMessage(token, channelId, buildAnnounceEmbed(gameState, bots));
       gameState.announceMessageId = announceMsg.id;
 
       // Update ephemeral message to confirm
