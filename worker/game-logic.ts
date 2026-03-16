@@ -266,37 +266,21 @@ export function assignRoles(
     roleKeys = [...wolves, ...village];
   }
 
-  const specialRoles: string[] = [];
-  const simpleRoles: string[] = [];
-  for (const r of roleKeys) {
-    if (r !== "loup" && r !== "villageois") specialRoles.push(r);
-    else simpleRoles.push(r);
-  }
-
-  const shuffle = (arr: string[]) => {
+  // Shuffle roles and players together — fully random, no human/bot bias
+  const shuffle = <T>(arr: T[]) => {
     for (let i = arr.length - 1; i > 0; i--) {
       const j = Math.floor(secureRandom(rng) * (i + 1));
       [arr[i], arr[j]] = [arr[j]!, arr[i]!];
     }
   };
-  shuffle(specialRoles);
-  shuffle(simpleRoles);
+
+  shuffle(roleKeys);
+  const allPlayers = [...humanIds, ...botIds];
+  shuffle(allPlayers);
 
   const roles: Record<string, string> = {};
-  let humanIdx = 0;
-
-  for (const role of specialRoles) {
-    if (humanIdx < humanIds.length) {
-      roles[humanIds[humanIdx]!] = role;
-      humanIdx++;
-    }
-  }
-
-  const remaining = [...humanIds.filter((id) => !roles[id]), ...botIds];
-  shuffle(remaining);
-
-  for (let i = 0; i < remaining.length; i++) {
-    roles[remaining[i]!] = simpleRoles[i] ?? "villageois";
+  for (let i = 0; i < allPlayers.length; i++) {
+    roles[allPlayers[i]!] = roleKeys[i] ?? "villageois";
   }
 
   return roles;

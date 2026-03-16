@@ -127,28 +127,20 @@ describe("assignRoles", () => {
     }
   });
 
-  it("special roles go to humans first (deterministic rng)", () => {
-    let i = 0;
-    const rng = () => (i++ % 10) / 10;
-
-    const humans = ["h1", "h2", "h3", "h4"];
-    const bots = ["b1", "b2"];
-    const result = assignRoles(humans, bots, undefined, rng);
-
-    // Humans should have been assigned special roles before bots
-    const humanRoles = humans.map((id) => result[id]!);
-    const botRoles = bots.map((id) => result[id]!);
-
-    // At least one human should have a special role (not loup/villageois)
-    const humanSpecial = humanRoles.filter(
-      (r) => r !== "loup" && r !== "villageois",
-    );
-    expect(humanSpecial.length).toBeGreaterThanOrEqual(1);
-
-    // Bots should only have simple roles (loup or villageois)
-    for (const role of botRoles) {
-      expect(["loup", "villageois"]).toContain(role);
+  it("roles are fully random — bots can get special roles", () => {
+    // Run many iterations; bots should eventually get a special role
+    let botGotSpecial = false;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const humans = ["h1"];
+      const bots = ["b1", "b2", "b3", "b4"];
+      const result = assignRoles(humans, bots);
+      const botRoles = bots.map((id) => result[id]!);
+      if (botRoles.some((r) => r !== "loup" && r !== "villageois")) {
+        botGotSpecial = true;
+        break;
+      }
     }
+    expect(botGotSpecial).toBe(true);
   });
 
   it("with selectedRoleIds: selected roles are preserved (e.g. [2, 47] = voyante + loup)", () => {

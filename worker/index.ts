@@ -4168,8 +4168,8 @@ async function handleStart(interaction: any, env: Env, ctx: ExecutionContext): P
     return json({ type: 4, data: { content: `❌ Seul le créateur (<@${game.creatorId}>) peut lancer la partie.`, flags: 64 } });
   }
 
-  if (game.players.length < 2) {
-    return json({ type: 4, data: { content: "❌ Il faut au minimum 2 joueurs humains pour lancer.", flags: 64 } });
+  if (game.players.length < 1) {
+    return json({ type: 4, data: { content: "❌ Il faut au minimum 1 joueur pour lancer.", flags: 64 } });
   }
 
   const token = env.DISCORD_BOT_TOKEN;
