@@ -4054,6 +4054,26 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
   }
 
   await sleep(3000);
+
+  // Clear all messages except lobby embed before night transition
+  if (game.lobbyMessageId) {
+    try {
+      const allMsgs: any[] = [];
+      let lastId: string | undefined;
+      for (let page = 0; page < 10; page++) {
+        const batch: any[] = await getChannelMessages(token, game.gameChannelId, lastId, 100);
+        if (!batch.length) break;
+        allMsgs.push(...batch);
+        lastId = batch[batch.length - 1]!.id;
+        if (batch.length < 100) break;
+      }
+      const toDelete = allMsgs.filter((m: any) => m.id !== game.lobbyMessageId).map((m: any) => m.id);
+      if (toDelete.length > 0) await bulkDeleteMessages(token, game.gameChannelId, toDelete);
+    } catch (err) {
+      console.error("[resolveDayVote] Failed to clean channel:", err);
+    }
+  }
+
   await sendMessage(token, game.gameChannelId, {
     embeds: [{
       title: "🌙 Le village se rendort...",
