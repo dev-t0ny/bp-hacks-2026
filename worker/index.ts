@@ -2755,7 +2755,7 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
   // Check win conditions first
   const winResult = checkWinCondition(game);
 
-  // Announce deaths
+  // Announce deaths with role reveals
   if (deaths.length === 0) {
     await sendMessage(token, game.gameChannelId, {
       embeds: [{
@@ -2771,20 +2771,31 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
     });
   } else if (deaths.length === 1) {
     const d = deaths[0]!;
+    const roleKey = game.roles?.[d.id] ?? "villageois";
+    const roleInfo = ROLES[roleKey] ?? ROLES.villageois!;
+    const display = d.id.startsWith("bot_") ? `🤖 **${d.name}**` : `**${d.name}** (<@${d.id}>)`;
     await sendMessage(token, game.gameChannelId, {
       embeds: [{
         title: "☀️ Le jour se lève...",
         description: [
-          `Les villageois découvrent avec horreur que **${d.name}** (<@${d.id}>) a été ${d.cause} cette nuit.`,
+          `Les villageois découvrent avec horreur que ${display} a été ${d.cause} cette nuit.`,
+          "",
+          `${roleInfo.emoji} C'était **${roleInfo.name}**!`,
           "",
           "*Un moment de silence pour la victime...*",
         ].join("\n"),
         color: EMBED_COLOR,
+        thumbnail: { url: getRoleImage(roleKey) },
         image: { url: SCENE_IMAGES.dawn_breaks },
       }],
     });
   } else {
-    const deathLines = deaths.map((d) => `💀 **${d.name}** (<@${d.id}>) — ${d.cause}`);
+    const deathLines = deaths.map((d) => {
+      const roleKey = game.roles?.[d.id] ?? "villageois";
+      const roleInfo = ROLES[roleKey] ?? ROLES.villageois!;
+      const display = d.id.startsWith("bot_") ? `🤖 **${d.name}**` : `**${d.name}** (<@${d.id}>)`;
+      return `💀 ${display} — ${d.cause}\n${roleInfo.emoji} C'était **${roleInfo.name}**`;
+    });
     await sendMessage(token, game.gameChannelId, {
       embeds: [{
         title: "☀️ Le jour se lève... Double meurtre!",
