@@ -2253,28 +2253,32 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
         EMBED_COLOR_PURPLE, getRoleImage("cupidon"),
       );
 
-      const deadline = Math.floor(Date.now() / 1000) + CUPIDON_TIMEOUT_SECONDS;
+      try {
+        const deadline = Math.floor(Date.now() / 1000) + CUPIDON_TIMEOUT_SECONDS;
 
-      const cupidonThread: any = await createThread(token, game.gameChannelId, {
-        name: "\u{1F498} Cupidon", type: 12, auto_archive_duration: 1440,
-      });
-      await addThreadMember(token, cupidonThread.id, cupidonId);
+        const cupidonThread: any = await createThread(token, game.gameChannelId, {
+          name: "\u{1F498} Cupidon", type: 12, auto_archive_duration: 1440,
+        });
+        await addThreadMember(token, cupidonThread.id, cupidonId);
 
-      const cupidonState: CupidonState = {
-        gameNumber: game.gameNumber, guildId: game.guildId,
-        gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId!,
-        cupidonId, players: playerTargets, picks: [], deadline,
-        roles: game.roles, allPlayers: game.players,
-      };
+        const cupidonState: CupidonState = {
+          gameNumber: game.gameNumber, guildId: game.guildId,
+          gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId!,
+          cupidonId, players: playerTargets, picks: [], deadline,
+          roles: game.roles, allPlayers: game.players,
+        };
 
-      await sendMessage(token, cupidonThread.id, {
-        content: `<@${cupidonId}>\n\n\u{1F498} **Cupidon se r\u00e9veille!** Choisis deux joueurs \u00e0 lier par l'amour.`,
-      });
-      const cupidonMsg: any = await sendMessage(token, cupidonThread.id, buildCupidonEmbed(cupidonState));
+        await sendMessage(token, cupidonThread.id, {
+          content: `<@${cupidonId}>\n\n\u{1F498} **Cupidon se r\u00e9veille!** Choisis deux joueurs \u00e0 lier par l'amour.`,
+        });
+        const cupidonMsg: any = await sendMessage(token, cupidonThread.id, buildCupidonEmbed(cupidonState));
 
-      await schedulePhase(env, "cupidon_timer", { cupidonMessageId: cupidonMsg.id, cupidonThreadId: cupidonThread.id }, CUPIDON_TIMEOUT_SECONDS);
+        await schedulePhase(env, "cupidon_timer", { cupidonMessageId: cupidonMsg.id, cupidonThreadId: cupidonThread.id }, CUPIDON_TIMEOUT_SECONDS);
 
-      return;
+        return;
+      } catch (err) {
+        console.error(`[cupidon] ❌ Failed to set up cupidon thread, skipping to voyante:`, err);
+      }
     }
   }
 
