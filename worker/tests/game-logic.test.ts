@@ -73,6 +73,29 @@ describe("encodeState / decodeState", () => {
     expect(decoded!.botCount).toBe(game.botCount);
   });
 
+  it("webhook fields: webhookId and webhookToken survive round-trip", () => {
+    const game = makeGame({
+      webhookId: "1234567890123456789",
+      webhookToken: "abcdefghijklmnopqrstuvwxyz_ABCDEF.0123456789",
+    });
+    const encoded = encodeState(game);
+    const decoded = decodeState(`https://garou.bot/s/${encoded}`);
+
+    expect(decoded).not.toBeNull();
+    expect(decoded!.webhookId).toBe("1234567890123456789");
+    expect(decoded!.webhookToken).toBe("abcdefghijklmnopqrstuvwxyz_ABCDEF.0123456789");
+  });
+
+  it("webhook fields: absent webhookId/webhookToken decode as undefined", () => {
+    const game = makeGame();
+    const encoded = encodeState(game);
+    const decoded = decodeState(`https://garou.bot/s/${encoded}`);
+
+    expect(decoded).not.toBeNull();
+    expect(decoded!.webhookId).toBeUndefined();
+    expect(decoded!.webhookToken).toBeUndefined();
+  });
+
   it("minimal state: encode with only required fields, decode, verify defaults", () => {
     const game = makeGame();
     const encoded = encodeState(game);

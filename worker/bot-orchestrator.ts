@@ -488,3 +488,7 @@ export async function appendHistory(kv: KVNamespace, gameNumber: number, event: 
   history.push(event);
   await kv.put(`game:${gameNumber}:history`, JSON.stringify(history), { expirationTtl: 86400 });
 }
+
+export async function clearGameHistory(kv: KVNamespace, gameNumber: number) {
+  await kv.delete(`game:${gameNumber}:history`);
+}
