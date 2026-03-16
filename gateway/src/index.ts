@@ -103,13 +103,29 @@ const client = new Client({
 });
 
 client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot) return;
-
   const entry = tracked.get(message.channelId);
   if (!entry) return;
 
+  // Skip embeds-only messages (vote UI, system embeds)
+  if (!message.content && message.embeds.length > 0) return;
+  if (!message.content) return;
+
+  // Determine display identity
+  let mirrorText: string;
   const wolfIndex = entry.wolves.get(message.author.id);
-  if (wolfIndex === undefined) return;
+  if (wolfIndex !== undefined) {
+    // Human wolf
+    mirrorText = `👀 **Loup #${wolfIndex}**: ${message.content}`;
+  } else if (message.webhookId) {
+    // Webhook message (bot wolf) — anonymous identity
+    const botWolfNum = entry.wolves.size + 1; // Bots get numbers after human wolves
+    mirrorText = `👀 **🐺 Loup #${botWolfNum}**: ${message.content}`;
+  } else if (message.author.bot && message.content) {
+    // Regular bot message (fallback sendMessage) — anonymous
+    mirrorText = `👀 **🐺 Loup**: ${message.content}`;
+  } else {
+    return;
+  }
 
   try {
     const spyChannel = await client.channels.fetch(entry.spyThreadId) as TextChannel | null;
@@ -119,8 +135,7 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    const content = message.content || "*(message vide)*";
-    await spyChannel.send(`👀 **Loup #${wolfIndex}**: ${content}`);
+    await spyChannel.send(mirrorText);
   } catch (error) {
     console.error(`[gateway] Failed to mirror message to spy thread ${entry.spyThreadId}:`, error);
   }
