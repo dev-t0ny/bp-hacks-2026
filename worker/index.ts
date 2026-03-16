@@ -4255,22 +4255,32 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
 
   console.log(`[discussion] ⏱️ START: ${discussionSeconds}s, gameChannel=${game.gameChannelId}`);
 
-  // Fire bot messages concurrently (non-blocking)
+  // Fire bot messages spread across the ENTIRE discussion period
   const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
   const aliveBots = bots.filter((b) => b.alive);
   if (aliveBots.length > 0 && game.roles) {
     const botAlivePlayers = await buildBotAlivePlayersList(token, game, livingPlayers, aliveBots);
-    const botMsgCount = 5 + Math.floor(Math.random() * 2);
-    console.log(`[discussion] ⏱️ launching ${botMsgCount} bot messages (ctx.waitUntil)`);
+    // Each bot speaks 2-3 times, spread across the discussion
+    const roundsPerBot = 2 + Math.floor(Math.random() * 2); // 2-3 rounds
+    const totalMessages = aliveBots.length * roundsPerBot;
+    // Reserve last 15s for vote transition, use remaining time for discussion
+    const usableTime = Math.max(30, (discussionSeconds - 15)) * 1000;
+    const avgDelay = Math.floor(usableTime / totalMessages);
+    console.log(`[discussion] ⏱️ launching ${totalMessages} bot messages over ${discussionSeconds}s (${avgDelay}ms avg gap)`);
     ctx.waitUntil((async () => {
-      for (let i = 0; i < botMsgCount; i++) {
-        const bot = aliveBots[Math.floor(Math.random() * aliveBots.length)]!;
-        const role = game.roles![bot.id] ?? "villageois";
-        await sleep(3000 + Math.floor(Math.random() * 5000));
-        try {
-          await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers, game);
-        } catch (e) {
-          console.error(`[discussion] ⏱️ bot msg error:`, e);
+      // Build round-robin schedule: each round, all bots speak in random order
+      for (let round = 0; round < roundsPerBot; round++) {
+        // Shuffle bots for this round
+        const shuffled = [...aliveBots].sort(() => Math.random() - 0.5);
+        for (const bot of shuffled) {
+          const jitter = Math.floor(avgDelay * 0.5 + Math.random() * avgDelay);
+          await sleep(jitter);
+          const role = game.roles![bot.id] ?? "villageois";
+          try {
+            await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers, game);
+          } catch (e) {
+            console.error(`[discussion] ⏱️ bot msg error (${bot.name} round ${round + 1}):`, e);
+          }
         }
       }
       console.log(`[discussion] ⏱️ all bot messages sent`);
