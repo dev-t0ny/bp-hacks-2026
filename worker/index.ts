@@ -4255,35 +4255,77 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
 
   console.log(`[discussion] ⏱️ START: ${discussionSeconds}s, gameChannel=${game.gameChannelId}`);
 
-  // Fire bot messages spread across the ENTIRE discussion period
+  // Reactive bot discussion — bots respond when mentioned or naturally chime in
   const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
   const aliveBots = bots.filter((b) => b.alive);
   if (aliveBots.length > 0 && game.roles) {
     const botAlivePlayers = await buildBotAlivePlayersList(token, game, livingPlayers, aliveBots);
-    // Each bot speaks 2-3 times, spread across the discussion
-    const roundsPerBot = 2 + Math.floor(Math.random() * 2); // 2-3 rounds
-    const totalMessages = aliveBots.length * roundsPerBot;
-    // Reserve last 15s for vote transition, use remaining time for discussion
-    const usableTime = Math.max(30, (discussionSeconds - 15)) * 1000;
-    const avgDelay = Math.floor(usableTime / totalMessages);
-    console.log(`[discussion] ⏱️ launching ${totalMessages} bot messages over ${discussionSeconds}s (${avgDelay}ms avg gap)`);
+    const endTime = Date.now() + (discussionSeconds - 12) * 1000; // Stop 12s before vote
+    console.log(`[discussion] ⏱️ reactive bot discussion, ${aliveBots.length} bots, ${discussionSeconds}s`);
     ctx.waitUntil((async () => {
-      // Build round-robin schedule: each round, all bots speak in random order
-      for (let round = 0; round < roundsPerBot; round++) {
-        // Shuffle bots for this round
-        const shuffled = [...aliveBots].sort(() => Math.random() - 0.5);
-        for (const bot of shuffled) {
-          const jitter = Math.floor(avgDelay * 0.5 + Math.random() * avgDelay);
-          await sleep(jitter);
-          const role = game.roles![bot.id] ?? "villageois";
-          try {
-            await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers, game);
-          } catch (e) {
-            console.error(`[discussion] ⏱️ bot msg error (${bot.name} round ${round + 1}):`, e);
+      const speakCount: Record<string, number> = {};
+      for (const b of aliveBots) speakCount[b.id] = 0;
+
+      // Initial delay before first bot speaks
+      await sleep(3000 + Math.floor(Math.random() * 4000));
+
+      while (Date.now() < endTime) {
+        // Fetch recent messages to see who's being talked about
+        let mentionedBots: BotPlayer[] = [];
+        try {
+          const msgs: any[] = await getChannelMessages(token, game.gameChannelId, undefined, 8);
+          const recentTexts = msgs
+            .filter((m: any) => m.content && !m.webhook_id && !m.author?.bot)
+            .map((m: any) => m.content.toLowerCase())
+            .slice(0, 5);
+          const recentContent = recentTexts.join(" ");
+
+          // Check which bots are mentioned by name in recent human messages
+          mentionedBots = aliveBots.filter((b) =>
+            recentContent.includes(b.name.toLowerCase()),
+          );
+        } catch {}
+
+        // Pick who speaks: prioritize mentioned bots, then random
+        let speaker: BotPlayer | undefined;
+        if (mentionedBots.length > 0) {
+          // Mentioned bot that hasn't spoken too much
+          const candidates = mentionedBots.filter((b) => (speakCount[b.id] ?? 0) < 5);
+          speaker = candidates[Math.floor(Math.random() * candidates.length)];
+        }
+        if (!speaker) {
+          // Random bot weighted by how little they've spoken
+          const weights = aliveBots.map((b) => Math.max(1, 4 - (speakCount[b.id] ?? 0)));
+          const totalWeight = weights.reduce((a, c) => a + c, 0);
+          let roll = Math.random() * totalWeight;
+          for (let i = 0; i < aliveBots.length; i++) {
+            roll -= weights[i]!;
+            if (roll <= 0) { speaker = aliveBots[i]; break; }
           }
         }
+        if (!speaker) speaker = aliveBots[Math.floor(Math.random() * aliveBots.length)]!;
+
+        // Chance to stay silent this tick (more likely if bot already spoke a lot)
+        const spoken = speakCount[speaker.id] ?? 0;
+        const silenceChance = mentionedBots.includes(speaker) ? 0.1 : (0.2 + spoken * 0.1);
+        if (Math.random() < silenceChance) {
+          await sleep(5000 + Math.floor(Math.random() * 5000));
+          continue;
+        }
+
+        const role = game.roles![speaker.id] ?? "villageois";
+        try {
+          await executeBotDiscussion(token, env, speaker, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers, game);
+          speakCount[speaker.id] = (speakCount[speaker.id] ?? 0) + 1;
+        } catch (e) {
+          console.error(`[discussion] ⏱️ bot msg error (${speaker.name}):`, e);
+        }
+
+        // Variable delay: shorter when conversation is active, longer when quiet
+        const baseDelay = mentionedBots.length > 0 ? 6000 : 10000;
+        await sleep(baseDelay + Math.floor(Math.random() * 8000));
       }
-      console.log(`[discussion] ⏱️ all bot messages sent`);
+      console.log(`[discussion] ⏱️ discussion ended, speak counts:`, JSON.stringify(speakCount));
     })());
   }
 
