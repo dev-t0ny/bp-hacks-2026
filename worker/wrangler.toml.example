@@ -6,6 +6,8 @@ account_id = "your-cloudflare-account-id"
 [vars]
 DISCORD_PUBLIC_KEY = "your-discord-application-public-key"
 DISCORD_BOT_TOKEN = "your-discord-bot-token"
+BOTPRESS_PAT = "your-botpress-personal-access-token"
+BOTPRESS_BOT_ID = "your-botpress-bot-id"
 
 [[kv_namespaces]]
 binding = "ACTIVE_PLAYERS"

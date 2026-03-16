@@ -1,6 +1,8 @@
 // game-logic.ts — Pure functions and constants for the Loup-Garou game engine.
 // This file has NO imports from index.ts.
 
+import { t, type Locale } from "./i18n";
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -177,6 +179,18 @@ export const ROLES: Record<string, Role> = {
 };
 
 // ---------------------------------------------------------------------------
+// i18n role helpers
+// ---------------------------------------------------------------------------
+
+export function getRoleName(key: string, lang: Locale): string {
+  return t(lang).roleNames[key] ?? ROLES[key]?.name ?? key;
+}
+
+export function getRoleDescription(key: string, lang: Locale): string {
+  return t(lang).roleDescriptions[key] ?? ROLES[key]?.description ?? "";
+}
+
+// ---------------------------------------------------------------------------
 // Role-ID mapping (from config embed selections)
 // ---------------------------------------------------------------------------
 
@@ -313,6 +327,7 @@ export interface GameState {
   voteTime?: number;
   selectedRoleIds?: number[];
   botCount?: number;
+  lang?: Locale;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +359,7 @@ export function encodeState(game: GameState): string {
   if (game.voteTime) compact.vt = game.voteTime;
   if (game.selectedRoleIds?.length) compact.sr = game.selectedRoleIds;
   if (game.botCount) compact.bc = game.botCount;
+  if (game.lang) compact.l = game.lang;
   return btoa(JSON.stringify(compact));
 }
 
@@ -375,6 +391,7 @@ export function decodeState(url: string): GameState | null {
       voteTime: compact.vt ?? 60,
       selectedRoleIds: compact.sr,
       botCount: compact.bc ?? 0,
+      lang: compact.l ?? "fr",
     };
   } catch {
     return null;
@@ -392,8 +409,10 @@ export interface WinResult {
   image: string;
 }
 
-export function checkWinCondition(game: GameState): WinResult | null {
+export function checkWinCondition(game: GameState, lang?: Locale): WinResult | null {
   if (!game.roles) return null;
+  const locale = lang ?? game.lang ?? "fr";
+  const i = t(locale);
   const dead = game.dead ?? [];
   const allPlayerIds = Object.keys(game.roles);
   const alive = allPlayerIds.filter((id) => !dead.includes(id));
@@ -413,9 +432,8 @@ export function checkWinCondition(game: GameState): WinResult | null {
   if (alive.length === 1 && aliveLoupBlanc.length === 1) {
     return {
       winner: "loup_blanc",
-      title: "\u26AA Le Loup-Garou Blanc triomphe!",
-      description:
-        "Le Loup-Garou Blanc a \u00E9limin\u00E9 tout le monde et r\u00E8gne seul sur le village d\u00E9sol\u00E9.",
+      title: i.game.victoryTitle.loup_blanc,
+      description: i.game.victoryDesc.loup_blanc,
       image: SCENE_IMAGES.victory_wolves,
     };
   }
@@ -423,9 +441,8 @@ export function checkWinCondition(game: GameState): WinResult | null {
   if (aliveWolves.length === 0) {
     return {
       winner: "village",
-      title: "\uD83C\uDFD8\uFE0F Le village est sauv\u00E9!",
-      description:
-        "Les villageois ont r\u00E9ussi \u00E0 \u00E9liminer tous les loups-garous. La paix revient au village!",
+      title: i.game.victoryTitle.village,
+      description: i.game.victoryDesc.village,
       image: SCENE_IMAGES.victory_village,
     };
   }
@@ -433,9 +450,8 @@ export function checkWinCondition(game: GameState): WinResult | null {
   if (aliveWolves.length >= aliveVillagers.length) {
     return {
       winner: "loups",
-      title: "\uD83D\uDC3A Les Loups-Garous ont gagn\u00E9!",
-      description:
-        "Les loups-garous sont d\u00E9sormais aussi nombreux que les villageois. Le village est perdu!",
+      title: i.game.victoryTitle.loups,
+      description: i.game.victoryDesc.loups,
       image: SCENE_IMAGES.victory_wolves,
     };
   }

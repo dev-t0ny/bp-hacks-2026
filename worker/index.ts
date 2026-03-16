@@ -20,6 +20,7 @@ import {
   updateRolesForGroup,
 } from "./config-embed";
 import { pickBots, type BotPlayer } from "./bot-personalities";
+import { t, type Locale } from "./i18n";
 import {
   buildBotPrompt,
   botDelay,
@@ -27,8 +28,19 @@ import {
   fallbackDecision,
   loadHistory,
   appendHistory,
+  loadBotMemory,
+  saveBotMemory,
+  initBotMemory,
+  parseLLMResponse,
+  FALLBACK_DISCUSSION_PHRASES,
+  ROLE_STRATEGIES,
   type BotDecisionRequest,
   type BotDecisionResult,
+  type BotMemory,
+  type BotPhase,
+  type ParsedSorciereResponse,
+  type ParsedCupidonResponse,
+  type ParsedLoupBlancResponse,
 } from "./bot-orchestrator";
 import {
   type GameState,
@@ -53,6 +65,7 @@ import {
   checkWinCondition,
   getRoleImage,
   progressBar,
+  getRoleName,
 } from "./game-logic";
 import {
   type VoteState,
@@ -99,6 +112,8 @@ interface Env {
   GATEWAY_URL?: string;
   GATEWAY_TOKEN?: string;
   ANTHROPIC_API_KEY?: string;
+  BOTPRESS_PAT?: string;
+  BOTPRESS_BOT_ID?: string;
   WORKER_URL?: string;
   PHASE_QUEUE: Queue; // Cloudflare Queue for delayed phase dispatch
 }
@@ -321,7 +336,7 @@ async function callLLM(prompt: string, env: Env): Promise<string> {
           "x-bot-id": env.BOTPRESS_BOT_ID,
         },
         body: JSON.stringify({
-          action: "botAiResponse",
+          type: "botAiResponse",
           input: { prompt, structured: false },
         }),
         signal: controller.signal,
@@ -387,9 +402,32 @@ async function executeBotWolfVote(
   const voteState = parseVoteFromEmbed(currentMsg);
   if (!voteState) { console.log(`[botWolfVote] No vote state found for ${bot.name}`); return; }
 
-  // Instant random decision — pick a random non-wolf target
-  const decision = fallbackDecision(voteState.targets, bot.id);
-  console.log(`[botWolfVote] ${bot.name} randomly chose: ${decision.action}`);
+  // LLM-powered decision
+  let decision: BotDecisionResult;
+  try {
+    const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, gameNumber, bot.id);
+    const history = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
+    const prompt = buildBotPrompt({
+      bot, role: botMem.role || "loup", phase: "night_vote",
+      alivePlayers: voteState.targets, aliveHumans: [], aliveBots: allBots.filter((b) => b.alive),
+      gameHistory: history, knownInfo: "", botMemory: botMem,
+      targetOptions: voteState.targets,
+    });
+    const raw = await callLLM(prompt, env);
+    console.log(`[botWolfVote] ${bot.name} LLM raw: ${raw.slice(0, 200)}`);
+    const parsed = parseLLMResponse(raw, "night_vote", voteState.targets);
+    console.log(`[botWolfVote] ${bot.name} parsed:`, JSON.stringify(parsed));
+    if (parsed && "action" in parsed && parsed.action !== "discuss") {
+      decision = parsed as BotDecisionResult;
+    } else {
+      console.log(`[botWolfVote] ${bot.name} → fallback (parse failed)`);
+      decision = fallbackDecision(voteState.targets, bot.id);
+    }
+  } catch (err) {
+    console.error(`[botWolfVote] LLM failed for ${bot.name}:`, err);
+    decision = fallbackDecision(voteState.targets, bot.id);
+  }
+  console.log(`[botWolfVote] ${bot.name} final choice: ${decision.action} — "${decision.message}"`);
 
   // Apply vote
   voteState.votes[bot.id] = decision.action;
@@ -414,60 +452,62 @@ async function executeBotWolfVote(
 
 async function executeBotDiscussion(
   token: string,
-  _env: Env,
+  env: Env,
   bot: BotPlayer,
-  _allBots: BotPlayer[],
+  allBots: BotPlayer[],
   gameChannelId: string,
-  _gameNumber: number,
+  gameNumber: number,
   role: string,
   alivePlayers: { id: string; name: string }[],
 ): Promise<void> {
   console.log(`[botDiscussion] 💬 Bot ${bot.name} (${bot.id}), role: ${role}`);
 
-  const others = alivePlayers.filter(p => p.id !== bot.id);
-  const randomTarget = others[Math.floor(Math.random() * others.length)];
-  const randomTarget2 = others.filter(p => p.id !== randomTarget?.id)[Math.floor(Math.random() * Math.max(1, others.length - 1))];
+  let message: string;
+  try {
+    const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, gameNumber, bot.id);
+    const history = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
 
-  const phrases = role === "loup" ? [
-    `Hmm, je trouve ${randomTarget?.name ?? "quelqu'un"} un peu louche...`,
-    `Moi je dis qu'on devrait surveiller ${randomTarget?.name ?? "certains"} de plus près.`,
-    `J'ai rien vu de suspect, mais ${randomTarget?.name ?? "quelqu'un"} me donne un mauvais feeling.`,
-    `C'est bizarre que personne n'accuse ${randomTarget?.name ?? "cette personne"}...`,
-    `Perso je fais confiance à personne. Surtout pas à ${randomTarget?.name ?? "certains"}.`,
-    `Moi j'accuse ${randomTarget?.name ?? "quelqu'un"}, y'a quelque chose qui cloche.`,
-    `Faut regarder du côté de ${randomTarget?.name ?? "certains"}, sérieux.`,
-    `Wsh ${randomTarget?.name ?? "toi là"}, t'as été bien silencieux cette nuit...`,
-    `Perso je vote ${randomTarget?.name ?? "quelqu'un"}, c'est clair que c'est un loup.`,
-    `Non mais attendez, ${randomTarget?.name ?? "quelqu'un"} a dit quoi exactement hier??`,
-    `Moi je dis c'est entre ${randomTarget?.name ?? "quelqu'un"} et ${randomTarget2?.name ?? "l'autre"}.`,
-    `${randomTarget?.name ?? "Quelqu'un"} fait trop l'innocent, ça pue le loup.`,
-    `On s'emballe pas, mais ${randomTarget?.name ?? "cette personne"} me dit rien de bon.`,
-    `Quelqu'un peut m'expliquer pourquoi ${randomTarget?.name ?? "lui/elle"} a rien dit hier?`,
-    `Moi je kiffe pas l'attitude de ${randomTarget?.name ?? "certains"}, c'est tout.`,
-    `Ouais non, ${randomTarget?.name ?? "toi"}, tu nous caches quelque chose.`,
-    `Bon on fait quoi? Moi je suis chaud pour virer ${randomTarget?.name ?? "quelqu'un"}.`,
-  ] : [
-    `Je suis pas sûr(e) mais ${randomTarget?.name ?? "quelqu'un"} agit bizarre non?`,
-    `On devrait voter contre ${randomTarget?.name ?? "quelqu'un"}, j'ai un mauvais pressentiment.`,
-    `Moi je suis innocent(e)! Regardez plutôt du côté de ${randomTarget?.name ?? "certains"}.`,
-    `${randomTarget?.name ?? "Quelqu'un"} parle pas beaucoup... c'est suspect.`,
-    `Faisons attention, les loups sont parmi nous. Je suspecte ${randomTarget?.name ?? "quelqu'un"}.`,
-    `Je fais confiance à personne ici. Surtout pas ${randomTarget?.name ?? "certains"}.`,
-    `Bon, moi je pense que ${randomTarget?.name ?? "quelqu'un"} nous ment depuis le début.`,
-    `Nah fr ${randomTarget?.name ?? "toi"}, explique-nous pourquoi tu dis rien?`,
-    `Moi je suis clean wallah, c'est ${randomTarget?.name ?? "quelqu'un"} le loup ici.`,
-    `On devrait focus ${randomTarget?.name ?? "cette personne"}, ses arguments tiennent pas la route.`,
-    `Écoutez moi, je vous jure c'est ${randomTarget?.name ?? "quelqu'un"} le problème.`,
-    `${randomTarget?.name ?? "Toi"} et ${randomTarget2?.name ?? "l'autre"}, vous votez toujours pareil, c'est louche.`,
-    `Les gars, faut se réveiller! ${randomTarget?.name ?? "Quelqu'un"} nous manipule depuis le début!`,
-    `Moi j'ai confiance en personne sauf moi-même. ${randomTarget?.name ?? "Quelqu'un"} est suspect.`,
-    `Honnêtement? ${randomTarget?.name ?? "Quelqu'un"} me donne des vibes de loup-garou.`,
-    `C'est la guerre les amis, et ${randomTarget?.name ?? "quelqu'un"} est dans le camp adverse.`,
-    `Attendez, ${randomTarget?.name ?? "cette personne"} a changé d'avis trop vite, non?`,
-    `Moi j'ai dormi tranquille cette nuit. Par contre ${randomTarget?.name ?? "certains"}... 👀`,
-  ];
+    // Fetch recent chat messages so bot can react to conversation
+    let recentMessages: string[] = [];
+    try {
+      const msgs: any[] = await getChannelMessages(token, gameChannelId, undefined, 15);
+      recentMessages = msgs
+        .reverse()
+        .filter((m: any) => m.content && !m.content.startsWith("🗳️") && !m.content.startsWith("☀️") && !m.content.startsWith("🌙"))
+        .map((m: any) => m.content)
+        .slice(-10);
+    } catch (e) {
+      console.error(`[botDiscussion] Failed to fetch recent messages:`, e);
+    }
 
-  const message = phrases[Math.floor(Math.random() * phrases.length)]!;
+    const prompt = buildBotPrompt({
+      bot, role: botMem.role || role, phase: "day_discussion",
+      alivePlayers, aliveHumans: [], aliveBots: allBots.filter((b) => b.alive),
+      gameHistory: history, knownInfo: "", botMemory: botMem,
+      recentMessages,
+    });
+    const raw = await callLLM(prompt, env);
+    console.log(`[botDiscussion] ${bot.name} LLM raw: ${raw.slice(0, 200)}`);
+    const parsed = parseLLMResponse(raw, "day_discussion", alivePlayers);
+    if (parsed && "message" in parsed && parsed.message) {
+      message = parsed.message;
+      console.log(`[botDiscussion] ${bot.name} LLM message: ${message.slice(0, 100)}`);
+      // Save discussion note to memory
+      botMem.discussionNotes = [...(botMem.discussionNotes ?? []).slice(-4), `Moi: ${message.slice(0, 80)}`];
+      await saveBotMemory(env.ACTIVE_PLAYERS, gameNumber, bot.id, botMem);
+    } else {
+      console.log(`[botDiscussion] ${bot.name} → fallback (parse failed)`);
+      // Fallback to random phrase
+      const team = (ROLE_STRATEGIES[role]?.team === "loups" || role === "loup" || role === "loup_blanc") ? "wolf" : "village";
+      const phrases = FALLBACK_DISCUSSION_PHRASES[team];
+      message = phrases[Math.floor(Math.random() * phrases.length)]!;
+    }
+  } catch (err) {
+    console.error(`[botDiscussion] LLM failed for ${bot.name}:`, err);
+    const team = (role === "loup" || role === "loup_blanc") ? "wolf" : "village";
+    const phrases = FALLBACK_DISCUSSION_PHRASES[team];
+    message = phrases[Math.floor(Math.random() * phrases.length)]!;
+  }
 
   try {
     await sendMessage(token, gameChannelId, {
@@ -483,13 +523,13 @@ async function executeBotDiscussion(
 
 async function executeBotDayVote(
   token: string,
-  _env: Env,
+  env: Env,
   bot: BotPlayer,
   allBots: BotPlayer[],
   gameChannelId: string,
   voteMessageId: string,
-  _gameNumber: number,
-  _role: string,
+  gameNumber: number,
+  role: string,
   ctx: ExecutionContext,
 ): Promise<void> {
   console.log(`[botDayVote] 🗳️ Bot ${bot.name} (${bot.id}) voting`);
@@ -499,11 +539,73 @@ async function executeBotDayVote(
   const dv = parseDayVoteFromEmbed(currentMsg);
   if (!dv) return;
 
-  // Instant random decision
-  const fd = fallbackDecision(dv.targets, bot.id);
-  const targetId = fd.action;
-  const message = fd.message;
-  console.log(`[botDayVote] ${bot.name} randomly chose: ${targetId}`);
+  // LLM-powered decision
+  let targetId: string;
+  let message: string;
+  try {
+    const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, gameNumber, bot.id);
+    const history = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
+    const actualRole = botMem.role || role;
+
+    // Fetch recent chat messages for vote context
+    let recentMessages: string[] = [];
+    try {
+      const msgs: any[] = await getChannelMessages(token, gameChannelId, undefined, 20);
+      recentMessages = msgs
+        .reverse()
+        .filter((m: any) => m.content && !m.content.startsWith("🗳️"))
+        .map((m: any) => m.content)
+        .slice(-15);
+    } catch (e) {
+      console.error(`[botDayVote] Failed to fetch recent messages:`, e);
+    }
+
+    const prompt = buildBotPrompt({
+      bot, role: actualRole, phase: "day_vote",
+      alivePlayers: dv.targets, aliveHumans: [], aliveBots: allBots.filter((b) => b.alive),
+      gameHistory: history, knownInfo: "", botMemory: botMem,
+      targetOptions: dv.targets.filter((t) => t.id !== bot.id),
+      recentMessages,
+    });
+    const raw = await callLLM(prompt, env);
+    console.log(`[botDayVote] ${bot.name} LLM raw: ${raw.slice(0, 200)}`);
+    const parsed = parseLLMResponse(raw, "day_vote", dv.targets.filter((t) => t.id !== bot.id));
+    console.log(`[botDayVote] ${bot.name} parsed:`, JSON.stringify(parsed));
+    if (parsed && "action" in parsed && parsed.action !== "discuss") {
+      // Wolf bots: never vote against known wolves
+      const isWolf = actualRole === "loup" || actualRole === "loup_blanc";
+      if (isWolf && botMem.knownWolves.length > 0) {
+        const targetName = dv.targets.find((t) => t.id === (parsed as BotDecisionResult).action)?.name;
+        if (targetName && botMem.knownWolves.includes(targetName)) {
+          console.log(`[botDayVote] ${bot.name} wolf-protect: redirecting away from ${targetName}`);
+          // Redirect to a non-wolf target
+          const safeTargets = dv.targets.filter((t) => t.id !== bot.id && !botMem.knownWolves.includes(t.name));
+          const fd = safeTargets.length > 0
+            ? { action: safeTargets[Math.floor(Math.random() * safeTargets.length)]!.id, message: `Je vote pour ${safeTargets[0]!.name}.` }
+            : fallbackDecision(dv.targets, bot.id);
+          targetId = fd.action;
+          message = fd.message;
+        } else {
+          targetId = (parsed as BotDecisionResult).action;
+          message = (parsed as BotDecisionResult).message;
+        }
+      } else {
+        targetId = (parsed as BotDecisionResult).action;
+        message = (parsed as BotDecisionResult).message;
+      }
+    } else {
+      console.log(`[botDayVote] ${bot.name} → fallback (parse failed)`);
+      const fd = fallbackDecision(dv.targets, bot.id);
+      targetId = fd.action;
+      message = fd.message;
+    }
+  } catch (err) {
+    console.error(`[botDayVote] LLM failed for ${bot.name}:`, err);
+    const fd = fallbackDecision(dv.targets, bot.id);
+    targetId = fd.action;
+    message = fd.message;
+  }
+  console.log(`[botDayVote] ${bot.name} chose: ${targetId}`);
 
   dv.votes[bot.id] = targetId;
 
@@ -570,7 +672,7 @@ async function executeBotDayVote(
       }],
       components: [],
     });
-    await resolveDayVote(token, dv, ctx, _env);
+    await resolveDayVote(token, dv, ctx, env);
   }
 }
 
@@ -660,15 +762,22 @@ function getConfigFromInteraction(interaction: any): ConfigState | null {
 
 async function handleConfigSelect(interaction: any, env: Env): Promise<Response> {
   const config = getConfigFromInteraction(interaction);
-  if (!config) return json({ type: 4, data: { content: "❌ Erreur: configuration introuvable.", flags: 64 } });
+  if (!config) return json({ type: 4, data: { content: t("fr").errors.configNotFound, flags: 64 } });
 
+  const i18n = t(config.lang);
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (userId !== config.creatorId) {
-    return json({ type: 4, data: { content: "❌ Seul le créateur peut modifier la configuration.", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.errors.onlyCreator, flags: 64 } });
   }
 
   const customId: string = interaction.data?.custom_id || "";
   const values: string[] = interaction.data?.values || [];
+
+  if (customId === "cfg_lang") {
+    config.lang = (values[0] || "fr") as Locale;
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
 
   if (customId === "cfg_preset") {
     const presetName = values[0] || "none";
@@ -747,18 +856,19 @@ async function handleConfigSelect(interaction: any, env: Env): Promise<Response>
     return json({ type: 7, data: buildStep2Embed(config) });
   }
 
-  return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
+  return json({ type: 4, data: { content: i18n.errors.unknownAction, flags: 64 } });
 }
 
 // ── Config Button Handler ────────────────────────────────────────────
 
 async function handleConfigButton(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const config = getConfigFromInteraction(interaction);
-  if (!config) return json({ type: 4, data: { content: "❌ Erreur: configuration introuvable.", flags: 64 } });
+  if (!config) return json({ type: 4, data: { content: t("fr").errors.configNotFound, flags: 64 } });
 
+  const i18n = t(config.lang);
   const userId = interaction.member?.user?.id || interaction.user?.id;
   if (userId !== config.creatorId) {
-    return json({ type: 4, data: { content: "❌ Seul le créateur peut modifier la configuration.", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.errors.onlyCreator, flags: 64 } });
   }
 
   const customId: string = interaction.data?.custom_id || "";
@@ -786,7 +896,7 @@ async function handleConfigButton(interaction: any, env: Env, ctx: ExecutionCont
 
   if (customId === "cfg_create") {
     if (config.selectedRoles.length === 0) {
-      return json({ type: 4, data: { content: "❌ Sélectionne au moins un rôle avant de créer la partie.", flags: 64 } });
+      return json({ type: 4, data: { content: i18n.errors.selectRolesFirst, flags: 64 } });
     }
     return handleCreateGame(interaction, config, env, ctx);
   }
@@ -797,7 +907,7 @@ async function handleConfigButton(interaction: any, env: Env, ctx: ExecutionCont
       type: 9,
       data: {
         custom_id: "cfg_save_modal",
-        title: "Sauvegarder le preset",
+        title: i18n.config.savePresetTitle,
         components: [
           {
             type: 1,
@@ -805,11 +915,11 @@ async function handleConfigButton(interaction: any, env: Env, ctx: ExecutionCont
               {
                 type: 4,
                 custom_id: "preset_name",
-                label: "Nom du preset",
+                label: i18n.config.presetNameLabel,
                 style: 1,
                 min_length: 1,
                 max_length: 50,
-                placeholder: "Mon preset personnalisé",
+                placeholder: i18n.config.presetNamePlaceholder,
                 required: true,
               },
             ],
@@ -819,7 +929,7 @@ async function handleConfigButton(interaction: any, env: Env, ctx: ExecutionCont
     });
   }
 
-  return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
+  return json({ type: 4, data: { content: i18n.errors.unknownAction, flags: 64 } });
 }
 
 // ── Modal Submit Handler ─────────────────────────────────────────────
@@ -830,18 +940,21 @@ async function handleModalSubmit(interaction: any, env: Env): Promise<Response> 
   if (customId === "cfg_save_modal") {
     // Extract preset name from modal
     const presetName = interaction.data?.components?.[0]?.components?.[0]?.value?.trim();
-    if (!presetName) {
-      return json({ type: 4, data: { content: "❌ Nom de preset invalide.", flags: 64 } });
-    }
 
     // Get config from the message the modal was triggered from
     const config = getConfigFromInteraction(interaction);
+    const i18n = t(config?.lang ?? "fr");
+
+    if (!presetName) {
+      return json({ type: 4, data: { content: i18n.errors.presetNameInvalid, flags: 64 } });
+    }
+
     if (!config) {
-      return json({ type: 4, data: { content: "❌ Erreur: configuration introuvable.", flags: 64 } });
+      return json({ type: 4, data: { content: i18n.errors.configNotFound, flags: 64 } });
     }
 
     if (!env.PRESETS_KV) {
-      return json({ type: 4, data: { content: "⚠️ Les presets personnalisés ne sont pas activés sur ce serveur.", flags: 64 } });
+      return json({ type: 4, data: { content: i18n.errors.customPresetsDisabled, flags: 64 } });
     }
 
     const preset: PresetConfig = {
@@ -861,13 +974,14 @@ async function handleModalSubmit(interaction: any, env: Env): Promise<Response> 
     return json({ type: 7, data: buildStep2Embed(config) });
   }
 
-  return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
+  return json({ type: 4, data: { content: t("fr").errors.unknownAction, flags: 64 } });
 }
 
 // ── Create Game from Config ──────────────────────────────────────────
 
 async function handleCreateGame(interaction: any, config: ConfigState, env: Env, ctx: ExecutionContext): Promise<Response> {
   const token = env.DISCORD_BOT_TOKEN;
+  const i18n = t(config.lang);
   const appId = interaction.application_id;
   const interactionToken = interaction.token;
   const userId = config.creatorId;
@@ -878,7 +992,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
   // Validate: at least 1 wolf role
   const hasWolf = config.selectedRoles.some((id) => ROLE_ID_TO_KEY[id] === "loup");
   if (!hasWolf) {
-    return json({ type: 4, data: { content: "❌ La config doit contenir au moins un Loup-Garou.", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.errors.needWolf, flags: 64 } });
   }
 
   // ACK with deferred update (remove the config embed)
@@ -920,12 +1034,13 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         voteTime: config.voteTime,
         selectedRoleIds: config.selectedRoles,
         botCount: config.botCount,
+        lang: config.lang,
       };
 
       // Create bot players if configured
       let bots: BotPlayer[] = [];
       if (gameState.botCount && gameState.botCount > 0) {
-        const personalities = pickBots(gameState.botCount);
+        const personalities = pickBots(gameState.botCount, config.lang);
         bots = personalities.map((p, i) => ({
           id: `bot_${i + 1}`,
           name: p.name,
@@ -946,13 +1061,13 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
 
       // Update ephemeral message to confirm
       await editOriginalInteractionResponse(appId, interactionToken, {
-        content: `✅ Partie #${gameNumber} créée! (${maxPlayers} joueurs)`,
+        content: i18n.game.gameCreated(gameNumber, maxPlayers),
         embeds: [],
         components: [
           {
             type: 1,
             components: [
-              { type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${guildId}/${gameChannel.id}` },
+              { type: 2, style: 5, label: i18n.game.goToChannel, url: `https://discord.com/channels/${guildId}/${gameChannel.id}` },
             ],
           },
         ],
@@ -964,7 +1079,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
       console.error("Error in handleCreateGame:", err);
       try {
         await editOriginalInteractionResponse(appId, interactionToken, {
-          content: "❌ Une erreur est survenue lors de la création de la partie.",
+          content: i18n.errors.createFailed,
         });
       } catch {}
     }
@@ -982,7 +1097,7 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
   const userId = interaction.member?.user?.id;
 
   if (!guildId || !channelId || !userId) {
-    return json({ type: 4, data: { content: "❌ Cette commande ne fonctionne que dans un serveur Discord.", flags: 64 } });
+    return json({ type: 4, data: { content: t("fr").errors.onlyInServer, flags: 64 } });
   }
 
   // Check if creator is already in a game
@@ -1002,6 +1117,7 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
     selectedRoles: [...defaultPreset.roles],
     botCount: 4,
     maxPlayers: 6,
+    lang: "fr" as Locale,
   };
 
   const customPresets = await loadCustomPresets(env, guildId);
@@ -1014,10 +1130,10 @@ async function handleSlashCommand(interaction: any, env: Env, ctx: ExecutionCont
 
 async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+  if (!userId) return json({ type: 4, data: { content: t("fr").errors.userNotFound, flags: 64 } });
 
   const initialGame = parseGameFromEmbed(interaction.message);
-  if (!initialGame) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+  if (!initialGame) return json({ type: 4, data: { content: t("fr").errors.gameNotFound, flags: 64 } });
 
   // ACK immediately (deferred ephemeral) — prevents "interaction failed" on slow API calls
   const appId = interaction.application_id;
@@ -1042,13 +1158,15 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
         } catch {}
       }
 
+      const i18n = t(game.lang ?? "fr");
+
       // Already in the embed? (concurrent join resolved it)
       if (game.players.includes(userId)) {
         await kv.put(playerKey, "1", { expirationTtl: PLAYER_TTL });
         await markPlayerActive(kv, userId, gn, game.gameChannelId);
         await editOriginalInteractionResponse(appId, interactionToken, {
-          content: `✅ Tu as rejoint la Partie #${game.gameNumber}!`,
-          components: [{ type: 1, components: [{ type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` }] }],
+          content: i18n.game.joined(game.gameNumber),
+          components: [{ type: 1, components: [{ type: 2, style: 5, label: i18n.game.goToChannel, url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` }] }],
         });
         return;
       }
@@ -1057,7 +1175,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
       const humanSlots = game.maxPlayers - bots.length;
       if (game.players.length >= humanSlots) {
         await editOriginalInteractionResponse(appId, interactionToken, {
-          content: "❌ La partie est pleine!",
+          content: i18n.errors.gameFull,
         });
         return;
       }
@@ -1079,7 +1197,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
       const member: any = await getGuildMember(token, game.guildId, userId);
       const playerName = member.nick || member.user.global_name || member.user.username;
 
-      await updateAllEmbeds(token, game, `${playerName} a rejoint la partie`, bots);
+      await updateAllEmbeds(token, game, i18n.game.playerJoined(playerName), bots);
 
       // ── Step 5: Post-update verify (fix race with concurrent joins) ──
       await sleep(1500);
@@ -1089,7 +1207,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
         if (verifyGame && !verifyGame.players.includes(userId)) {
           // Our update got overwritten by a concurrent join — re-add
           verifyGame.players.push(userId);
-          await updateAllEmbeds(token, verifyGame, `${playerName} a rejoint la partie`, bots);
+          await updateAllEmbeds(token, verifyGame, i18n.game.playerJoined(playerName), bots);
           game = verifyGame;
         } else if (verifyGame) {
           game = verifyGame;
@@ -1103,12 +1221,12 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
       }
 
       await editOriginalInteractionResponse(appId, interactionToken, {
-        content: `✅ Tu as rejoint la Partie #${game.gameNumber}!`,
+        content: i18n.game.joined(game.gameNumber),
         components: [
           {
             type: 1,
             components: [
-              { type: 2, style: 5, label: "🐺 Aller au salon", url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` },
+              { type: 2, style: 5, label: i18n.game.goToChannel, url: `https://discord.com/channels/${game.guildId}/${game.gameChannelId}` },
             ],
           },
         ],
@@ -1117,7 +1235,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
       console.error("handleJoin background error:", err);
       try {
         await editOriginalInteractionResponse(appId, interactionToken, {
-          content: "❌ Une erreur est survenue en rejoignant la partie.",
+          content: i18n.errors.joinFailed,
         });
       } catch {}
     }
@@ -1131,13 +1249,13 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
 
 async function handleQuit(interaction: any, env: Env): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+  if (!userId) return json({ type: 4, data: { content: t("fr").errors.userNotFound, flags: 64 } });
 
   const token = env.DISCORD_BOT_TOKEN;
 
   // Re-read the latest state from the lobby embed (same race condition fix as handleJoin)
   const initialGame = parseGameFromEmbed(interaction.message);
-  if (!initialGame) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+  if (!initialGame) return json({ type: 4, data: { content: t("fr").errors.gameNotFound, flags: 64 } });
 
   let game = initialGame;
   if (initialGame.lobbyMessageId) {
@@ -1148,7 +1266,8 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
     } catch {}
   }
 
-  if (!game.players.includes(userId)) return json({ type: 4, data: { content: "❌ Tu n'es pas dans cette partie.", flags: 64 } });
+  const i18n = t(game.lang ?? "fr");
+  if (!game.players.includes(userId)) return json({ type: 4, data: { content: i18n.errors.notInGame, flags: 64 } });
 
   game.players = game.players.filter((id) => id !== userId);
 
@@ -1172,7 +1291,7 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
     if (game.announceChannelId && game.announceMessageId) {
       try { await deleteMessage(token, game.announceChannelId, game.announceMessageId); } catch {}
     }
-    return json({ type: 4, data: { content: `🗑️ La Partie #${game.gameNumber} a été supprimée (plus aucun joueur).`, flags: 64 } });
+    return json({ type: 4, data: { content: i18n.game.gameDeleted(game.gameNumber), flags: 64 } });
   }
 
   // Creator left → transfer
@@ -1182,15 +1301,15 @@ async function handleQuit(interaction: any, env: Env): Promise<Response> {
     game.creatorId = newCreatorId;
     const newCreatorMember: any = await getGuildMember(token, game.guildId, newCreatorId);
     game.creatorName = newCreatorMember.nick || newCreatorMember.user.global_name || newCreatorMember.user.username;
-    lastEvent = `${playerName} a quitté — ${game.creatorName} est le nouveau créateur`;
+    lastEvent = i18n.game.creatorTransfer(playerName, game.creatorName);
   } else {
-    lastEvent = `${playerName} a quitté la partie`;
+    lastEvent = i18n.game.playerQuit(playerName);
   }
 
   const quitBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
   await updateAllEmbeds(token, game, lastEvent, quitBots);
 
-  return json({ type: 4, data: { content: `🚪 Tu as quitté la Partie #${game.gameNumber}.`, flags: 64 } });
+  return json({ type: 4, data: { content: i18n.game.quit(game.gameNumber), flags: 64 } });
 }
 
 // ── Game Start (animated role reveal) ────────────────────────────────
@@ -1373,6 +1492,7 @@ async function updatePhaseStatus(token: string, game: GameState, title: string, 
 
 async function startGame(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.lobbyMessageId) return;
+  const i18n = t(game.lang ?? "fr");
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
 
@@ -1380,11 +1500,11 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
     embeds: [
       {
-        title: "🌑 La nuit tombe sur le village...",
+        title: i18n.game.nightFalls,
         url: stateUrl,
         description: [
-          "*Les villageois s'endorment...*",
-          "*Quelque chose rôde dans l'ombre...*",
+          i18n.game.villageSleeps,
+          i18n.game.somethingLurks,
         ].join("\n"),
         color: EMBED_COLOR_NIGHT,
         image: { url: SCENE_IMAGES.night_falls },
@@ -1399,12 +1519,12 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
     embeds: [
       {
-        title: "🃏 Le destin se révèle...",
+        title: i18n.game.destinyReveals,
         url: stateUrl,
         description: [
-          `**${game.players.length + (game.botCount ?? 0)} cartes** sont distribuées face cachée...`,
+          i18n.game.cardsDealt(game.players.length + (game.botCount ?? 0)),
           "",
-          "*Chaque joueur reçoit son destin en secret.*",
+          i18n.game.secretDestiny,
         ].join("\n"),
         color: EMBED_COLOR_PURPLE,
         image: { url: SCENE_IMAGES.game_start },
@@ -1419,6 +1539,27 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   game.roles = assignRoles(game.players, botIds, game.selectedRoleIds);
   game.witchPotions = { life: true, death: true };
 
+  // ── Init bot memory for each bot ──
+  const wolfBotIds = botIds.filter((id) => game.roles![id] === "loup" || game.roles![id] === "loup_blanc");
+  for (const botId of botIds) {
+    const role = game.roles[botId] ?? "villageois";
+    const mem = initBotMemory(role);
+    // Wolves know their fellow wolves
+    if (role === "loup" || role === "loup_blanc") {
+      const fellowWolves = wolfBotIds
+        .filter((id) => id !== botId)
+        .map((id) => bots.find((b) => b.id === id)?.name ?? id);
+      // Also include human wolves
+      const humanWolfNames = game.players
+        .filter((id) => game.roles![id] === "loup" || game.roles![id] === "loup_blanc")
+        .map((id) => id); // Will be resolved to names at prompt time
+      mem.knownWolves = [...fellowWolves, ...humanWolfNames];
+    }
+    await saveBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, botId, mem);
+    const botName = bots.find((b) => b.id === botId)?.name ?? botId;
+    console.log(`[startGame] Bot memory init: ${botName} → role=${role}, knownWolves=${mem.knownWolves.length}`);
+  }
+
   await sleep(3000);
 
   // ── Phase 3: Role check (channels are created lazily when players reveal) ──
@@ -1428,12 +1569,12 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
   if (game.announceChannelId && game.announceMessageId) {
     await editMessage(token, game.announceChannelId, game.announceMessageId, {
       embeds: [{
-        title: `🎮 Partie #${game.gameNumber} — En cours!`,
+        title: i18n.game.gameInProgress(game.gameNumber),
         url: `https://garou.bot/s/${encodeState(game)}`,
-        description: [`Lancée par <@${game.creatorId}>`, "", `**${game.players.length + (game.botCount ?? 0)} joueurs** — Les rôles sont distribués!`].join("\n"),
+        description: [i18n.game.launchedBy(game.creatorId), "", i18n.game.playersRolesDistributed(game.players.length + (game.botCount ?? 0))].join("\n"),
         color: EMBED_COLOR_GREEN,
         image: { url: SCENE_IMAGES.night_falls },
-        footer: { text: "La partie est en cours!" },
+        footer: { text: i18n.game.gameInProgressFooter },
       }],
       components: [],
     });
@@ -1446,6 +1587,7 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
 // ── Countdown + Night — runs in ctx.waitUntil from handleRevealRole (~15s) ──
 async function runCountdownAndNight(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   console.log(`[countdown] Starting for game #${game.gameNumber}`);
+  const i18n = t(game.lang ?? "fr");
 
   try {
     const msg: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId!);
@@ -1463,18 +1605,18 @@ async function runCountdownAndNight(token: string, game: GameState, ctx: Executi
       const bar = "█".repeat(remaining) + "░".repeat(GAME_START_DELAY - remaining);
       await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
         embeds: [{
-          title: `⏳ La partie débute dans ${remaining}s — Partie #${game.gameNumber}`,
+          title: i18n.game.gameStartsIn(remaining, game.gameNumber),
           url: nightStateUrl,
           description: [
-            "✅ Les rôles ont été distribués!",
+            i18n.game.rolesDistributed,
             "",
             `\`${bar}\` **${remaining}s**`,
             "",
-            "*Préparez-vous...*",
+            i18n.game.prepareYourself,
           ].join("\n"),
           color: EMBED_COLOR_ORANGE,
           image: { url: SCENE_IMAGES.night_falls },
-          footer: { text: "🤫 Ne révèle ton rôle à personne!" },
+          footer: { text: i18n.game.dontRevealRole },
         }],
         components: [],
       });
@@ -1488,11 +1630,11 @@ async function runCountdownAndNight(token: string, game: GameState, ctx: Executi
   try {
     await editMessage(token, game.gameChannelId, game.lobbyMessageId!, {
       embeds: [{
-        title: `🌙 Le village s'endort... — Partie #${game.gameNumber}`,
+        title: i18n.game.villageSleepsTitle(game.gameNumber),
         url: nightStateUrl,
         description: [
-          "*Chaque villageois ferme les yeux...*",
-          "*Le silence envahit le village...*",
+          i18n.game.villagersSleep,
+          i18n.game.silenceFalls,
         ].join("\n"),
         color: EMBED_COLOR_NIGHT,
         image: { url: SCENE_IMAGES.night_falls },
@@ -1513,14 +1655,20 @@ async function runCountdownAndNight(token: string, game: GameState, ctx: Executi
 // ── Countdown when game is full ──────────────────────────────────────
 
 function isGameStarted(title: string): boolean {
-  return title.includes("La nuit tombe") || title.includes("La chasse commence") || title.includes("Le destin")
-    || title.includes("Le village s'endort") || title.includes("Les loups-garous se réveillent")
-    || title.includes("Découvrez vos rôles") || title.includes("La partie débute")
-    || title.includes("Vision de la Voyante") || title.includes("Sorcière");
+  return title.includes("La nuit tombe") || title.includes("Night falls")
+    || title.includes("La chasse commence")
+    || title.includes("Le destin") || title.includes("Destiny reveals")
+    || title.includes("Le village s'endort") || title.includes("village falls asleep")
+    || title.includes("Les loups-garous se réveillent") || title.includes("werewolves wake")
+    || title.includes("Découvrez vos rôles") || title.includes("Discover your roles")
+    || title.includes("La partie débute") || title.includes("Game starts")
+    || title.includes("Vision de la Voyante") || title.includes("Seer's Vision")
+    || title.includes("Sorcière") || title.includes("Witch");
 }
 
 async function runCountdown(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   if (!game.lobbyMessageId) return;
+  const i18n = t(game.lang ?? "fr");
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
   for (let remaining = COUNTDOWN_SECONDS; remaining >= 0; remaining--) {
@@ -1546,7 +1694,7 @@ async function runCountdown(token: string, game: GameState, ctx: ExecutionContex
         await editMessage(token, game.gameChannelId, game.lobbyMessageId, {
           embeds: [
             {
-              title: `⏳ La partie commence dans ${remaining}s...`,
+              title: i18n.game.countdownTitle(remaining),
               url: stateUrl,
               description: [
                 "",
@@ -1561,11 +1709,11 @@ async function runCountdown(token: string, game: GameState, ctx: ExecutionContex
                 "",
                 "━━━━━━━━━━━━━━━━━━━━",
                 "",
-                `🟢 **${game.players.length}/${game.maxPlayers}** — Tous les joueurs sont prêts!`,
+                i18n.game.allPlayersReady(game.players.length, game.maxPlayers),
               ].join("\n"),
               color: EMBED_COLOR_ORANGE,
               image: { url: SCENE_IMAGES.game_start },
-              footer: { text: `👑 Le créateur peut lancer immédiatement` },
+              footer: { text: i18n.game.creatorCanStart },
             },
           ],
           components: [
@@ -1575,13 +1723,13 @@ async function runCountdown(token: string, game: GameState, ctx: ExecutionContex
                 {
                   type: 2,
                   style: 3,
-                  label: `⏩ Commencer maintenant`,
+                  label: i18n.game.skipCountdown,
                   custom_id: `skip_countdown_${game.gameNumber}`,
                 },
                 {
                   type: 2,
                   style: 4,
-                  label: "🚪 Quitter la partie",
+                  label: i18n.game.quitButton,
                   custom_id: `quit_game_${game.gameNumber}`,
                 },
               ],
@@ -1628,9 +1776,10 @@ const SORCIERE_TIMEOUT_SECONDS = 60;
 async function handleCupidonPick(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const s = parseCupidonFromEmbed(interaction.message);
-  if (!s) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
-  if (userId !== s.cupidonId) return json({ type: 4, data: { content: "❌ Seul Cupidon peut choisir.", flags: 64 } });
-  if (Math.floor(Date.now() / 1000) > s.deadline) return json({ type: 4, data: { content: "⏰ Le temps est écoulé!", flags: 64 } });
+  if (!s) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(s.lang ?? "fr");
+  if (userId !== s.cupidonId) return json({ type: 4, data: { content: i18n.errors.onlyCupidon, flags: 64 } });
+  if (Math.floor(Date.now() / 1000) > s.deadline) return json({ type: 4, data: { content: i18n.errors.timeUp, flags: 64 } });
 
   const customId: string = interaction.data?.custom_id || "";
   const targetId = customId.replace(`cupidon_pick_${s.gameNumber}_`, "");
@@ -1646,6 +1795,7 @@ async function handleCupidonPick(interaction: any, env: Env, ctx: ExecutionConte
 }
 
 async function finalizeCupidonAndStartWolves(token: string, s: CupidonState, couple: [string, string], cupidonThreadId: string, ctx: ExecutionContext, env: Env) {
+  const i18n = t(s.lang ?? "fr");
   const names = couple.map(id => s.players.find(p => p.id === id)?.name ?? "?");
 
   for (const playerId of couple) {
@@ -1655,12 +1805,8 @@ async function finalizeCupidonAndStartWolves(token: string, s: CupidonState, cou
       const dm: any = await createDM(token, playerId);
       await sendMessage(token, dm.id, {
         embeds: [{
-          title: "💘 Tu as été touché(e) par la flèche de Cupidon!",
-          description: [
-            `Tu es lié(e) à **${otherName}** (<@${otherId}>).`,
-            "", "Si l'un de vous meurt, l'autre mourra aussi de chagrin.",
-            "", "*Protégez-vous mutuellement...*",
-          ].join("\n"),
+          title: i18n.game.cupidonDM,
+          description: i18n.game.cupidonDMDesc(otherName!, otherId!),
           color: 0xe91e63, thumbnail: { url: getRoleImage("cupidon") },
         }],
       });
@@ -1704,9 +1850,10 @@ async function finalizeCupidonAndStartWolves(token: string, s: CupidonState, cou
 async function handleCupidonConfirm(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const s = parseCupidonFromEmbed(interaction.message);
-  if (!s) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
-  if (userId !== s.cupidonId) return json({ type: 4, data: { content: "❌ Seul Cupidon peut confirmer.", flags: 64 } });
-  if (s.picks.length !== 2) return json({ type: 4, data: { content: "❌ Choisis exactement 2 joueurs.", flags: 64 } });
+  if (!s) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(s.lang ?? "fr");
+  if (userId !== s.cupidonId) return json({ type: 4, data: { content: i18n.errors.onlyCupidonConfirm, flags: 64 } });
+  if (s.picks.length !== 2) return json({ type: 4, data: { content: i18n.errors.pick2Players, flags: 64 } });
 
   const token = env.DISCORD_BOT_TOKEN;
   const couple = s.picks as [string, string];
@@ -1714,9 +1861,9 @@ async function handleCupidonConfirm(interaction: any, env: Env, ctx: ExecutionCo
 
   const ackResponse = json({ type: 7, data: {
     embeds: [{
-      title: `💘 Le couple est formé! — Partie #${s.gameNumber}`,
+      title: i18n.game.cupidonFormed(s.gameNumber),
       url: `https://garou.bot/cu/${encodeCupidonState(s)}`,
-      description: `**${names[0]}** & **${names[1]}** sont liés par l'amour.\n\n*Si l'un meurt, l'autre mourra de chagrin.*`,
+      description: i18n.game.cupidonFormedDesc(names[0]!, names[1]!),
       color: 0xe91e63, thumbnail: { url: getRoleImage("cupidon") },
     }],
     components: [],
@@ -1748,11 +1895,12 @@ async function phaseCupidonTimer(token: string, data: any, ctx: ExecutionContext
   const couple: [string, string] = [shuffled[0]!.id, shuffled[1]!.id];
   const names = couple.map(id => s.players.find(p => p.id === id)?.name ?? "?");
 
+  const i18n = t(s.lang ?? "fr");
   await editMessage(token, cupidonThreadId, cupidonMessageId, {
     embeds: [{
-      title: `💘 Temps écoulé! Couple aléatoire — Partie #${s.gameNumber}`,
+      title: i18n.game.cupidonTimeout(s.gameNumber),
       url: `https://garou.bot/cu/${encodeCupidonState(s)}`,
-      description: `**${names[0]}** & **${names[1]}** sont liés par l'amour.\n\n*Cupidon n'a pas choisi à temps...*`,
+      description: i18n.game.cupidonTimeoutDesc(names[0]!, names[1]!),
       color: 0xe91e63,
     }],
     components: [],
@@ -1766,6 +1914,7 @@ async function phaseCupidonTimer(token: string, data: any, ctx: ExecutionContext
 const CHASSEUR_TIMEOUT_SECONDS = 30;
 
 async function triggerChasseurShoot(token: string, game: GameState, chasseurId: string, ctx: ExecutionContext, env: Env) {
+  const i18n = t(game.lang ?? "fr");
   const dead = game.dead ?? [];
   const livingTargets = game.players.filter(id => !dead.includes(id) && id !== chasseurId);
   const humanTargets = await Promise.all(
@@ -1779,10 +1928,33 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
   const targets = [...humanTargets, ...chBotTargets];
   if (targets.length === 0) return;
 
-  // BOT AUTO-PLAY: If chasseur is a bot, pick a random target instantly
+  // BOT AUTO-PLAY: If chasseur is a bot, use LLM to pick target
   if (chasseurId.startsWith("bot_")) {
-    const target = targets[Math.floor(Math.random() * targets.length)]!;
-    console.log(`[chasseur] Bot ${chasseurId} auto-shooting ${target.name}`);
+    let target = targets[Math.floor(Math.random() * targets.length)]!;
+    const botChasseur = chBots.find((b) => b.id === chasseurId);
+    if (botChasseur) {
+      try {
+        const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, chasseurId);
+        const history = await loadHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+        const prompt = buildBotPrompt({
+          bot: botChasseur, role: "chasseur", phase: "chasseur_shoot",
+          alivePlayers: targets, aliveHumans: [], aliveBots: chBots.filter((b) => b.alive),
+          gameHistory: history, knownInfo: "", botMemory: botMem,
+          targetOptions: targets,
+        });
+        const raw = await callLLM(prompt, env);
+        console.log(`[chasseur] Bot LLM raw: ${raw.slice(0, 200)}`);
+        const parsed = parseLLMResponse(raw, "chasseur_shoot", targets);
+        console.log(`[chasseur] Bot parsed:`, JSON.stringify(parsed));
+        if (parsed && "action" in parsed) {
+          const match = targets.find((t) => t.id === (parsed as BotDecisionResult).action);
+          if (match) target = match;
+        }
+      } catch (err) {
+        console.error(`[chasseur] LLM failed for bot chasseur:`, err);
+      }
+    }
+    console.log(`[chasseur] Bot ${chasseurId} shooting ${target.name}`);
 
     if (!game.dead) game.dead = [];
     game.dead.push(target.id);
@@ -1801,17 +1973,19 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
     await sleep(2000);
     await sendMessage(token, game.gameChannelId, {
       embeds: [{
-        title: "🏹 Le chasseur tire une dernière flèche!",
+        title: i18n.game.chasseurShoot,
         description: [
-          `Dans un dernier souffle, le chasseur abat ${targetDisplay}!`,
+          i18n.game.chasseurShootDesc(targetDisplay),
           "",
-          `${targetRoleInfo.emoji} C'était **${targetRoleInfo.name}**!`,
+          i18n.game.chasseurWas(targetRoleInfo.emoji, getRoleName(targetRoleKey, game.lang ?? "fr")),
         ].join("\n"),
         color: 0xe67e22,
         thumbnail: { url: getRoleImage(targetRoleKey) },
         image: { url: SCENE_IMAGES.snipe_reveal },
       }],
     });
+
+    await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Le Chasseur a tiré sur ${target.name}. C'était ${getRoleName(targetRoleKey, game.lang ?? "fr")}.`);
 
     // Couple death chain
     if (game.couple && game.couple.includes(target.id)) {
@@ -1826,7 +2000,8 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
         const pRoleInfo = ROLES[pRoleKey] ?? ROLES.villageois!;
         const pDisplay = pid.startsWith("bot_") ? `🤖 **${pName}**` : `**${pName}** (<@${pid}>)`;
         await sleep(2000);
-        await sendMessage(token, game.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: [`${pDisplay} meurt de chagrin.`, "", `${pRoleInfo.emoji} C'était **${pRoleInfo.name}**!`].join("\n"), color: 0xe91e63 }] });
+        await sendMessage(token, game.gameChannelId, { embeds: [{ title: i18n.game.coupleBroken, description: [i18n.game.coupleGrief(pDisplay), "", i18n.game.chasseurWas(pRoleInfo.emoji, getRoleName(pRoleKey, game.lang ?? "fr"))].join("\n"), color: 0xe91e63 }] });
+        await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `${pName} meurt de chagrin (couple). C'était ${getRoleName(pRoleKey, game.lang ?? "fr")}.`);
       }
     }
 
@@ -1863,21 +2038,22 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
 async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const s = parseChasseurFromEmbed(interaction.message);
-  if (!s) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
-  if (userId !== s.chasseurId) return json({ type: 4, data: { content: "❌ Seul le chasseur peut tirer.", flags: 64 } });
+  if (!s) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(s.lang ?? "fr");
+  if (userId !== s.chasseurId) return json({ type: 4, data: { content: i18n.errors.onlyChasseur, flags: 64 } });
 
   const customId: string = interaction.data?.custom_id || "";
   const targetId = customId.replace(`chasseur_shoot_${s.gameNumber}_`, "");
   const target = s.targets.find(t => t.id === targetId);
-  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+  if (!target) return json({ type: 4, data: { content: i18n.errors.invalidTarget, flags: 64 } });
 
   const token = env.DISCORD_BOT_TOKEN;
 
   const ackResponse = json({ type: 7, data: {
     embeds: [{
-      title: `🏹 Le chasseur tire! — Partie #${s.gameNumber}`,
+      title: i18n.game.chasseurShotTitle(s.gameNumber),
       url: `https://garou.bot/hs/${encodeChasseurState(s)}`,
-      description: `**${target.name}** (<@${target.id}>) est abattu(e) par le chasseur!`,
+      description: i18n.game.chasseurShootDesc(`**${target.name}** (<@${target.id}>)`),
       color: 0xe67e22, thumbnail: { url: getRoleImage("chasseur") },
     }],
     components: [],
@@ -1890,6 +2066,7 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
       game = parseGameFromEmbed(lobbyMsg);
     } catch {}
     if (!game) return;
+    const gi18n = t(game.lang ?? "fr");
     if (!game.dead) game.dead = [];
     game.dead.push(target.id);
 
@@ -1898,11 +2075,11 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
     const tDisplay = target.id.startsWith("bot_") ? `🤖 **${target.name}**` : `**${target.name}** (<@${target.id}>)`;
     await sendMessage(token, s.gameChannelId, {
       embeds: [{
-        title: "🏹 Le chasseur tire une dernière flèche!",
+        title: gi18n.game.chasseurShoot,
         description: [
-          `Dans un dernier souffle, le chasseur abat ${tDisplay}!`,
+          gi18n.game.chasseurShootDesc(tDisplay),
           "",
-          `${tRoleInfo.emoji} C'était **${tRoleInfo.name}**!`,
+          gi18n.game.chasseurWas(tRoleInfo.emoji, getRoleName(tRoleKey, game.lang ?? "fr")),
         ].join("\n"),
         color: 0xe67e22, thumbnail: { url: getRoleImage(tRoleKey) }, image: { url: SCENE_IMAGES.snipe_reveal },
       }],
@@ -1926,7 +2103,7 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
         const pDisplay = partnerId.startsWith("bot_") ? `🤖 **${pName}**` : `**${pName}** (<@${partnerId}>)`;
         await sleep(2000);
         await sendMessage(token, s.gameChannelId, {
-          embeds: [{ title: "💔 Le couple est brisé...", description: [`${pDisplay} meurt de chagrin.`, "", `${pRoleInfo.emoji} C'était **${pRoleInfo.name}**!`].join("\n"), color: 0xe91e63 }],
+          embeds: [{ title: gi18n.game.coupleBroken, description: [gi18n.game.coupleGrief(pDisplay), "", gi18n.game.chasseurWas(pRoleInfo.emoji, getRoleName(pRoleKey, game.lang ?? "fr"))].join("\n"), color: 0xe91e63 }],
         });
       }
     }
@@ -1964,12 +2141,13 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
   const s = parseChasseurFromEmbed(msg);
   if (!s) return;
 
+  const i18n = t(s.lang ?? "fr");
   const target = s.targets[Math.floor(Math.random() * s.targets.length)]!;
   await editMessage(token, gameChannelId, chasseurMessageId, {
     embeds: [{
-      title: `🏹 Le chasseur tire! — Partie #${s.gameNumber}`,
+      title: i18n.game.chasseurShotTitle(s.gameNumber),
       url: `https://garou.bot/hs/${encodeChasseurState(s)}`,
-      description: `Temps écoulé... **${target.name}** est abattu(e) au hasard!`,
+      description: i18n.game.chasseurTimeoutDesc(target.name),
       color: 0xe67e22,
     }],
     components: [],
@@ -1977,6 +2155,7 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
   let game: GameState | null = null;
   try { const lm: any = await getMessage(token, s.gameChannelId, s.lobbyMessageId); game = parseGameFromEmbed(lm); } catch {}
   if (!game) return;
+  const gi18n = t(game.lang ?? "fr");
   if (!game.dead) game.dead = [];
   game.dead.push(target.id);
   try { await setChannelPermission(token, s.gameChannelId, target.id, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
@@ -1986,11 +2165,11 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
   const tDisplay2 = target.id.startsWith("bot_") ? `🤖 **${target.name}**` : `**${target.name}** (<@${target.id}>)`;
   await sendMessage(token, s.gameChannelId, {
     embeds: [{
-      title: "🏹 Le chasseur tire une dernière flèche!",
+      title: gi18n.game.chasseurShoot,
       description: [
-        `Dans un dernier souffle, le chasseur abat ${tDisplay2}!`,
+        gi18n.game.chasseurShootDesc(tDisplay2),
         "",
-        `${tRoleInfo2.emoji} C'était **${tRoleInfo2.name}**!`,
+        gi18n.game.chasseurWas(tRoleInfo2.emoji, getRoleName(tRoleKey2, game.lang ?? "fr")),
       ].join("\n"),
       color: 0xe67e22, thumbnail: { url: getRoleImage(tRoleKey2) }, image: { url: SCENE_IMAGES.snipe_reveal },
     }],
@@ -2007,7 +2186,7 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
       const pRoleInfo2 = ROLES[pRoleKey2] ?? ROLES.villageois!;
       const pDisplay2 = pid.startsWith("bot_") ? `🤖 **${pn}**` : `**${pn}** (<@${pid}>)`;
       await sleep(2000);
-      await sendMessage(token, s.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: [`${pDisplay2} meurt de chagrin.`, "", `${pRoleInfo2.emoji} C'était **${pRoleInfo2.name}**!`].join("\n"), color: 0xe91e63 }] });
+      await sendMessage(token, s.gameChannelId, { embeds: [{ title: gi18n.game.coupleBroken, description: [gi18n.game.coupleGrief(pDisplay2), "", gi18n.game.chasseurWas(pRoleInfo2.emoji, getRoleName(pRoleKey2, game.lang ?? "fr"))].join("\n"), color: 0xe91e63 }] });
     }
   }
 
@@ -2025,12 +2204,13 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
 
 async function startWolfPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   console.log(`[wolfPhase] 🐺 Starting wolf phase for game #${game.gameNumber}`);
+  const i18n = t(game.lang ?? "fr");
   if (!game.roles) { console.error("[wolfPhase] No roles!"); return; }
 
   // Show wolf wake-up animation in game channel
   await updatePhaseStatus(token, game,
-    "🐺 Les loups-garous se réveillent...",
-    `*Des ombres se faufilent dans la nuit...*\n*Les loups-garous ouvrent les yeux et choisissent leur victime.*\n\n⏰ Les loups ont **${NIGHT_VOTE_SECONDS} secondes** pour décider.`,
+    i18n.game.wolfWake,
+    i18n.game.wolfWakeDesc(NIGHT_VOTE_SECONDS),
     EMBED_COLOR_NIGHT, getRoleImage("loup"),
   );
 
@@ -2083,10 +2263,11 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     couple: game.couple, allRoles: game.roles,
     allPlayers: [...livingPlayers, ...bots.filter((b) => b.alive).map((b) => b.id)],
     wolfNames,
+    lang: game.lang,
   };
 
   const wolfThread: any = await createThread(token, game.gameChannelId, {
-    name: "🐺 Tanière", type: 12, auto_archive_duration: 1440,
+    name: i18n.game.wolfThreadName, type: 12, auto_archive_duration: 1440,
   });
   game.wolfChannelId = wolfThread.id;
   voteState.wolfChannelId = wolfThread.id;
@@ -2096,20 +2277,24 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     await addThreadMember(token, wolfThread.id, wolfId);
   }
 
-  // If petite fille is alive, create spy thread
-  const petiteFilleId = livingPlayers.find(id => game.roles![id] === "petite_fille");
+  // If petite fille is alive (human or bot), create spy thread
+  const petiteFilleId = livingPlayers.find(id => game.roles![id] === "petite_fille")
+    ?? bots.find(b => b.alive && game.roles![b.id] === "petite_fille")?.id;
   if (petiteFilleId) {
     const spyThread: any = await createThread(token, game.gameChannelId, {
-      name: "👧 Espionnage", type: 12, auto_archive_duration: 1440,
+      name: i18n.game.petiteFilleThreadName, type: 12, auto_archive_duration: 1440,
     });
     game.petiteFilleThreadId = spyThread.id;
     voteState.petiteFilleThreadId = spyThread.id;
 
-    await addThreadMember(token, spyThread.id, petiteFilleId);
+    // Only add human petite fille to thread (bots read messages at dawn)
+    if (!petiteFilleId.startsWith("bot_")) {
+      await addThreadMember(token, spyThread.id, petiteFilleId);
+    }
     await sendMessage(token, spyThread.id, {
       embeds: [{
-        title: "👧 Petite Fille — Espionnage nocturne",
-        description: "Tu espionnes les loups-garous cette nuit...\n\nTu verras leurs messages apparaître ici en temps réel.\nIls ne savent pas que tu les observes.\n\n*Fais attention à ne pas te faire repérer...*",
+        title: i18n.game.petiteFilleTitle,
+        description: i18n.game.petiteFilleDesc,
         color: 0x9b59b6, thumbnail: { url: getRoleImage("petite_fille") },
       }],
     });
@@ -2119,17 +2304,49 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     ctx.waitUntil(gatewayTrackThread(env, wolfThread.id, spyThread.id, wolfIndices).catch(() => {}));
   }
 
-  // If ALL wolves are bots, skip the whole thread/vote UI — just pick a random victim after 5s
+  // If ALL wolves are bots, use LLM to pick a victim
   if (humanWolfIds.length === 0) {
-    console.log(`[wolfPhase] All wolves are bots — auto-picking victim in 5s`);
+    console.log(`[wolfPhase] All wolves are bots — LLM picking victim`);
     await sendMessage(token, wolfThread.id, {
-      content: `🌙 **La nuit est tombée!** Les loups choisissent leur victime...`,
+      content: i18n.game.wolfNightFallenBots,
     });
 
-    await sleep(5000);
+    await sleep(3000);
 
-    // Pick a random non-wolf target
-    const victim = targets[Math.floor(Math.random() * targets.length)];
+    // Use first wolf bot's perspective for LLM decision
+    const leadWolf = bots.find((b) => botWolfIds.includes(b.id) && b.alive);
+    let victim: { id: string; name: string } | undefined;
+    if (leadWolf && targets.length > 0) {
+      try {
+        const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, leadWolf.id);
+        const history = await loadHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+        const prompt = buildBotPrompt({
+          bot: leadWolf, role: botMem.role || "loup", phase: "night_vote",
+          alivePlayers: targets, aliveHumans: [], aliveBots: bots.filter((b) => b.alive),
+          gameHistory: history, knownInfo: "", botMemory: botMem,
+          targetOptions: targets,
+        });
+        const raw = await callLLM(prompt, env);
+        console.log(`[wolfPhase] All-bots LLM raw: ${raw.slice(0, 200)}`);
+        const parsed = parseLLMResponse(raw, "night_vote", targets);
+        console.log(`[wolfPhase] All-bots parsed:`, JSON.stringify(parsed));
+        if (parsed && "action" in parsed) {
+          victim = targets.find((t) => t.id === (parsed as BotDecisionResult).action);
+          if (victim) {
+            console.log(`[wolfPhase] All-bots chose: ${victim.name}`);
+            // Post the wolf's message
+            await sendMessage(token, wolfThread.id, {
+              content: `**${leadWolf.emoji} ${leadWolf.name}** : "${(parsed as BotDecisionResult).message}"`,
+            });
+          }
+        }
+      } catch (err) {
+        console.error("[wolfPhase] LLM failed for bot wolves:", err);
+      }
+    }
+    if (!victim) {
+      victim = targets[Math.floor(Math.random() * targets.length)];
+    }
     if (!victim) {
       console.error("[wolfPhase] No targets available!");
       try { await deleteChannel(token, wolfThread.id); } catch {}
@@ -2140,8 +2357,8 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     // Post result in wolf thread
     await sendMessage(token, wolfThread.id, {
       embeds: [{
-        title: `☠️ La meute a choisi — Partie #${game.gameNumber}`,
-        description: `**${victim.name}** sera dévoré(e) cette nuit.`,
+        title: i18n.game.wolfChose(game.gameNumber),
+        description: i18n.game.wolfVictim(victim.name, ""),
         color: EMBED_COLOR,
         image: { url: SCENE_IMAGES.night_kill },
       }],
@@ -2163,17 +2380,39 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
   // There are human wolves — use the normal vote UI
   const wolfMentions = humanWolfIds.map(id => `<@${id}>`).join(" ");
   await sendMessage(token, wolfThread.id, {
-    content: `${wolfMentions}\n\n🌙 **La nuit est tombée!** Choisissez votre victime ci-dessous.`,
+    content: `${wolfMentions}\n\n${i18n.game.wolfNightFallen}`,
   });
   const voteMsg: any = await sendMessage(token, wolfThread.id, buildVoteEmbed(voteState));
 
-  // Pre-fill bot wolf votes immediately (no delay, no LLM)
+  // Pre-fill bot wolf votes with LLM
   for (const botWolf of bots.filter((b) => b.alive && botWolfIds.includes(b.id))) {
-    const fd = fallbackDecision(targets, botWolf.id);
-    voteState.votes[botWolf.id] = fd.action;
-    console.log(`[wolfPhase] Bot ${botWolf.name} pre-voted for ${fd.action}`);
+    let decision: BotDecisionResult;
+    try {
+      const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, botWolf.id);
+      const history = await loadHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+      const prompt = buildBotPrompt({
+        bot: botWolf, role: botMem.role || "loup", phase: "night_vote",
+        alivePlayers: targets, aliveHumans: [], aliveBots: bots.filter((b) => b.alive),
+        gameHistory: history, knownInfo: "", botMemory: botMem,
+        targetOptions: targets,
+      });
+      const raw = await callLLM(prompt, env);
+      console.log(`[wolfPhase] ${botWolf.name} pre-vote LLM raw: ${raw.slice(0, 200)}`);
+      const parsed = parseLLMResponse(raw, "night_vote", targets);
+      console.log(`[wolfPhase] ${botWolf.name} pre-vote parsed:`, JSON.stringify(parsed));
+      if (parsed && "action" in parsed && (parsed as BotDecisionResult).action !== "discuss") {
+        decision = parsed as BotDecisionResult;
+      } else {
+        decision = fallbackDecision(targets, botWolf.id);
+      }
+    } catch (err) {
+      console.error(`[wolfPhase] LLM failed for bot wolf ${botWolf.name}:`, err);
+      decision = fallbackDecision(targets, botWolf.id);
+    }
+    voteState.votes[botWolf.id] = decision.action;
+    console.log(`[wolfPhase] Bot ${botWolf.name} pre-voted for ${decision.action}`);
     await sendMessage(token, wolfThread.id, {
-      content: `**${botWolf.emoji} ${botWolf.name}** : "${fd.message}"`,
+      content: `**${botWolf.emoji} ${botWolf.name}** : "${decision.message}"`,
     });
   }
 
@@ -2199,6 +2438,7 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
 
 async function startNightPhase(token: string, game: GameState, ctx: ExecutionContext, env: Env) {
   console.log(`[nightStart] 🌙 Starting night #${(game.nightCount ?? 0) + 1} for game #${game.gameNumber}, players: ${game.players.length}, dead: ${(game.dead ?? []).length}`);
+  const i18n = t(game.lang ?? "fr");
   if (!game.roles) { console.error("[nightStart] No roles assigned!"); return; }
 
   // Increment night count and persist
@@ -2230,8 +2470,8 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
   }
 
   await updatePhaseStatus(token, game,
-    `🌙 Nuit ${game.nightCount} — Le village s'endort...`,
-    "*Chaque villageois ferme les yeux...*\n*Le silence envahit le village...*",
+    i18n.game.nightTitle(game.nightCount),
+    `${i18n.game.villagersSleep}\n${i18n.game.silenceFalls}`,
     EMBED_COLOR_NIGHT, SCENE_IMAGES.night_falls,
   );
 
@@ -2254,21 +2494,61 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
       const botTargets = cupBots.filter(b => b.alive && b.id !== cupidonId && !dead.includes(b.id)).map(b => ({ id: b.id, name: b.name }));
       const playerTargets = [...humanTargets, ...botTargets];
 
-      // BOT AUTO-PLAY: If cupidon is a bot, pick 2 random targets instantly
+      // BOT AUTO-PLAY: If cupidon is a bot, use LLM to pick couple
       if (cupidonId.startsWith("bot_")) {
         await updatePhaseStatus(token, game,
-          "💘 Cupidon se réveille...",
-          "*Cupidon bande son arc et choisit deux âmes à lier...*",
+          i18n.game.cupidonWake,
+          i18n.game.cupidonWakeDesc,
           EMBED_COLOR_PURPLE, getRoleImage("cupidon"),
         );
         await sleep(3000);
         console.log(`[cupidon] Bot ${cupidonId} auto-picking couple`);
         if (playerTargets.length >= 2) {
-          const shuffled = [...playerTargets].sort(() => Math.random() - 0.5);
-          const pick1 = shuffled[0]!;
-          const pick2 = shuffled[1]!;
+          let pick1 = playerTargets[0]!;
+          let pick2 = playerTargets[1]!;
+
+          const botCupidon = cupBots.find((b) => b.id === cupidonId);
+          if (botCupidon) {
+            try {
+              const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, cupidonId);
+              const history = await loadHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+              const prompt = buildBotPrompt({
+                bot: botCupidon, role: "cupidon", phase: "cupidon_pick",
+                alivePlayers: playerTargets, aliveHumans: [], aliveBots: cupBots.filter((b) => b.alive),
+                gameHistory: history, knownInfo: "", botMemory: botMem,
+                targetOptions: playerTargets,
+              });
+              const raw = await callLLM(prompt, env);
+              console.log(`[cupidon] Bot LLM raw: ${raw.slice(0, 200)}`);
+              const parsed = parseLLMResponse(raw, "cupidon_pick", playerTargets);
+              console.log(`[cupidon] Bot parsed:`, JSON.stringify(parsed));
+              if (parsed && "target1" in parsed) {
+                const cupResp = parsed as ParsedCupidonResponse;
+                const m1 = playerTargets.find((t) => t.id === cupResp.target1);
+                const m2 = playerTargets.find((t) => t.id === cupResp.target2);
+                if (m1 && m2) { pick1 = m1; pick2 = m2; }
+              }
+            } catch (err) {
+              console.error(`[cupidon] LLM failed for bot cupidon:`, err);
+            }
+          }
+
           game.couple = [pick1.id, pick2.id];
           console.log(`[cupidon] Bot chose couple: ${pick1.name} + ${pick2.name}`);
+
+          // Set couple partner in memory for both bots
+          for (const pid of [pick1.id, pick2.id]) {
+            if (pid.startsWith("bot_")) {
+              try {
+                const mem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, pid);
+                const partnerId = pid === pick1.id ? pick2.id : pick1.id;
+                const partnerName = pid === pick1.id ? pick2.name : pick1.name;
+                mem.couplePartner = partnerName;
+                await saveBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, pid, mem);
+              } catch {}
+            }
+          }
+
           // Persist couple in game state
           if (game.lobbyMessageId) {
             const su = `https://garou.bot/s/${encodeState(game)}`;
@@ -2284,8 +2564,8 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
       }
 
       await updatePhaseStatus(token, game,
-        "💘 Cupidon se réveille...",
-        "*Cupidon bande son arc et choisit deux âmes à lier...*",
+        i18n.game.cupidonWake,
+        i18n.game.cupidonWakeDesc,
         EMBED_COLOR_PURPLE, getRoleImage("cupidon"),
       );
 
@@ -2302,6 +2582,7 @@ async function startNightPhase(token: string, game: GameState, ctx: ExecutionCon
           gameChannelId: game.gameChannelId, lobbyMessageId: game.lobbyMessageId!,
           cupidonId, players: playerTargets, picks: [], deadline,
           roles: game.roles, allPlayers: game.players,
+          lang: game.lang,
         };
 
         await sendMessage(token, cupidonThread.id, {
@@ -2356,10 +2637,59 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
   const targets = [...humanTargets, ...botTargets];
   console.log(`[voyante] Targets: ${targets.map(t => t.name).join(", ")} (${humanTargets.length} humans, ${botTargets.length} bots)`);
 
-  // BOT AUTO-PLAY: If voyante is a bot, skip instantly (just look at a random person, no visible effect)
+  // BOT AUTO-PLAY: If voyante is a bot, use LLM to pick target and store result
   if (voyanteId.startsWith("bot_")) {
-    const pick = targets[Math.floor(Math.random() * targets.length)];
-    console.log(`[voyante] Bot ${voyanteId} auto-spied on ${pick?.name ?? "nobody"}`);
+    const botVoyante = bots.find((b) => b.id === voyanteId);
+    let pick = targets[Math.floor(Math.random() * targets.length)];
+
+    if (botVoyante && targets.length > 0) {
+      try {
+        const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, voyanteId);
+        const history = await loadHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+        // Filter out already-checked players
+        const checkedNames = botMem.voyanteResults.map((r) => r.name);
+        const unchecked = targets.filter((t) => !checkedNames.includes(t.name));
+        const spyTargets = unchecked.length > 0 ? unchecked : targets;
+
+        const prompt = buildBotPrompt({
+          bot: botVoyante, role: "voyante", phase: "voyante_spy",
+          alivePlayers: targets, aliveHumans: [], aliveBots: bots.filter((b) => b.alive),
+          gameHistory: history, knownInfo: "", botMemory: botMem,
+          targetOptions: spyTargets,
+        });
+        const raw = await callLLM(prompt, env);
+        console.log(`[voyante] Bot LLM raw: ${raw.slice(0, 200)}`);
+        const parsed = parseLLMResponse(raw, "voyante_spy", spyTargets);
+        console.log(`[voyante] Bot parsed:`, JSON.stringify(parsed));
+        if (parsed && "action" in parsed) {
+          const matchedTarget = targets.find((t) => t.id === (parsed as BotDecisionResult).action);
+          if (matchedTarget) pick = matchedTarget;
+        }
+      } catch (err) {
+        console.error(`[voyante] LLM failed for bot voyante:`, err);
+      }
+    }
+
+    if (pick) {
+      // Look up target's actual role and store in memory
+      const targetRole = game.roles?.[pick.id] ?? "villageois";
+      const targetRoleName = ROLES[targetRole]?.name ?? "Villageois";
+      console.log(`[voyante] Bot ${voyanteId} spied on ${pick.name} → ${targetRoleName}`);
+
+      try {
+        const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, voyanteId);
+        botMem.voyanteResults.push({ name: pick.name, role: targetRoleName });
+        if (targetRole === "loup" || targetRole === "loup_blanc") {
+          if (!botMem.knownWolves.includes(pick.name)) botMem.knownWolves.push(pick.name);
+        } else {
+          if (!botMem.knownInnocents.includes(pick.name)) botMem.knownInnocents.push(pick.name);
+        }
+        await saveBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, voyanteId, botMem);
+      } catch (err) {
+        console.error(`[voyante] Failed to save bot memory:`, err);
+      }
+    }
+
     await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
     return;
   }
@@ -2798,12 +3128,45 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
     }
   }
 
+  // Enrich game history with dawn events
+  for (const d of deaths) {
+    const roleKey = game.roles?.[d.id] ?? "villageois";
+    const roleName = ROLES[roleKey]?.name ?? "Villageois";
+    await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Nuit: ${d.name} a été ${d.cause}. C'était ${roleName}.`);
+  }
+  if (_witchSaved) {
+    await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Nuit: La Sorcière a sauvé ${_wolfVictimName} avec sa potion de vie.`);
+  }
+  if (_witchKillId) {
+    const killName = deaths.find((d) => d.id === _witchKillId)?.name ?? _witchKillId;
+    await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Nuit: La Sorcière a empoisonné ${killName}.`);
+  }
+
   // Update witch potions: consume used potions
   if (_witchSaved && game.witchPotions) {
     game.witchPotions.life = false;
   }
   if (_witchKillId && game.witchPotions) {
     game.witchPotions.death = false;
+  }
+
+  // Inject wolf chat messages into petite fille bot memory (before deleting spy thread)
+  if (game.petiteFilleThreadId && game.roles) {
+    const petiteFilleId = Object.entries(game.roles).find(([id, r]) => r === "petite_fille" && !game.dead!.includes(id))?.[0];
+    if (petiteFilleId?.startsWith("bot_")) {
+      try {
+        const spyMsgs: any[] = await getChannelMessages(token, game.petiteFilleThreadId, undefined, 20);
+        const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, petiteFilleId);
+        botMem.wolfChatMessages = spyMsgs
+          .filter((m: any) => m.content && !m.embeds?.length) // Only text messages, not embeds
+          .map((m: any) => m.content)
+          .reverse(); // Chronological order
+        await saveBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, petiteFilleId, botMem);
+        console.log(`[phaseDawn] Petite fille bot ${petiteFilleId} received ${botMem.wolfChatMessages.length} wolf messages`);
+      } catch (err) {
+        console.error("[phaseDawn] Failed to inject wolf messages into petite fille memory:", err);
+      }
+    }
   }
 
   // Clean up petite fille spy thread if it exists
@@ -2941,11 +3304,82 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
     EMBED_COLOR_PURPLE, getRoleImage("sorciere"),
   );
 
-  // BOT AUTO-PLAY: If sorciere is a bot, skip instantly (don't use potions)
+  // BOT AUTO-PLAY: If sorciere is a bot, use LLM to decide
   if (sorciereId.startsWith("bot_")) {
-    console.log(`[sorciere] Bot ${sorciereId} auto-skipping (no potions used)`);
+    const botSorciere = (await loadBots(env.ACTIVE_PLAYERS, game.gameNumber)).find((b) => b.id === sorciereId);
+    let witchSaved = false;
+    let witchKillId: string | undefined;
+
+    if (botSorciere && (potions.life || potions.death)) {
+      try {
+        const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, sorciereId);
+        botMem.wolfVictimLastNight = _wolfVictimName;
+        const history = await loadHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+
+        // Build death potion targets
+        const targetIds = game.players.filter((id) => id !== sorciereId && !dead.includes(id));
+        const humanTargets = await Promise.all(
+          targetIds.map(async (id) => {
+            try {
+              const member: any = await getGuildMember(token, game.guildId, id);
+              return { id, name: member.nick || member.user.global_name || member.user.username };
+            } catch { return { id, name: id }; }
+          })
+        );
+        const soBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+        const soBotTargets = soBots.filter(b => b.alive && b.id !== sorciereId && !dead.includes(b.id)).map(b => ({ id: b.id, name: b.name }));
+        const deathTargets = [...humanTargets, ...soBotTargets];
+
+        const extraContext = [
+          `Victime des loups: ${_wolfVictimName}`,
+          `Potion de vie: ${potions.life ? "disponible" : "déjà utilisée"}`,
+          `Potion de mort: ${potions.death ? "disponible" : "déjà utilisée"}`,
+        ].join(". ");
+
+        const prompt = buildBotPrompt({
+          bot: botSorciere, role: "sorciere", phase: "sorciere_potion",
+          alivePlayers: deathTargets, aliveHumans: [], aliveBots: soBots.filter((b) => b.alive),
+          gameHistory: history, knownInfo: "", botMemory: botMem,
+          extraContext, targetOptions: deathTargets,
+        });
+        const raw = await callLLM(prompt, env);
+        console.log(`[sorciere] Bot LLM raw: ${raw.slice(0, 200)}`);
+        const parsed = parseLLMResponse(raw, "sorciere_potion", deathTargets);
+        console.log(`[sorciere] Bot parsed:`, JSON.stringify(parsed));
+
+        if (parsed && "action" in parsed) {
+          const soResp = parsed as ParsedSorciereResponse;
+          if (soResp.action === "save" && potions.life) {
+            witchSaved = true;
+            game.witchPotions!.life = false;
+            console.log(`[sorciere] Bot saved ${_wolfVictimName}`);
+          } else if (soResp.action === "kill" && potions.death && soResp.target) {
+            witchKillId = soResp.target;
+            game.witchPotions!.death = false;
+            console.log(`[sorciere] Bot killed ${witchKillId}`);
+          } else {
+            console.log(`[sorciere] Bot skipped`);
+          }
+        }
+        await saveBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, sorciereId, botMem);
+      } catch (err) {
+        console.error(`[sorciere] LLM failed for bot sorciere:`, err);
+      }
+    } else {
+      console.log(`[sorciere] Bot ${sorciereId} has no potions, skipping`);
+    }
+
     await sleep(3000);
-    await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
+    // Persist updated potions in game state
+    if (game.lobbyMessageId) {
+      const su = `https://garou.bot/s/${encodeState(game)}`;
+      try {
+        const m: any = await getMessage(token, game.gameChannelId, game.lobbyMessageId);
+        const e = m.embeds?.[0];
+        if (e) { e.url = su; await editMessage(token, game.gameChannelId, game.lobbyMessageId, { embeds: [e], components: m.components ?? [] }); }
+      } catch {}
+    }
+    await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: witchSaved, _witchKillId: witchKillId }, ctx, env);
     return;
   }
 
@@ -3229,12 +3663,55 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
 
   if (wolfTargetIds.length === 0) return; // No wolves to kill
 
-  // BOT AUTO-PLAY: If loup blanc is a bot, randomly kill a wolf or skip
+  // BOT AUTO-PLAY: If loup blanc is a bot, use LLM to decide kill or skip
   if (loupBlancId.startsWith("bot_")) {
-    const doKill = Math.random() < 0.5;
+    const lbBotsForLLM = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+    const botLoupBlanc = lbBotsForLLM.find((b) => b.id === loupBlancId);
+
+    // Build wolf targets list with names
+    const wolfTargetsNamed: { id: string; name: string }[] = [];
+    for (const id of wolfTargetIds) {
+      if (id.startsWith("bot_")) {
+        const bot = lbBotsForLLM.find(b => b.id === id);
+        if (bot) wolfTargetsNamed.push({ id, name: bot.name });
+      } else {
+        try {
+          const member: any = await getGuildMember(token, game.guildId, id);
+          wolfTargetsNamed.push({ id, name: member.nick || member.user.global_name || member.user.username });
+        } catch { wolfTargetsNamed.push({ id, name: id }); }
+      }
+    }
+
+    let doKill = Math.random() < 0.5;
+    let victimId: string | undefined;
+
+    if (botLoupBlanc && wolfTargetsNamed.length > 0) {
+      try {
+        const botMem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, loupBlancId);
+        const history = await loadHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+        const prompt = buildBotPrompt({
+          bot: botLoupBlanc, role: "loup_blanc", phase: "loup_blanc_kill",
+          alivePlayers: wolfTargetsNamed, aliveHumans: [], aliveBots: lbBotsForLLM.filter((b) => b.alive),
+          gameHistory: history, knownInfo: "", botMemory: botMem,
+          targetOptions: wolfTargetsNamed,
+        });
+        const raw = await callLLM(prompt, env);
+        console.log(`[loupBlanc] Bot LLM raw: ${raw.slice(0, 200)}`);
+        const parsed = parseLLMResponse(raw, "loup_blanc_kill", wolfTargetsNamed);
+        console.log(`[loupBlanc] Bot parsed:`, JSON.stringify(parsed));
+        if (parsed && "action" in parsed) {
+          const lbResp = parsed as ParsedLoupBlancResponse;
+          doKill = lbResp.action === "kill";
+          if (doKill && lbResp.target) victimId = lbResp.target;
+        }
+      } catch (err) {
+        console.error(`[loupBlanc] LLM failed for bot loup blanc:`, err);
+      }
+    }
+
     if (doKill && wolfTargetIds.length > 0) {
-      const victimId = wolfTargetIds[Math.floor(Math.random() * wolfTargetIds.length)]!;
-      console.log(`[loupBlanc] Bot ${loupBlancId} auto-killing wolf ${victimId}`);
+      if (!victimId) victimId = wolfTargetIds[Math.floor(Math.random() * wolfTargetIds.length)]!;
+      console.log(`[loupBlanc] Bot ${loupBlancId} killing wolf ${victimId}`);
 
       // Mark as dead
       if (!game.dead) game.dead = [];
@@ -3242,11 +3719,10 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
 
       // Mark bot as dead if it's a bot
       if (victimId.startsWith("bot_")) {
-        const lbBots2 = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
-        const victimBot = lbBots2.find(b => b.id === victimId);
+        const victimBot = lbBotsForLLM.find(b => b.id === victimId);
         if (victimBot) {
           victimBot.alive = false;
-          await saveBots(env.ACTIVE_PLAYERS, game.gameNumber, lbBots2);
+          await saveBots(env.ACTIVE_PLAYERS, game.gameNumber, lbBotsForLLM);
         }
       } else {
         // Set spectator perms for human
@@ -3263,7 +3739,7 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
         } catch {}
       }
     } else {
-      console.log(`[loupBlanc] Bot ${loupBlancId} auto-skipped`);
+      console.log(`[loupBlanc] Bot ${loupBlancId} skipped`);
     }
     return;
   }
@@ -3763,7 +4239,8 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
     for (const bot of aliveBots) {
       await sleep(2000 + Math.floor(Math.random() * 2000));
       try {
-        await executeBotDayVote(token, env, bot, bots, game.gameChannelId, voteMsg.id, game.gameNumber, "villageois", ctx);
+        const botRole = game.roles?.[bot.id] ?? "villageois";
+        await executeBotDayVote(token, env, bot, bots, game.gameChannelId, voteMsg.id, game.gameNumber, botRole, ctx);
       } catch (err) {
         console.error(`[dayVote] Bot ${bot.name} vote failed:`, err);
       }

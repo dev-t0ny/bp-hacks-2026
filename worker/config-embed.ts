@@ -9,6 +9,7 @@ import {
   bitmaskToRoles,
   type PresetConfig,
 } from "./roles";
+import { t, type Locale } from "./i18n";
 
 const MIN_PLAYERS = 4;
 const WOLF_IDS = new Set([47, 48, 49, 50, 51, 52, 53]);
@@ -30,6 +31,7 @@ export interface ConfigState {
   selectedRoles: number[];
   botCount: number;
   maxPlayers: number; // total players (humans + bots)
+  lang: Locale;
 }
 
 export function encodeConfigState(config: ConfigState): string {
@@ -46,6 +48,7 @@ export function encodeConfigState(config: ConfigState): string {
   };
   if (config.botCount) compact.bc = config.botCount;
   if (config.maxPlayers) compact.mp = config.maxPlayers;
+  if (config.lang && config.lang !== "fr") compact.ln = config.lang;
   return btoa(JSON.stringify(compact));
 }
 
@@ -66,6 +69,7 @@ export function decodeConfigState(url: string): ConfigState | null {
       selectedRoles: bitmaskToRoles(compact.rb ?? "0000000000000000"),
       botCount: compact.bc ?? 0,
       maxPlayers: compact.mp ?? 6,
+      lang: compact.ln ?? "fr",
     };
   } catch {
     return null;
@@ -84,6 +88,8 @@ function formatTime(seconds: number): string {
 // ── Step 1 Embed — Parameters ───────────────────────────────────────
 
 export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig[] = []) {
+  const i18n = t(config.lang);
+  const c = i18n.config;
   const stateUrl = `https://garou.bot/c/${encodeConfigState({ ...config, step: 1 })}`;
 
   const rolesCount = config.selectedRoles.length;
@@ -91,35 +97,43 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
   const loupsCount = config.selectedRoles.filter((id) => id >= 47 && id <= 53).length;
   const soloCount = config.selectedRoles.filter((id) => id >= 54).length;
 
+  const presetNames: Record<string, string> = {
+    Classique: i18n.presets.classique,
+    "Étendu": i18n.presets.etendu,
+    Chaos: i18n.presets.chaos,
+    "Loups+": i18n.presets.loupsPlus,
+  };
+  const displayPreset = config.presetName ? (presetNames[config.presetName] ?? config.presetName) : c.noPreset;
+
   const description = [
-    `> **Preset:** ${config.presetName || "Aucun"}`,
-    `> **Votes:** ${config.anonymousVotes ? "🔒 Anonyme" : "👁️ Public"} • **Discussion:** ${formatTime(config.discussionTime)} • **Vote:** ${formatTime(config.voteTime)}`,
-    `> **Joueurs:** ${config.maxPlayers} total (👥 ${config.maxPlayers - config.botCount} humains${config.botCount > 0 ? ` + 🤖 ${config.botCount} bots` : ""})`,
+    `> **${c.preset}:** ${displayPreset}`,
+    `> **${c.votes}:** ${config.anonymousVotes ? c.anonVote : c.publicVote} • **${c.discussion}:** ${formatTime(config.discussionTime)} • **${c.vote}:** ${formatTime(config.voteTime)}`,
+    `> **${c.players}:** ${config.maxPlayers} ${c.total} (👥 ${config.maxPlayers - config.botCount} ${c.humans}${config.botCount > 0 ? ` + 🤖 ${config.botCount} ${c.bots}` : ""})`,
     "",
-    `🎭 **Rôles:** ${rolesCount} sélectionnés`,
+    `🎭 **${c.rolesSelected}:** ${rolesCount} ${c.selected}`,
     rolesCount > 0
-      ? `> 🏘️ ${villCount} Villageois • 🐺 ${loupsCount} Loups • 🎭 ${soloCount} Solo`
-      : "> _Sélectionnez un preset ou configurez les rôles manuellement_",
+      ? `> 🏘️ ${villCount} ${c.villagers} • 🐺 ${loupsCount} ${c.wolves} • 🎭 ${soloCount} ${c.solo}`
+      : `> _${c.selectRolesHint}_`,
   ].join("\n");
 
   // Build preset options
   const presetOptions: any[] = [
     {
-      label: "Aucun",
+      label: c.noPreset,
       value: "none",
-      description: "Configuration manuelle",
+      description: c.manualConfig,
       default: !config.presetName,
     },
     ...DEFAULT_PRESETS.map((p) => ({
-      label: p.name,
+      label: presetNames[p.name] ?? p.name,
       value: p.name,
-      description: `${p.roles.length} rôles • ${p.anonymousVotes ? "Anonyme" : "Public"}`,
+      description: c.presetRoles(p.roles.length, p.anonymousVotes),
       default: config.presetName === p.name,
     })),
     ...customPresets.map((p) => ({
       label: `📌 ${p.name}`,
       value: `custom:${p.name}`,
-      description: `${p.roles.length} rôles • Preset serveur`,
+      description: c.serverPreset(p.roles.length),
       default: config.presetName === p.name,
     })),
   ];
@@ -127,12 +141,12 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
   return {
     embeds: [
       {
-        title: "🐺 Nouvelle Partie — Configuration",
+        title: c.title,
         url: stateUrl,
         description,
         color: 0x8b0000,
         image: { url: "https://raw.githubusercontent.com/dev-t0ny/bp-hacks-2026/main/garou/assets/scenes/game_start.png" },
-        footer: { text: "Étape 1/2 — Paramètres" },
+        footer: { text: c.step1Footer },
       },
     ],
     components: [
@@ -141,8 +155,24 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
         components: [
           {
             type: 3,
+            custom_id: "cfg_lang",
+            placeholder: c.langLabel,
+            min_values: 1,
+            max_values: 1,
+            options: [
+              { label: c.langFr, value: "fr", default: config.lang === "fr" },
+              { label: c.langEn, value: "en", default: config.lang === "en" },
+            ],
+          },
+        ],
+      },
+      {
+        type: 1,
+        components: [
+          {
+            type: 3,
             custom_id: "cfg_preset",
-            placeholder: "🎮 Choisir un preset...",
+            placeholder: c.selectPreset,
             min_values: 1,
             max_values: 1,
             options: presetOptions.slice(0, 25),
@@ -155,18 +185,14 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
           {
             type: 3,
             custom_id: "cfg_max_players",
-            placeholder: "👥 Nombre de joueurs",
+            placeholder: c.playerCount,
             min_values: 1,
             max_values: 1,
-            options: [
-              { label: "4 joueurs", value: "4", default: config.maxPlayers === 4 },
-              { label: "5 joueurs", value: "5", default: config.maxPlayers === 5 },
-              { label: "6 joueurs", value: "6", default: config.maxPlayers === 6 },
-              { label: "7 joueurs", value: "7", default: config.maxPlayers === 7 },
-              { label: "8 joueurs", value: "8", default: config.maxPlayers === 8 },
-              { label: "10 joueurs", value: "10", default: config.maxPlayers === 10 },
-              { label: "12 joueurs", value: "12", default: config.maxPlayers === 12 },
-            ],
+            options: [4, 5, 6, 7, 8, 10, 12].map((n) => ({
+              label: c.nPlayers(n),
+              value: String(n),
+              default: config.maxPlayers === n,
+            })),
           },
         ],
       },
@@ -176,37 +202,14 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
           {
             type: 3,
             custom_id: "cfg_bots",
-            placeholder: "🤖 Nombre de bots IA",
+            placeholder: c.botCount,
             min_values: 1,
             max_values: 1,
-            options: [
-              { label: "Aucun bot", value: "0", default: config.botCount === 0 },
-              { label: "1 bot", value: "1", default: config.botCount === 1 },
-              { label: "2 bots", value: "2", default: config.botCount === 2 },
-              { label: "3 bots", value: "3", default: config.botCount === 3 },
-              { label: "4 bots", value: "4", default: config.botCount === 4 },
-              { label: "5 bots", value: "5", default: config.botCount === 5 },
-            ],
-          },
-        ],
-      },
-      {
-        type: 1,
-        components: [
-          {
-            type: 3,
-            custom_id: "cfg_timers",
-            placeholder: "⏱️ Temps (discussion / vote)",
-            min_values: 1,
-            max_values: 1,
-            options: [
-              { label: "Ultra rapide — 30s / 30s", value: "30_30", default: config.discussionTime === 30 && config.voteTime === 30 },
-              { label: "Rapide — 1m / 30s", value: "60_30", default: config.discussionTime === 60 && config.voteTime === 30 },
-              { label: "Rapide — 1m30 / 30s", value: "90_30", default: config.discussionTime === 90 && config.voteTime === 30 },
-              { label: "Normal — 2m / 1m", value: "120_60", default: config.discussionTime === 120 && config.voteTime === 60 },
-              { label: "Long — 3m / 1m30", value: "180_90", default: config.discussionTime === 180 && config.voteTime === 90 },
-              { label: "Très long — 3m30 / 2m", value: "210_120", default: config.discussionTime === 210 && config.voteTime === 120 },
-            ],
+            options: [0, 1, 2, 3, 4, 5].map((n) => ({
+              label: c.nBots(n),
+              value: String(n),
+              default: config.botCount === n,
+            })),
           },
         ],
       },
@@ -216,25 +219,25 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
           {
             type: 2,
             style: config.anonymousVotes ? 2 : 1,
-            label: "👁️ Public",
+            label: c.publicVote,
             custom_id: "cfg_votes_public",
           },
           {
             type: 2,
             style: config.anonymousVotes ? 1 : 2,
-            label: "🔒 Anonyme",
+            label: c.anonVote,
             custom_id: "cfg_votes_anonyme",
           },
           {
             type: 2,
             style: 1,
-            label: "Configurer les rôles →",
+            label: c.configureRoles,
             custom_id: "cfg_next",
           },
           {
             type: 2,
             style: 3,
-            label: "Créer avec preset",
+            label: c.createWithPreset,
             custom_id: "cfg_create",
             disabled: !configIsValid(config.selectedRoles),
           },
@@ -247,6 +250,8 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
 // ── Step 2 Embed — Roles ────────────────────────────────────────────
 
 export function buildStep2Embed(config: ConfigState) {
+  const i18n = t(config.lang);
+  const c = i18n.config;
   const stateUrl = `https://garou.bot/c/${encodeConfigState({ ...config, step: 2 })}`;
 
   const villCount = config.selectedRoles.filter((id) => id <= 46).length;
@@ -254,12 +259,20 @@ export function buildStep2Embed(config: ConfigState) {
   const soloCount = config.selectedRoles.filter((id) => id >= 54).length;
   const total = config.selectedRoles.length;
 
+  const presetNames: Record<string, string> = {
+    Classique: i18n.presets.classique,
+    "Étendu": i18n.presets.etendu,
+    Chaos: i18n.presets.chaos,
+    "Loups+": i18n.presets.loupsPlus,
+  };
+  const displayPreset = config.presetName ? (presetNames[config.presetName] ?? config.presetName) : c.manual;
+
   const description = [
-    `> **Preset:** ${config.presetName || "Manuel"}`,
-    `> **Votes:** ${config.anonymousVotes ? "🔒 Anonyme" : "👁️ Public"} • **Discussion:** ${formatTime(config.discussionTime)} • **Vote:** ${formatTime(config.voteTime)}`,
+    `> **${c.preset}:** ${displayPreset}`,
+    `> **${c.votes}:** ${config.anonymousVotes ? c.anonVote : c.publicVote} • **${c.discussion}:** ${formatTime(config.discussionTime)} • **${c.vote}:** ${formatTime(config.voteTime)}`,
     "",
-    `🎭 **Rôles sélectionnés:** ${total}`,
-    `> 🏘️ ${villCount} Villageois • 🐺 ${loupsCount} Loups • 🎭 ${soloCount} Solo`,
+    `🎭 **${c.rolesSelected} ${c.selected}:** ${total}`,
+    `> 🏘️ ${villCount} ${c.villagers} • 🐺 ${loupsCount} ${c.wolves} • 🎭 ${soloCount} ${c.solo}`,
   ].join("\n");
 
   const selectedSet = new Set(config.selectedRoles);
@@ -275,7 +288,7 @@ export function buildStep2Embed(config: ConfigState) {
           min_values: 0,
           max_values: roles.length,
           options: roles.map((r) => ({
-            label: r.name,
+            label: i18n.allRoleNames[r.id] ?? r.name,
             value: String(r.id),
             default: selectedSet.has(r.id),
           })),
@@ -287,39 +300,39 @@ export function buildStep2Embed(config: ConfigState) {
   return {
     embeds: [
       {
-        title: "🐺 Nouvelle Partie — Rôles",
+        title: c.step2Title,
         url: stateUrl,
         description,
         color: 0x8b0000,
         image: { url: "https://raw.githubusercontent.com/dev-t0ny/bp-hacks-2026/main/garou/assets/scenes/game_start.png" },
-        footer: { text: "Étape 2/2 — Sélection des rôles" },
+        footer: { text: c.step2Footer },
       },
     ],
     components: [
-      buildRoleMenu("cfg_roles_v1", "🏘️ Villageois (1/2)", VILLAGEOIS_GROUP_1),
-      buildRoleMenu("cfg_roles_v2", "🏘️ Villageois (2/2)", VILLAGEOIS_GROUP_2),
-      buildRoleMenu("cfg_roles_loups", "🐺 Loups-Garous", LOUPS_ROLES),
-      buildRoleMenu("cfg_roles_solo", "🎭 Solitaires", SOLITAIRE_ROLES),
+      buildRoleMenu("cfg_roles_v1", c.villageoisGroup1, VILLAGEOIS_GROUP_1),
+      buildRoleMenu("cfg_roles_v2", c.villageoisGroup2, VILLAGEOIS_GROUP_2),
+      buildRoleMenu("cfg_roles_loups", c.loupsGroup, LOUPS_ROLES),
+      buildRoleMenu("cfg_roles_solo", c.soloGroup, SOLITAIRE_ROLES),
       {
         type: 1,
         components: [
           {
             type: 2,
             style: 2,
-            label: "← Retour",
+            label: c.back,
             custom_id: "cfg_back",
           },
           {
             type: 2,
             style: 3,
-            label: "Créer la partie",
+            label: c.createGame,
             custom_id: "cfg_create",
             disabled: !configIsValid(config.selectedRoles),
           },
           {
             type: 2,
             style: 1,
-            label: "Sauvegarder preset",
+            label: c.savePreset,
             custom_id: "cfg_save",
             disabled: total === 0,
           },

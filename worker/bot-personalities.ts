@@ -1,3 +1,5 @@
+import { t, type Locale } from "./i18n";
+
 export interface BotPersonality {
   name: string;
   traits: string[];
@@ -30,8 +32,14 @@ export const BOT_POOL: BotPersonality[] = [
   { name: "Gustave", traits: ["têtu", "loyal"], emoji: "🫡" },
 ];
 
-/** Pick `count` unique random personalities from the pool */
-export function pickBots(count: number): BotPersonality[] {
-  const shuffled = [...BOT_POOL].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, Math.min(count, BOT_POOL.length));
+/** Pick `count` unique random bot personalities, localized */
+export function pickBots(count: number, lang: Locale = "fr"): BotPersonality[] {
+  const i18n = t(lang);
+  const pool = BOT_POOL.map((bot, idx) => {
+    const localName = i18n.botNames[idx] ?? bot.name;
+    const localTraits = i18n.botTraits[localName] ?? bot.traits;
+    return { name: localName, traits: localTraits, emoji: bot.emoji };
+  });
+  const shuffled = [...pool].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, Math.min(count, pool.length));
 }
