@@ -200,6 +200,8 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
             min_values: 1,
             max_values: 1,
             options: [
+              { label: "Ultra rapide — 30s / 30s", value: "30_30", default: config.discussionTime === 30 && config.voteTime === 30 },
+              { label: "Rapide — 1m / 30s", value: "60_30", default: config.discussionTime === 60 && config.voteTime === 30 },
               { label: "Rapide — 1m30 / 30s", value: "90_30", default: config.discussionTime === 90 && config.voteTime === 30 },
               { label: "Normal — 2m / 1m", value: "120_60", default: config.discussionTime === 120 && config.voteTime === 60 },
               { label: "Long — 3m / 1m30", value: "180_90", default: config.discussionTime === 180 && config.voteTime === 90 },

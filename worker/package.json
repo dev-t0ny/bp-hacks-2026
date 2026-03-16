@@ -3,14 +3,19 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0",
+    "@cloudflare/workers-types": "^4.20250313.0"
   }
 }
