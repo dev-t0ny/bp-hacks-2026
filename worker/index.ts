@@ -2524,26 +2524,58 @@ async function announceVictory(token: string, game: GameState, result: WinResult
     revealLines.push(`${status} ${role.emoji} 🤖 ${bot.name} — **${role.name}**`);
   }
 
-  await sendMessage(token, game.gameChannelId, {
-    embeds: [{
-      title: result.title,
-      description: [
-        result.description,
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        "**Récapitulatif des rôles:**",
-        "",
-        ...revealLines,
-        "",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        `🎮 **Partie #${game.gameNumber}** terminée!`,
-      ].join("\n"),
-      color: result.winner === "village" ? EMBED_COLOR_GREEN : EMBED_COLOR,
-      image: { url: result.image },
-    }],
-  });
+  const victoryEmbed = {
+    title: result.title,
+    description: [
+      result.description,
+      "",
+      "━━━━━━━━━━━━━━━━━━━━",
+      "",
+      "**Récapitulatif des rôles:**",
+      "",
+      ...revealLines,
+      "",
+      "━━━━━━━━━━━━━━━━━━━━",
+      "",
+      `🎮 **Partie #${game.gameNumber}** terminée!`,
+    ].join("\n"),
+    color: result.winner === "village" ? EMBED_COLOR_GREEN : EMBED_COLOR,
+    image: { url: result.image },
+  };
+
+  // Clean the game channel: delete all messages, then show only the victory embed
+  try {
+    const allMsgs: any[] = [];
+    let lastId: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const batch: any[] = await getChannelMessages(token, game.gameChannelId, lastId, 100);
+      if (!batch.length) break;
+      allMsgs.push(...batch);
+      lastId = batch[batch.length - 1]!.id;
+      if (batch.length < 100) break;
+    }
+    const toDelete = allMsgs.map((m: any) => m.id);
+    if (toDelete.length > 0) {
+      await bulkDeleteMessages(token, game.gameChannelId, toDelete);
+    }
+  } catch (err) {
+    console.error("[victory] Failed to clean game channel:", err);
+  }
+
+  // Send victory message as the only message in the channel
+  await sendMessage(token, game.gameChannelId, { embeds: [victoryEmbed] });
+
+  // Post recap in the announce channel (replace old game message)
+  if (game.announceChannelId && game.announceMessageId) {
+    try {
+      await editMessage(token, game.announceChannelId, game.announceMessageId, {
+        embeds: [victoryEmbed],
+        components: [],
+      });
+    } catch (err) {
+      console.error("[victory] Failed to update announce message:", err);
+    }
+  }
 
   // Clear KV entries for all players
   await clearAllPlayersForGame(env.ACTIVE_PLAYERS, game.players);
@@ -2554,6 +2586,11 @@ async function announceVictory(token: string, game: GameState, result: WinResult
     try { await deleteChannel(token, game.wolfChannelId); } catch {}
   }
 
+  // Wait 10 seconds, then delete the game channel
+  await sleep(10000);
+  try { await deleteChannel(token, game.gameChannelId); } catch (err) {
+    console.error("[victory] Failed to delete game channel:", err);
+  }
 }
 
 async function resolveNightVote(token: string, vote: VoteState, voteMessageId: string, ctx?: ExecutionContext, env?: Env) {
