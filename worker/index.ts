@@ -4102,6 +4102,25 @@ async function startNextNight(token: string, dv: DayVoteState, ctx: ExecutionCon
     return;
   }
 
+  // Clear all messages except lobby embed before night transition
+  if (game.lobbyMessageId) {
+    try {
+      const allMsgs: any[] = [];
+      let lastId: string | undefined;
+      for (let page = 0; page < 10; page++) {
+        const batch: any[] = await getChannelMessages(token, dv.gameChannelId, lastId, 100);
+        if (!batch.length) break;
+        allMsgs.push(...batch);
+        lastId = batch[batch.length - 1]!.id;
+        if (batch.length < 100) break;
+      }
+      const toDelete = allMsgs.filter((m: any) => m.id !== game.lobbyMessageId).map((m: any) => m.id);
+      if (toDelete.length > 0) await bulkDeleteMessages(token, dv.gameChannelId, toDelete);
+    } catch (err) {
+      console.error("[startNextNight] Failed to clean channel:", err);
+    }
+  }
+
   // Send transition message
   await sendMessage(token, dv.gameChannelId, {
     embeds: [{
