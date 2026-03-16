@@ -2111,16 +2111,16 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
       }],
     });
 
-    // Clean up and chain to post_wolf (sorciere phase)
+    // Clean up and chain to post_wolf via queue (fresh worker invocation)
     await sleep(2000);
     try { await deleteChannel(token, wolfThread.id); } catch {}
     if (game.petiteFilleThreadId) {
       try { await deleteChannel(token, game.petiteFilleThreadId); } catch {}
     }
 
-    await dispatchPhase(token, "sorciere_phase", {
+    await schedulePhase(env, "post_wolf", {
       game, _wolfVictimId: victim.id, _wolfVictimName: victim.name,
-    }, ctx, env);
+    }, 1);
     return;
   }
 
