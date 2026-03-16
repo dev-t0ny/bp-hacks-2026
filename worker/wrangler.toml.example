@@ -1,0 +1,22 @@
+name = "garou-interactions"
+main = "index.ts"
+compatibility_date = "2024-12-01"
+account_id = "your-cloudflare-account-id"
+
+[vars]
+DISCORD_PUBLIC_KEY = "your-discord-application-public-key"
+DISCORD_BOT_TOKEN = "your-discord-bot-token"
+
+[[kv_namespaces]]
+binding = "ACTIVE_PLAYERS"
+id = "your-kv-namespace-id"
+
+# Queue for delayed phase dispatch (timers get a fresh worker invocation)
+[[queues.producers]]
+queue = "garou-timers"
+binding = "PHASE_QUEUE"
+
+[[queues.consumers]]
+queue = "garou-timers"
+max_batch_size = 1
+max_retries = 0
