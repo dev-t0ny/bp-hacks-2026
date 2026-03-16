@@ -327,6 +327,28 @@ async function sendBotMessage(
   }
 }
 
+const WOLF_AVATAR_URL = "https://api.dicebear.com/9.x/adventurer/png?seed=LoupGarou&size=128";
+
+async function mirrorToSpyThread(
+  token: string, game: GameState, wolfNum: number, content: string,
+) {
+  if (!game.petiteFilleThreadId) return;
+  try {
+    if (game.webhookId && game.webhookToken) {
+      await executeWebhook(game.webhookId, game.webhookToken, {
+        content,
+        username: `🐺 Loup #${wolfNum}`,
+        avatar_url: WOLF_AVATAR_URL,
+        thread_id: game.petiteFilleThreadId,
+      });
+    } else {
+      await sendMessage(token, game.petiteFilleThreadId, { content: `**🐺 Loup #${wolfNum}**: ${content}` });
+    }
+  } catch (err) {
+    console.error(`[mirrorToSpyThread] Failed for Loup #${wolfNum}:`, err);
+  }
+}
+
 function getGuildMember(token: string, guildId: string, userId: string) {
   return discordFetch(token, `/guilds/${guildId}/members/${userId}`);
 }
@@ -500,10 +522,8 @@ async function executeBotWolfVote(
 
   // Post bot message in wolf thread
   await sendBotMessage(token, game, bot, `"${decision.message}"`, wolfChannelId);
-  // Mirror to spy thread for Petite Fille (anonymous)
-  if (game.petiteFilleThreadId) {
-    try { await sendMessage(token, game.petiteFilleThreadId, { content: `👀 **🐺 Loup #${wolfIndex}**: "${decision.message}"` }); } catch {}
-  }
+  // Mirror to spy thread for Petite Fille (anonymous webhook identity)
+  await mirrorToSpyThread(token, game, wolfIndex, `"${decision.message}"`);
 
   // Update vote embed with new state
   await editMessage(token, wolfChannelId, voteMessageId, buildVoteEmbed(voteState));
@@ -543,8 +563,19 @@ async function executeBotDiscussion(
       recentMessages = msgs
         .reverse()
         .filter((m: any) => m.content && !m.content.startsWith("🗳️") && !m.content.startsWith("☀️") && !m.content.startsWith("🌙"))
-        .map((m: any) => m.content)
-        .slice(-10);
+        .map((m: any) => {
+          // Webhook messages = bot characters, use webhook username directly
+          // Regular messages = human players, use global_name
+          if (m.webhook_id) {
+            return `${m.author?.username ?? "?"}: ${m.content}`;
+          }
+          // Skip system bot messages (Garou app)
+          if (m.author?.bot) return null;
+          const author = m.author?.global_name || m.author?.username || "?";
+          return `${author}: ${m.content}`;
+        })
+        .filter(Boolean)
+        .slice(-10) as string[];
     } catch (e) {
       console.error(`[botDiscussion] Failed to fetch recent messages:`, e);
     }
@@ -615,15 +646,21 @@ async function executeBotDayVote(
     const history = await loadHistory(env.ACTIVE_PLAYERS, gameNumber);
     const actualRole = botMem.role || role;
 
-    // Fetch recent chat messages for vote context
+    // Fetch recent chat messages for vote context (with author names)
     let recentMessages: string[] = [];
     try {
       const msgs: any[] = await getChannelMessages(token, gameChannelId, undefined, 20);
       recentMessages = msgs
         .reverse()
         .filter((m: any) => m.content && !m.content.startsWith("🗳️"))
-        .map((m: any) => m.content)
-        .slice(-15);
+        .map((m: any) => {
+          if (m.webhook_id) return `${m.author?.username ?? "?"}: ${m.content}`;
+          if (m.author?.bot) return null;
+          const author = m.author?.global_name || m.author?.username || "?";
+          return `${author}: ${m.content}`;
+        })
+        .filter(Boolean)
+        .slice(-15) as string[];
     } catch (e) {
       console.error(`[botDayVote] Failed to fetch recent messages:`, e);
     }
@@ -2424,11 +2461,9 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
             console.log(`[wolfPhase] All-bots chose: ${victim.name}`);
             // Post the wolf's message
             await sendBotMessage(token, game, leadWolf, `"${(parsed as BotDecisionResult).message}"`, wolfThread.id);
-            // Mirror to spy thread for Petite Fille (anonymous)
-            if (game.petiteFilleThreadId) {
-              const wolfNum = allWolfIds.indexOf(leadWolf.id) + 1;
-              try { await sendMessage(token, game.petiteFilleThreadId, { content: `👀 **🐺 Loup #${wolfNum}**: "${(parsed as BotDecisionResult).message}"` }); } catch {}
-            }
+            // Mirror to spy thread for Petite Fille (anonymous webhook identity)
+            const wolfNum = allWolfIds.indexOf(leadWolf.id) + 1;
+            await mirrorToSpyThread(token, game, wolfNum, `"${(parsed as BotDecisionResult).message}"`);
           }
         }
       } catch (err) {
@@ -2528,11 +2563,9 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     await sleep(3000 + Math.floor(Math.random() * 3000));
     try {
       await sendBotMessage(token, game, botWolf, `"${decision.message}"`, wolfThread.id);
-      // Mirror to spy thread for Petite Fille (anonymous)
-      if (game.petiteFilleThreadId) {
-        const wolfNum = allWolfIds.indexOf(botWolf.id) + 1;
-        try { await sendMessage(token, game.petiteFilleThreadId, { content: `👀 **🐺 Loup #${wolfNum}**: "${decision.message}"` }); } catch {}
-      }
+      // Mirror to spy thread for Petite Fille (anonymous webhook identity)
+      const wolfNum = allWolfIds.indexOf(botWolf.id) + 1;
+      await mirrorToSpyThread(token, game, wolfNum, `"${decision.message}"`);
     } catch (err) {
       console.error(`[wolfPhase] Failed to send pre-vote message for ${botWolf.name}:`, err);
     }
