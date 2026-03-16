@@ -2367,7 +2367,11 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
 
 async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { voyanteMessageId, voyanteThreadId, game } = data;
-  if (!voyanteMessageId || !voyanteThreadId) return;
+  if (!voyanteMessageId || !voyanteThreadId) {
+    console.error("[voyanteTimer] Missing message/thread ID, advancing to wolf");
+    if (game) await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
+    return;
+  }
 
   // Check if already resolved (user acted before timeout)
   const checkMsg: any = await getMessage(token, voyanteThreadId, voyanteMessageId);
@@ -2862,54 +2866,63 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
   }
 
   // Build targets for death potion (all living players + bots except sorciere)
-  const targetIds = game.players.filter((id) => id !== sorciereId && !dead.includes(id));
-  const humanTargets = await Promise.all(
-    targetIds.map(async (id) => {
-      const member: any = await getGuildMember(token, game.guildId, id);
-      return { id, name: member.nick || member.user.global_name || member.user.username };
-    })
-  );
-  const soBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
-  const soBotTargets = soBots.filter(b => b.alive && b.id !== sorciereId && !dead.includes(b.id)).map(b => ({ id: b.id, name: b.name }));
-  const targets = [...humanTargets, ...soBotTargets];
+  try {
+    const targetIds = game.players.filter((id) => id !== sorciereId && !dead.includes(id));
+    const humanTargets = await Promise.all(
+      targetIds.map(async (id) => {
+        const member: any = await getGuildMember(token, game.guildId, id);
+        return { id, name: member.nick || member.user.global_name || member.user.username };
+      })
+    );
+    const soBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+    const soBotTargets = soBots.filter(b => b.alive && b.id !== sorciereId && !dead.includes(b.id)).map(b => ({ id: b.id, name: b.name }));
+    const targets = [...humanTargets, ...soBotTargets];
 
-  const deadline = Math.floor(Date.now() / 1000) + SORCIERE_TIMEOUT_SECONDS;
+    const deadline = Math.floor(Date.now() / 1000) + SORCIERE_TIMEOUT_SECONDS;
 
-  // Create private thread
-  const sorciereThread: any = await createThread(token, game.gameChannelId, {
-    name: "🧪 Laboratoire",
-    type: 12,
-    auto_archive_duration: 1440,
-  });
+    // Create private thread
+    const sorciereThread: any = await createThread(token, game.gameChannelId, {
+      name: "🧪 Laboratoire",
+      type: 12,
+      auto_archive_duration: 1440,
+    });
 
-  await addThreadMember(token, sorciereThread.id, sorciereId);
+    await addThreadMember(token, sorciereThread.id, sorciereId);
 
-  const soState: SorciereState = {
-    gameNumber: game.gameNumber,
-    guildId: game.guildId,
-    gameChannelId: game.gameChannelId,
-    sorciereThreadId: sorciereThread.id,
-    lobbyMessageId: game.lobbyMessageId!,
-    sorciereId,
-    wolfVictimId: _wolfVictimId,
-    wolfVictimName: _wolfVictimName,
-    potions,
-    targets,
-    deadline,
-  };
+    const soState: SorciereState = {
+      gameNumber: game.gameNumber,
+      guildId: game.guildId,
+      gameChannelId: game.gameChannelId,
+      sorciereThreadId: sorciereThread.id,
+      lobbyMessageId: game.lobbyMessageId!,
+      sorciereId,
+      wolfVictimId: _wolfVictimId,
+      wolfVictimName: _wolfVictimName,
+      potions,
+      targets,
+      deadline,
+    };
 
-  await sendMessage(token, sorciereThread.id, {
-    content: `<@${sorciereId}>\n\n🧪 **La Sorcière se réveille!** Les loups ont choisi leur victime...`,
-  });
-  const soMsg: any = await sendMessage(token, sorciereThread.id, buildSorciereEmbed(soState));
+    await sendMessage(token, sorciereThread.id, {
+      content: `<@${sorciereId}>\n\n🧪 **La Sorcière se réveille!** Les loups ont choisi leur victime...`,
+    });
+    const soMsg: any = await sendMessage(token, sorciereThread.id, buildSorciereEmbed(soState));
 
-  // Schedule timeout via queue (fresh worker invocation)
-  await schedulePhase(env, "sorciere_timer", { sorciereMessageId: soMsg.id, sorciereThreadId: sorciereThread.id, game, _wolfVictimId, _wolfVictimName }, SORCIERE_TIMEOUT_SECONDS);
+    // Schedule timeout via queue (fresh worker invocation)
+    await schedulePhase(env, "sorciere_timer", { sorciereMessageId: soMsg.id, sorciereThreadId: sorciereThread.id, game, _wolfVictimId, _wolfVictimName }, SORCIERE_TIMEOUT_SECONDS);
+  } catch (err) {
+    console.error(`[sorciere] ❌ Failed to set up sorciere thread, skipping to dawn:`, err);
+    await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
+  }
 }
 
 async function phaseSorciereTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
   const { sorciereMessageId, sorciereThreadId, game, _wolfVictimId, _wolfVictimName } = data;
-  if (!sorciereMessageId || !sorciereThreadId) return;
+  if (!sorciereMessageId || !sorciereThreadId) {
+    console.error("[sorciereTimer] Missing message/thread ID, advancing to dawn");
+    if (game) await dispatchPhase(token, "dawn_phase", { game, _wolfVictimId, _wolfVictimName, _witchSaved: false }, ctx, env);
+    return;
+  }
 
   // Check if already resolved (user acted before timeout)
   const checkMsg: any = await getMessage(token, sorciereThreadId, sorciereMessageId);
