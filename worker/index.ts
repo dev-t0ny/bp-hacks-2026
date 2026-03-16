@@ -1650,7 +1650,7 @@ async function startGame(token: string, game: GameState, ctx: ExecutionContext, 
 
   // ── Phase 3: Role check (channels are created lazily when players reveal) ──
   game.seen = [...botIds]; // Bots "see" their role instantly
-  await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game));
+  await editMessage(token, game.gameChannelId, game.lobbyMessageId, buildRoleCheckEmbed(game, bots));
 
   if (game.announceChannelId && game.announceMessageId) {
     await editMessage(token, game.announceChannelId, game.announceMessageId, {
@@ -4880,6 +4880,7 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
     ctx.waitUntil((async () => {
       const lobbyId = game.lobbyMessageId!;
       const channelId = game.gameChannelId;
+      const revealBots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
 
       for (let attempt = 0; attempt < 5; attempt++) {
         try {
@@ -4893,7 +4894,7 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
           seen.push(userId);
           latest.seen = seen;
 
-          await editMessage(token, channelId, lobbyId, buildRoleCheckEmbed(latest));
+          await editMessage(token, channelId, lobbyId, buildRoleCheckEmbed(latest, revealBots));
 
           // Verify our write persisted
           await sleep(150);
@@ -4904,7 +4905,7 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
             const humansSeen = (verify.seen ?? []).filter((id: string) => !id.startsWith("bot_")).length;
             if (humansSeen >= verify.players.length) {
               const title: string = verifyMsg.embeds?.[0]?.title ?? "";
-              if (title.includes("Découvrez vos rôles")) {
+              if (title.includes("Découvrez vos rôles") || title.includes("Discover your roles")) {
                 // Mark title to prevent duplicate triggers from concurrent handlers
                 try {
                   const embed = verifyMsg.embeds[0];

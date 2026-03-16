@@ -618,15 +618,23 @@ export function parseDayVoteFromEmbed(message: any): DayVoteState | null {
 
 // ─── Game Embeds (Lobby, Announce, Role Check) ─────────────────────────────
 
-export function buildRoleCheckEmbed(game: GameState) {
+export function buildRoleCheckEmbed(game: GameState, bots: BotPlayer[] = []) {
   const i18n = t(game.lang ?? "fr");
   const seen = game.seen ?? [];
   const stateUrl = `https://garou.bot/s/${encodeState(game)}`;
 
+  // Human players
   const playerLines = game.players.map((id) => {
     const checked = seen.includes(id);
     return `${checked ? "✅" : "⬜"} <@${id}>`;
   });
+
+  // Bot players (always checked)
+  const botLines = bots.map((b) => `✅ 🤖 ${b.name}`);
+
+  const totalPlayers = game.players.length + bots.length;
+  const humansSeen = seen.filter(id => !id.startsWith("bot_")).length;
+  const totalSeen = humansSeen + bots.length;
 
   return {
     embeds: [{
@@ -638,10 +646,11 @@ export function buildRoleCheckEmbed(game: GameState) {
         "━━━━━━━━━━━━━━━━━━━━",
         "",
         ...playerLines,
+        ...botLines,
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
-        i18n.game.roleCheckProgress(seen.filter(id => !id.startsWith("bot_")).length, game.players.length),
+        i18n.game.roleCheckProgress(totalSeen, totalPlayers),
       ].join("\n"),
       color: EMBED_COLOR_PURPLE,
       image: { url: SCENE_IMAGES.game_start },
