@@ -22,6 +22,7 @@ describe("encodeConfigState / decodeConfigState round-trip", () => {
     selectedRoles: [0, 2, 3, 4, 5, 47],
     botCount: 2,
     maxPlayers: 8,
+    lang: "fr",
   };
 
   it("encodes and decodes back to the same config", () => {
@@ -71,6 +72,7 @@ describe("buildStep1Embed", () => {
     selectedRoles: [0, 2, 3, 4, 5, 47],
     botCount: 0,
     maxPlayers: 6,
+    lang: "fr",
   };
 
   it("returns embeds array with 1 embed", () => {

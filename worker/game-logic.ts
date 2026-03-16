@@ -316,6 +316,8 @@ export interface GameState {
   announceChannelId?: string;
   announceMessageId?: string;
   wolfChannelId?: string;
+  webhookId?: string;
+  webhookToken?: string;
   roles?: Record<string, string>;
   seen?: string[];
   couple?: [string, string];
@@ -348,6 +350,8 @@ export function encodeState(game: GameState): string {
     am: game.announceMessageId,
     wc: game.wolfChannelId,
   };
+  if (game.webhookId) compact.whi = game.webhookId;
+  if (game.webhookToken) compact.wht = game.webhookToken;
   if (game.roles) compact.r = game.roles;
   if (game.seen?.length) compact.s = game.seen;
   if (game.couple) compact.cp = game.couple;
@@ -380,6 +384,8 @@ export function decodeState(url: string): GameState | null {
       announceChannelId: compact.ac,
       announceMessageId: compact.am,
       wolfChannelId: compact.wc,
+      webhookId: compact.whi,
+      webhookToken: compact.wht,
       roles: compact.r,
       seen: compact.s ?? [],
       couple: compact.cp,

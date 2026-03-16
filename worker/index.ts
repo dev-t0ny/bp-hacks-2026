@@ -66,6 +66,7 @@ import {
   getRoleImage,
   progressBar,
   getRoleName,
+  getRoleDescription,
 } from "./game-logic";
 import {
   type VoteState,
@@ -127,7 +128,14 @@ async function saveBots(kv: KVNamespace, gameNumber: number, bots: BotPlayer[]) 
 async function loadBots(kv: KVNamespace, gameNumber: number): Promise<BotPlayer[]> {
   const val = await kv.get(`game:${gameNumber}:bots`);
   if (!val) return [];
-  try { return JSON.parse(val); } catch { return []; }
+  try {
+    const bots: BotPlayer[] = JSON.parse(val);
+    // Backfill avatarUrl for bots saved before webhook support
+    for (const b of bots) {
+      if (!b.avatarUrl) b.avatarUrl = `https://api.dicebear.com/9.x/adventurer/png?seed=${encodeURIComponent(b.name)}&size=128`;
+    }
+    return bots;
+  } catch { return []; }
 }
 
 async function markPlayerActive(kv: KVNamespace, userId: string, gameNumber: number, channelId: string) {
@@ -263,6 +271,49 @@ function addThreadMember(token: string, threadId: string, userId: string) {
   });
 }
 
+function createWebhook(token: string, channelId: string, name: string) {
+  return discordFetch(token, `/channels/${channelId}/webhooks`, {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+async function executeWebhook(
+  webhookId: string,
+  webhookToken: string,
+  body: { content?: string; username?: string; avatar_url?: string; embeds?: unknown[]; thread_id?: string },
+) {
+  const params = body.thread_id ? `?thread_id=${body.thread_id}` : "";
+  const { thread_id: _, ...payload } = body;
+  const res = await fetch(
+    `https://discord.com/api/v10/webhooks/${webhookId}/${webhookToken}${params}`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+  );
+  if (!res.ok) throw new Error(`Webhook ${res.status}: ${await res.text()}`);
+  return res.status === 204 ? null : res.json();
+}
+
+async function sendBotMessage(
+  token: string,
+  game: GameState,
+  bot: BotPlayer,
+  content: string,
+  channelId?: string,
+) {
+  if (game.webhookId && game.webhookToken) {
+    const isThread = channelId && channelId !== game.gameChannelId;
+    await executeWebhook(game.webhookId, game.webhookToken, {
+      content,
+      username: `${bot.emoji} ${bot.name}`,
+      avatar_url: bot.avatarUrl,
+      ...(isThread ? { thread_id: channelId } : {}),
+    });
+  } else {
+    const targetChannel = channelId ?? game.gameChannelId;
+    await sendMessage(token, targetChannel, { content: `**${bot.emoji} ${bot.name}** : ${content}` });
+  }
+}
+
 function getGuildMember(token: string, guildId: string, userId: string) {
   return discordFetch(token, `/guilds/${guildId}/members/${userId}`);
 }
@@ -394,6 +445,7 @@ async function executeBotWolfVote(
   voteMessageId: string,
   gameNumber: number,
   ctx: ExecutionContext,
+  game: GameState,
 ): Promise<void> {
   console.log(`[botWolfVote] 🐺 Bot ${bot.name} (${bot.id}) voting in game #${gameNumber}`);
   // Re-read VoteState from embed to avoid race conditions
@@ -433,9 +485,7 @@ async function executeBotWolfVote(
   voteState.votes[bot.id] = decision.action;
 
   // Post bot message in wolf thread
-  await sendMessage(token, wolfChannelId, {
-    content: `**${bot.emoji} ${bot.name}** : "${decision.message}"`,
-  });
+  await sendBotMessage(token, game, bot, `"${decision.message}"`, wolfChannelId);
 
   // Update vote embed with new state
   await editMessage(token, wolfChannelId, voteMessageId, buildVoteEmbed(voteState));
@@ -459,6 +509,7 @@ async function executeBotDiscussion(
   gameNumber: number,
   role: string,
   alivePlayers: { id: string; name: string }[],
+  game: GameState,
 ): Promise<void> {
   console.log(`[botDiscussion] 💬 Bot ${bot.name} (${bot.id}), role: ${role}`);
 
@@ -510,9 +561,7 @@ async function executeBotDiscussion(
   }
 
   try {
-    await sendMessage(token, gameChannelId, {
-      content: `**${bot.emoji} ${bot.name}** : ${message}`,
-    });
+    await sendBotMessage(token, game, bot, message);
     console.log(`[botDiscussion] ${bot.name} posted: ${message}`);
   } catch (err) {
     console.error(`[botDiscussion] Failed to send message for ${bot.name}:`, err);
@@ -531,6 +580,7 @@ async function executeBotDayVote(
   gameNumber: number,
   role: string,
   ctx: ExecutionContext,
+  game: GameState,
 ): Promise<void> {
   console.log(`[botDayVote] 🗳️ Bot ${bot.name} (${bot.id}) voting`);
   // Re-read DayVoteState from embed
@@ -647,9 +697,7 @@ async function executeBotDayVote(
   });
 
   // Post message
-  await sendMessage(token, gameChannelId, {
-    content: `**${bot.emoji} ${bot.name}** vote : "${message}"`,
-  });
+  await sendBotMessage(token, game, bot, `vote : "${message}"`);
 
   // Check all voted
   const allVoted = dv.voters.every((id) => dv.votes[id]);
@@ -773,8 +821,8 @@ async function handleConfigSelect(interaction: any, env: Env): Promise<Response>
   const customId: string = interaction.data?.custom_id || "";
   const values: string[] = interaction.data?.values || [];
 
-  if (customId === "cfg_lang") {
-    config.lang = (values[0] || "fr") as Locale;
+  if (customId === "cfg_lang" || customId === "cfg_lang_fr" || customId === "cfg_lang_en") {
+    config.lang = customId === "cfg_lang_en" ? "en" : customId === "cfg_lang_fr" ? "fr" : (values[0] || "fr") as Locale;
     const customPresets = await loadCustomPresets(env, config.guildId);
     return json({ type: 7, data: buildStep1Embed(config, customPresets) });
   }
@@ -872,6 +920,12 @@ async function handleConfigButton(interaction: any, env: Env, ctx: ExecutionCont
   }
 
   const customId: string = interaction.data?.custom_id || "";
+
+  if (customId === "cfg_lang_fr" || customId === "cfg_lang_en") {
+    config.lang = customId === "cfg_lang_en" ? "en" : "fr";
+    const customPresets = await loadCustomPresets(env, config.guildId);
+    return json({ type: 7, data: buildStep1Embed(config, customPresets) });
+  }
 
   if (customId === "cfg_votes_public") {
     config.anonymousVotes = false;
@@ -1018,6 +1072,14 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
       });
 
 
+      // Create webhook for bot identities
+      let webhook: any = null;
+      try {
+        webhook = await createWebhook(token, gameChannel.id, "Garou");
+      } catch (err) {
+        console.error("Failed to create webhook:", err);
+      }
+
       await markPlayerActive(env.ACTIVE_PLAYERS, userId, gameNumber, gameChannel.id);
       await env.ACTIVE_PLAYERS.put(`gp:${gameNumber}:${userId}`, "1", { expirationTtl: PLAYER_TTL });
 
@@ -1030,6 +1092,8 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
         maxPlayers,
         players: [userId],
         announceChannelId: channelId,
+        webhookId: webhook?.id,
+        webhookToken: webhook?.token,
         discussionTime: config.discussionTime,
         voteTime: config.voteTime,
         selectedRoleIds: config.selectedRoles,
@@ -1046,6 +1110,7 @@ async function handleCreateGame(interaction: any, config: ConfigState, env: Env,
           name: p.name,
           traits: p.traits,
           emoji: p.emoji,
+          avatarUrl: p.avatarUrl,
           alive: true,
         }));
         await saveBots(env.ACTIVE_PLAYERS, gameNumber, bots);
@@ -1235,7 +1300,7 @@ async function handleJoin(interaction: any, env: Env, ctx: ExecutionContext): Pr
       console.error("handleJoin background error:", err);
       try {
         await editOriginalInteractionResponse(appId, interactionToken, {
-          content: i18n.errors.joinFailed,
+          content: t(initialGame.lang ?? "fr").errors.joinFailed,
         });
       } catch {}
     }
@@ -2335,9 +2400,7 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
           if (victim) {
             console.log(`[wolfPhase] All-bots chose: ${victim.name}`);
             // Post the wolf's message
-            await sendMessage(token, wolfThread.id, {
-              content: `**${leadWolf.emoji} ${leadWolf.name}** : "${(parsed as BotDecisionResult).message}"`,
-            });
+            await sendBotMessage(token, game, leadWolf, `"${(parsed as BotDecisionResult).message}"`, wolfThread.id);
           }
         }
       } catch (err) {
@@ -2411,9 +2474,7 @@ async function startWolfPhase(token: string, game: GameState, ctx: ExecutionCont
     }
     voteState.votes[botWolf.id] = decision.action;
     console.log(`[wolfPhase] Bot ${botWolf.name} pre-voted for ${decision.action}`);
-    await sendMessage(token, wolfThread.id, {
-      content: `**${botWolf.emoji} ${botWolf.name}** : "${decision.message}"`,
-    });
+    await sendBotMessage(token, game, botWolf, `"${decision.message}"`, wolfThread.id);
   }
 
   // Update vote embed with bot votes already applied
@@ -2616,10 +2677,11 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
   }
   const voyanteId = voyanteEntry[0];
 
+  const i18n = t(game.lang ?? "fr");
   // Update lobby status
   await updatePhaseStatus(token, game,
-    "🔮 La Voyante se réveille...",
-    "*La Voyante ouvre les yeux et scrute le village...*",
+    i18n.game.voyanteWake,
+    i18n.game.voyanteWakeDesc,
     EMBED_COLOR_PURPLE, getRoleImage("voyante"),
   );
 
@@ -2699,7 +2761,7 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
 
     // Create private thread for voyante
     const voyanteThread: any = await createThread(token, game.gameChannelId, {
-      name: "🔮 Vision",
+      name: i18n.game.voyanteThreadName,
       type: 12,
       auto_archive_duration: 1440,
     });
@@ -2716,10 +2778,11 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
       targets,
       deadline,
       allRoles: game.roles,
+      lang: game.lang,
     };
 
     await sendMessage(token, voyanteThread.id, {
-      content: `<@${voyanteId}>\n\n🔮 **La Voyante se réveille!** Choisis un joueur à espionner.`,
+      content: i18n.game.voyanteWakeMsg(voyanteId),
     });
     const vyMsg: any = await sendMessage(token, voyanteThread.id, buildVoyanteEmbed(vyState));
 
@@ -2744,10 +2807,11 @@ async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext
   if (!checkMsg.components?.length) { console.log("[voyanteTimer] Already resolved"); return; }
 
   // Timeout — voyante didn't act
+  const vi18n = t(game?.lang ?? "fr");
   await editMessage(token, voyanteThreadId, voyanteMessageId, {
     embeds: [{
-      title: `🔮 Vision de la Voyante — Temps écoulé`,
-      description: "La Voyante n'a pas choisi à temps.",
+      title: vi18n.game.voyanteTimeout,
+      description: vi18n.game.voyanteTimeoutDesc,
       color: EMBED_COLOR_PURPLE,
       thumbnail: { url: getRoleImage("voyante") },
     }],
@@ -2761,16 +2825,17 @@ async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext
 
 async function handleVoyanteSee(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur.", flags: 64 } });
-
   const vy = parseVoyanteFromEmbed(interaction.message);
-  if (!vy) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
-  if (userId !== vy.voyanteId) return json({ type: 4, data: { content: "❌ Seule la Voyante peut utiliser ce pouvoir.", flags: 64 } });
+  const vyi18n = t(vy?.lang ?? "fr");
+  if (!userId) return json({ type: 4, data: { content: vyi18n.errors.error, flags: 64 } });
+
+  if (!vy) return json({ type: 4, data: { content: vyi18n.errors.stateNotFound, flags: 64 } });
+  if (userId !== vy.voyanteId) return json({ type: 4, data: { content: vyi18n.errors.onlyVoyante, flags: 64 } });
 
   const customId: string = interaction.data?.custom_id || "";
   const targetId = customId.replace(`voyante_see_${vy.gameNumber}_`, "");
   const target = vy.targets.find((t) => t.id === targetId);
-  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+  if (!target) return json({ type: 4, data: { content: vyi18n.errors.invalidTarget, flags: 64 } });
 
   const roleKey = vy.allRoles[targetId] ?? "villageois";
   const role = ROLES[roleKey] ?? ROLES.villageois!;
@@ -2794,18 +2859,20 @@ async function handleVoyanteSee(interaction: any, env: Env, ctx: ExecutionContex
     }
   })());
 
+  const localizedRoleName = getRoleName(roleKey, vy.lang ?? "fr");
+
   return json({
     type: 7,
     data: {
       embeds: [{
-        title: `🔮 Vision de la Voyante — Partie #${vy.gameNumber}`,
+        title: vyi18n.game.voyanteTitle(vy.gameNumber),
         url: stateUrl,
         description: [
-          `Tu as espionné **${target.name}**...`,
+          vyi18n.game.voyanteSpied(target.name),
           "",
           "━━━━━━━━━━━━━━━━━━━━",
           "",
-          `${role.emoji} **${target.name}** est **${role.name}**!`,
+          vyi18n.game.voyanteResult(target.name, localizedRoleName, role.emoji),
           "",
           "━━━━━━━━━━━━━━━━━━━━",
         ].join("\n"),
@@ -2835,8 +2902,10 @@ async function phaseVoteTimer(token: string, data: any, ctx: ExecutionContext, e
 // ── Win Conditions ──────────────────────────────────────────────────
 
 async function announceVictory(token: string, game: GameState, result: WinResult, env: Env) {
+  const ai18n = t(game.lang ?? "fr");
   const dead = game.dead ?? [];
   const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+  const lang = game.lang ?? "fr";
 
   // Build role reveal lines — humans
   const revealLines = game.players.map((id) => {
@@ -2844,14 +2913,14 @@ async function announceVictory(token: string, game: GameState, result: WinResult
     const role = ROLES[roleKey] ?? ROLES.villageois!;
     const isDead = dead.includes(id);
     const status = isDead ? "💀" : "✅";
-    return `${status} ${role.emoji} <@${id}> — **${role.name}**`;
+    return `${status} ${role.emoji} <@${id}> — **${getRoleName(roleKey, lang)}**`;
   });
   // Bot reveal lines
   for (const bot of bots) {
     const roleKey = game.roles?.[bot.id] ?? "villageois";
     const role = ROLES[roleKey] ?? ROLES.villageois!;
     const status = bot.alive ? "✅" : "💀";
-    revealLines.push(`${status} ${role.emoji} 🤖 ${bot.name} — **${role.name}**`);
+    revealLines.push(`${status} ${role.emoji} 🤖 ${bot.name} — **${getRoleName(roleKey, lang)}**`);
   }
 
   const victoryEmbed = {
@@ -2861,13 +2930,13 @@ async function announceVictory(token: string, game: GameState, result: WinResult
       "",
       "━━━━━━━━━━━━━━━━━━━━",
       "",
-      "**Récapitulatif des rôles:**",
+      ai18n.game.roleRecap,
       "",
       ...revealLines,
       "",
       "━━━━━━━━━━━━━━━━━━━━",
       "",
-      `🎮 **Partie #${game.gameNumber}** terminée!`,
+      ai18n.game.gameFinished(game.gameNumber),
     ].join("\n"),
     color: result.winner === "village" ? EMBED_COLOR_GREEN : EMBED_COLOR,
     image: { url: result.image },
@@ -2924,6 +2993,7 @@ async function announceVictory(token: string, game: GameState, result: WinResult
 }
 
 async function resolveNightVote(token: string, vote: VoteState, voteMessageId: string, ctx?: ExecutionContext, env?: Env) {
+  const ni18n = t(vote.lang ?? "fr");
   console.log(`[resolveNightVote] Resolving for game #${vote.gameNumber}, votes: ${JSON.stringify(vote.votes)}`);
   // Safety: check if already resolved
   try {
@@ -2954,12 +3024,13 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
   const stateUrl = `https://garou.bot/v/${encodeVoteState(vote)}`;
 
   // Edit vote embed — show result, remove buttons
+  const victimMention = victim.id.startsWith("bot_") ? " 🤖" : ` (<@${victim.id}>)`;
   await editMessage(token, vote.wolfChannelId, voteMessageId, {
     embeds: [{
-      title: `☠️ La meute a choisi — Partie #${vote.gameNumber}`,
+      title: ni18n.game.wolfChose(vote.gameNumber),
       url: stateUrl,
       description: [
-        `**${victim.name}**${victim.id.startsWith("bot_") ? " 🤖" : ` (<@${victim.id}>)`} sera dévoré(e) cette nuit.`,
+        ni18n.game.wolfVictim(victim.name, victimMention),
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
@@ -2969,12 +3040,12 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
           const wolfLabel = wId.startsWith("bot_")
             ? `🤖 **${vote.wolfNames?.[wId] ?? wId}**`
             : `🐺 <@${wId}>`;
-          return `${wolfLabel} → ${target ? target.name : "*(pas voté)*"}`;
+          return `${wolfLabel} → ${target ? target.name : ni18n.game.wolfVoteDidntVote}`;
         }),
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
-        "*Le vote est terminé.*",
+        ni18n.game.wolfVoteFinished,
       ].join("\n"),
       color: EMBED_COLOR,
       image: { url: SCENE_IMAGES.night_kill },
@@ -3021,13 +3092,14 @@ async function resolveNightVote(token: string, vote: VoteState, voteMessageId: s
   }
 
   // Fallback: announce death directly if no ctx/env (should not happen in practice)
+  const display = `**${victim.name}** (<@${victim.id}>)`;
   await sendMessage(token, vote.gameChannelId, {
     embeds: [{
-      title: "☀️ Le jour se lève...",
+      title: ni18n.game.dawnTitle,
       description: [
-        `Les villageois découvrent avec horreur que **${victim.name}** (<@${victim.id}>) a été dévoré(e) par les loups-garous cette nuit.`,
+        ni18n.game.dawnSingleDeath(display, ni18n.game.dawnDevouredBy),
         "",
-        "*Un moment de silence pour la victime...*",
+        ni18n.game.dawnSilence,
       ].join("\n"),
       color: EMBED_COLOR,
       image: { url: SCENE_IMAGES.dawn_breaks },
@@ -3063,11 +3135,12 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
     _witchSaved?: boolean; _witchKillId?: string;
   };
   if (!game) return;
+  const i18n = t(game.lang ?? "fr");
 
   // Update lobby status
   await updatePhaseStatus(token, game,
-    "☀️ Le jour se lève...",
-    "*Les premiers rayons du soleil éclairent le village...*",
+    i18n.game.dawnTitle,
+    i18n.game.dawnFirstRays,
     EMBED_COLOR_ORANGE, SCENE_IMAGES.dawn_breaks,
   );
 
@@ -3078,7 +3151,7 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
   if (!_witchSaved && _wolfVictimId) {
     if (!game.dead.includes(_wolfVictimId)) {
       game.dead.push(_wolfVictimId);
-      deaths.push({ id: _wolfVictimId, name: _wolfVictimName, cause: "dévoré(e) par les loups-garous" });
+      deaths.push({ id: _wolfVictimId, name: _wolfVictimName, cause: i18n.game.dawnDevouredBy });
       try {
         await setChannelPermission(token, game.gameChannelId, _wolfVictimId, {
           allow: String(1 << 10), deny: String(1 << 11), type: 1,
@@ -3096,7 +3169,7 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
         const member: any = await getGuildMember(token, game.guildId, _witchKillId);
         killName = member.nick || member.user.global_name || member.user.username;
       } catch {}
-      deaths.push({ id: _witchKillId, name: killName, cause: "empoisonné(e) pendant la nuit" });
+      deaths.push({ id: _witchKillId, name: killName, cause: i18n.game.dawnPoisoned });
       try {
         await setChannelPermission(token, game.gameChannelId, _witchKillId, {
           allow: String(1 << 10), deny: String(1 << 11), type: 1,
@@ -3117,7 +3190,7 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
             const pm: any = await getGuildMember(token, game.guildId, partnerId);
             partnerName = pm.nick || pm.user.global_name || pm.user.username;
           } catch {}
-          deaths.push({ id: partnerId, name: partnerName, cause: "mort(e) de chagrin (couple 💔)" });
+          deaths.push({ id: partnerId, name: partnerName, cause: i18n.game.dawnCoupleGrief });
           try {
             await setChannelPermission(token, game.gameChannelId, partnerId, {
               allow: String(1 << 10), deny: String(1 << 11), type: 1,
@@ -3131,7 +3204,7 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
   // Enrich game history with dawn events
   for (const d of deaths) {
     const roleKey = game.roles?.[d.id] ?? "villageois";
-    const roleName = ROLES[roleKey]?.name ?? "Villageois";
+    const roleName = getRoleName(roleKey, game.lang ?? "fr");
     await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Nuit: ${d.name} a été ${d.cause}. C'était ${roleName}.`);
   }
   if (_witchSaved) {
@@ -3195,11 +3268,11 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
   if (deaths.length === 0) {
     await sendMessage(token, game.gameChannelId, {
       embeds: [{
-        title: "☀️ Le jour se lève...",
+        title: i18n.game.dawnTitle,
         description: [
-          "Les villageois se réveillent et... **personne n'est mort cette nuit!** 🎉",
+          i18n.game.dawnNoDeath,
           "",
-          "*La sorcière a veillé sur le village...*",
+          i18n.game.dawnWitchWatched,
         ].join("\n"),
         color: EMBED_COLOR_GREEN,
         image: { url: SCENE_IMAGES.dawn_breaks },
@@ -3212,13 +3285,13 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
     const display = d.id.startsWith("bot_") ? `🤖 **${d.name}**` : `**${d.name}** (<@${d.id}>)`;
     await sendMessage(token, game.gameChannelId, {
       embeds: [{
-        title: "☀️ Le jour se lève...",
+        title: i18n.game.dawnTitle,
         description: [
-          `Les villageois découvrent avec horreur que ${display} a été ${d.cause} cette nuit.`,
+          i18n.game.dawnSingleDeath(display, d.cause),
           "",
-          `${roleInfo.emoji} C'était **${roleInfo.name}**!`,
+          i18n.game.dawnWas(roleInfo.emoji, getRoleName(roleKey, game.lang ?? "fr")),
           "",
-          "*Un moment de silence pour la victime...*",
+          i18n.game.dawnSilence,
         ].join("\n"),
         color: EMBED_COLOR,
         thumbnail: { url: getRoleImage(roleKey) },
@@ -3230,13 +3303,13 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
       const roleKey = game.roles?.[d.id] ?? "villageois";
       const roleInfo = ROLES[roleKey] ?? ROLES.villageois!;
       const display = d.id.startsWith("bot_") ? `🤖 **${d.name}**` : `**${d.name}** (<@${d.id}>)`;
-      return `💀 ${display} — ${d.cause}\n${roleInfo.emoji} C'était **${roleInfo.name}**`;
+      return i18n.game.dawnDeathLine(display, d.cause, roleInfo.emoji, getRoleName(roleKey, game.lang ?? "fr"));
     });
     await sendMessage(token, game.gameChannelId, {
       embeds: [{
-        title: "☀️ Le jour se lève... Double meurtre!",
+        title: i18n.game.dawnDoubleMurder,
         description: [
-          "Les villageois découvrent avec horreur que **deux personnes** sont mortes cette nuit!",
+          i18n.game.dawnDoubleDesc,
           "",
           "━━━━━━━━━━━━━━━━━━━━",
           "",
@@ -3244,7 +3317,7 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
           "",
           "━━━━━━━━━━━━━━━━━━━━",
           "",
-          "*Un moment de silence pour les victimes...*",
+          i18n.game.dawnSilencePlural,
         ].join("\n"),
         color: EMBED_COLOR,
         image: { url: SCENE_IMAGES.dawn_breaks },
@@ -3297,10 +3370,12 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
   const sorciereId = sorciereEntry[0];
   const potions = game.witchPotions ?? { life: false, death: false };
 
+  const i18n = t(game.lang ?? "fr");
+
   // Update lobby status
   await updatePhaseStatus(token, game,
-    "🧪 La Sorcière se réveille...",
-    "*La Sorcière ouvre les yeux et prépare ses potions...*",
+    i18n.game.sorciereWake,
+    i18n.game.sorciereWakeDesc,
     EMBED_COLOR_PURPLE, getRoleImage("sorciere"),
   );
 
@@ -3400,7 +3475,7 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
 
     // Create private thread
     const sorciereThread: any = await createThread(token, game.gameChannelId, {
-      name: "🧪 Laboratoire",
+      name: i18n.game.sorciereThreadName,
       type: 12,
       auto_archive_duration: 1440,
     });
@@ -3419,10 +3494,11 @@ async function phaseSorciere(token: string, data: any, ctx: ExecutionContext, en
       potions,
       targets,
       deadline,
+      lang: game.lang,
     };
 
     await sendMessage(token, sorciereThread.id, {
-      content: `<@${sorciereId}>\n\n🧪 **La Sorcière se réveille!** Les loups ont choisi leur victime...`,
+      content: i18n.game.sorciereWakeMsg(sorciereId),
     });
     const soMsg: any = await sendMessage(token, sorciereThread.id, buildSorciereEmbed(soState));
 
@@ -3447,10 +3523,11 @@ async function phaseSorciereTimer(token: string, data: any, ctx: ExecutionContex
   if (!checkMsg.components?.length) { console.log("[sorciereTimer] Already resolved"); return; }
 
   // Timeout — sorciere didn't act
+  const i18nST = game ? t(game.lang ?? "fr") : t("fr");
   await editMessage(token, sorciereThreadId, sorciereMessageId, {
     embeds: [{
-      title: `🧪 Sorcière — Temps écoulé`,
-      description: "La Sorcière n'a pas agi à temps.",
+      title: i18nST.game.sorciereTimeoutTitle,
+      description: i18nST.game.sorciereTimeout,
       color: EMBED_COLOR_PURPLE,
       thumbnail: { url: getRoleImage("sorciere") },
     }],
@@ -3465,9 +3542,10 @@ async function phaseSorciereTimer(token: string, data: any, ctx: ExecutionContex
 async function handleSorciereLife(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const so = parseSorciereFromEmbed(interaction.message);
-  if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
-  if (userId !== so.sorciereId) return json({ type: 4, data: { content: "❌ Seule la Sorcière peut utiliser ce pouvoir.", flags: 64 } });
-  if (!so.potions.life) return json({ type: 4, data: { content: "❌ Tu as déjà utilisé ta Potion de Vie.", flags: 64 } });
+  if (!so) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(so.lang ?? "fr");
+  if (userId !== so.sorciereId) return json({ type: 4, data: { content: i18n.errors.onlySorciere, flags: 64 } });
+  if (!so.potions.life) return json({ type: 4, data: { content: i18n.errors.lifePotionUsed, flags: 64 } });
 
   so.witchSaved = true;
   so.resolved = true;
@@ -3491,12 +3569,12 @@ async function handleSorciereLife(interaction: any, env: Env, ctx: ExecutionCont
     type: 7,
     data: {
       embeds: [{
-        title: `🧪 Sorcière — Partie #${so.gameNumber}`,
+        title: i18n.game.sorciereTitle(so.gameNumber),
         url: stateUrl,
         description: [
-          `💚 Tu as utilisé la **Potion de Vie** pour sauver **${so.wolfVictimName}**!`,
+          i18n.game.sorciereLifeUsedMsg(so.wolfVictimName),
           "",
-          "*La victime des loups survivra cette nuit.*",
+          i18n.game.sorciereLifeUsedDesc,
         ].join("\n"),
         color: EMBED_COLOR_GREEN,
         thumbnail: { url: getRoleImage("sorciere") },
@@ -3509,9 +3587,10 @@ async function handleSorciereLife(interaction: any, env: Env, ctx: ExecutionCont
 async function handleSorciereDeath(interaction: any, env: Env): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const so = parseSorciereFromEmbed(interaction.message);
-  if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
-  if (userId !== so.sorciereId) return json({ type: 4, data: { content: "❌ Seule la Sorcière peut utiliser ce pouvoir.", flags: 64 } });
-  if (!so.potions.death) return json({ type: 4, data: { content: "❌ Tu as déjà utilisé ta Potion de Mort.", flags: 64 } });
+  if (!so) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(so.lang ?? "fr");
+  if (userId !== so.sorciereId) return json({ type: 4, data: { content: i18n.errors.onlySorciere, flags: 64 } });
+  if (!so.potions.death) return json({ type: 4, data: { content: i18n.errors.deathPotionUsed, flags: 64 } });
 
   // Show target picker
   return json({ type: 7, data: buildSorciereTargetEmbed(so) });
@@ -3520,13 +3599,14 @@ async function handleSorciereDeath(interaction: any, env: Env): Promise<Response
 async function handleSorciereTarget(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const so = parseSorciereFromEmbed(interaction.message);
-  if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
-  if (userId !== so.sorciereId) return json({ type: 4, data: { content: "❌ Seule la Sorcière peut utiliser ce pouvoir.", flags: 64 } });
+  if (!so) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(so.lang ?? "fr");
+  if (userId !== so.sorciereId) return json({ type: 4, data: { content: i18n.errors.onlySorciere, flags: 64 } });
 
   const customId: string = interaction.data?.custom_id || "";
   const targetId = customId.replace(`sorciere_target_${so.gameNumber}_`, "");
   const target = so.targets.find((t) => t.id === targetId);
-  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+  if (!target) return json({ type: 4, data: { content: i18n.errors.invalidTarget, flags: 64 } });
 
   so.witchKillTargetId = targetId;
   so.resolved = true;
@@ -3550,12 +3630,12 @@ async function handleSorciereTarget(interaction: any, env: Env, ctx: ExecutionCo
     type: 7,
     data: {
       embeds: [{
-        title: `🧪 Sorcière — Partie #${so.gameNumber}`,
+        title: i18n.game.sorciereTitle(so.gameNumber),
         url: stateUrl,
         description: [
-          `💀 Tu as utilisé la **Potion de Mort** sur **${target.name}**!`,
+          i18n.game.sorciereDeathUsedMsg(target.name),
           "",
-          "*Ton poison fera effet cette nuit...*",
+          i18n.game.sorciereDeathUsedDesc,
         ].join("\n"),
         color: EMBED_COLOR,
         thumbnail: { url: getRoleImage("sorciere") },
@@ -3568,8 +3648,9 @@ async function handleSorciereTarget(interaction: any, env: Env, ctx: ExecutionCo
 async function handleSorciereSkip(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
   const so = parseSorciereFromEmbed(interaction.message);
-  if (!so) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
-  if (userId !== so.sorciereId) return json({ type: 4, data: { content: "❌ Seule la Sorcière peut faire ça.", flags: 64 } });
+  if (!so) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(so.lang ?? "fr");
+  if (userId !== so.sorciereId) return json({ type: 4, data: { content: i18n.errors.onlySorciereDo, flags: 64 } });
 
   so.resolved = true;
   const stateUrl = `https://garou.bot/so/${encodeSorciereState(so)}`;
@@ -3591,9 +3672,9 @@ async function handleSorciereSkip(interaction: any, env: Env, ctx: ExecutionCont
     type: 7,
     data: {
       embeds: [{
-        title: `🧪 Sorcière — Partie #${so.gameNumber}`,
+        title: i18n.game.sorciereTitle(so.gameNumber),
         url: stateUrl,
-        description: "Tu as choisi de ne rien faire cette nuit.",
+        description: i18n.game.sorciereSkippedDesc,
         color: EMBED_COLOR_PURPLE,
         thumbnail: { url: getRoleImage("sorciere") },
       }],
@@ -3614,15 +3695,18 @@ interface LoupBlancVoteState {
   dmChannelId: string;
   dmMessageId: string;
   deadline: number;
+  lang?: Locale;
 }
 
 function encodeLBState(lb: LoupBlancVoteState): string {
-  return btoa(JSON.stringify({
+  const o: Record<string, unknown> = {
     g: lb.gameNumber, gi: lb.guildId, gc: lb.gameChannelId,
     lm: lb.lobbyMessageId, lb: lb.loupBlancId,
     t: lb.targets.map((t) => [t.id, t.name]),
     dc: lb.dmChannelId, dm: lb.dmMessageId, dl: lb.deadline,
-  }));
+  };
+  if (lb.lang) o.ln = lb.lang;
+  return btoa(JSON.stringify(o));
 }
 
 function decodeLBState(url: string): LoupBlancVoteState | null {
@@ -3635,6 +3719,7 @@ function decodeLBState(url: string): LoupBlancVoteState | null {
       lobbyMessageId: c.lm, loupBlancId: c.lb,
       targets: (c.t as [string, string][]).map(([id, name]) => ({ id, name })),
       dmChannelId: c.dc, dmMessageId: c.dm, deadline: c.dl,
+      lang: c.ln ?? "fr",
     };
   } catch { return null; }
 }
@@ -3648,10 +3733,12 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
   const loupBlancEntry = Object.entries(game.roles).find(([id, r]) => r === "loup_blanc" && !dead.includes(id));
   if (!loupBlancEntry) return;
 
+  const i18n = t(game.lang ?? "fr");
+
   // Update lobby status
   await updatePhaseStatus(token, game,
-    "⚪ Le Loup-Garou Blanc rôde...",
-    "*Une ombre plus pâle que les autres se faufile parmi les loups...*",
+    i18n.game.loupBlancWake,
+    i18n.game.loupBlancWakeDesc,
     0xffffff, getRoleImage("loup_blanc"),
   );
   const loupBlancId = loupBlancEntry[0];
@@ -3771,6 +3858,7 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
     dmChannelId: dmChannel.id,
     dmMessageId: "", // will be set after sending
     deadline,
+    lang: game.lang,
   };
 
   const stateUrl = `https://garou.bot/lb/${encodeLBState(lbState)}`;
@@ -3796,17 +3884,17 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
   currentRow.push({
     type: 2,
     style: 2,
-    label: "⏭️ Passer",
+    label: i18n.game.loupBlancPassBtn,
     custom_id: `lb_skip_${game.gameNumber}`,
   });
   buttonRows.push({ type: 1, components: currentRow });
 
   const dmMsg: any = await sendMessage(token, dmChannel.id, {
     embeds: [{
-      title: `⚪ Loup-Garou Blanc — Nuit ${game.nightCount}`,
+      title: i18n.game.loupBlancNightTitle(game.nightCount ?? 1),
       url: stateUrl,
       description: [
-        "**C'est ton tour!** Tu peux éliminer un loup-garou cette nuit.",
+        i18n.game.loupBlancTurn,
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
@@ -3814,9 +3902,9 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
-        `⏰ Tu as **${LOUP_BLANC_VOTE_SECONDS}s** pour décider. (<t:${deadline}:R>)`,
+        i18n.game.loupBlancDeadline(LOUP_BLANC_VOTE_SECONDS, deadline),
         "",
-        "*Tu peux aussi passer ton tour.*",
+        i18n.game.loupBlancPassNote,
       ].join("\n"),
       color: 0xffffff,
       thumbnail: { url: getRoleImage("loup_blanc") },
@@ -3841,17 +3929,20 @@ async function phaseLoupBlancVote(token: string, game: GameState, ctx: Execution
 
 async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur.", flags: 64 } });
+  if (!userId) return json({ type: 4, data: { content: t("fr").errors.error, flags: 64 } });
 
   const lb = (() => {
     const embed = interaction.message?.embeds?.[0];
     if (!embed?.url?.includes("/lb/")) return null;
     return decodeLBState(embed.url);
   })();
-  if (!lb) return json({ type: 4, data: { content: "❌ Erreur: état introuvable.", flags: 64 } });
+  if (!lb) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+
+  // Recover lang from game state in background; use "fr" fallback for immediate responses
+  const i18n = t(lb.lang ?? "fr");
 
   if (userId !== lb.loupBlancId) {
-    return json({ type: 4, data: { content: "❌ Ce n'est pas ton choix.", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.game.loupBlancNotYou, flags: 64 } });
   }
 
   const customId: string = interaction.data?.custom_id || "";
@@ -3874,8 +3965,8 @@ async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionCon
       type: 7,
       data: {
         embeds: [{
-          title: "⚪ Loup-Garou Blanc — Passé",
-          description: "Tu as choisi de ne tuer personne cette nuit.",
+          title: i18n.game.loupBlancSkipped,
+          description: i18n.game.loupBlancSkippedDesc,
           color: 0xffffff,
           thumbnail: { url: getRoleImage("loup_blanc") },
         }],
@@ -3887,15 +3978,15 @@ async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionCon
   // Handle kill
   const targetId = customId.replace(`lb_kill_${lb.gameNumber}_`, "");
   const target = lb.targets.find((t) => t.id === targetId);
-  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+  if (!target) return json({ type: 4, data: { content: i18n.errors.invalidTarget, flags: 64 } });
 
   // Remove buttons immediately
   const ackResponse = json({
     type: 7,
     data: {
       embeds: [{
-        title: "⚪ Loup-Garou Blanc — Choix fait",
-        description: `Tu as choisi d'éliminer **${target.name}**.`,
+        title: i18n.game.loupBlancChoiceMade,
+        description: i18n.game.loupBlancChoiceMadeDesc(target.name),
         color: 0xffffff,
         thumbnail: { url: getRoleImage("loup_blanc") },
       }],
@@ -3940,13 +4031,15 @@ async function handleLoupBlancKill(interaction: any, env: Env, ctx: ExecutionCon
       }
 
       // Announce mysterious death in game channel
+      // Recover lang from game for announcement
+      const lbI18n = game ? t(game.lang ?? "fr") : i18n;
       await sendMessage(token, lb.gameChannelId, {
         embeds: [{
-          title: "💀 Une mort mystérieuse...",
+          title: lbI18n.game.loupBlancMysteriousDeath,
           description: [
-            `Au petit matin, les villageois trouvent le corps sans vie de **${target.name}** (<@${targetId}>).`,
+            lbI18n.game.loupBlancBodyFound(target.name, `<@${targetId}>`),
             "",
-            "*Personne ne sait ce qui s'est passé...*",
+            lbI18n.game.loupBlancMysteriousDesc,
           ].join("\n"),
           color: 0xffffff,
           image: { url: SCENE_IMAGES.night_kill },
@@ -3982,10 +4075,20 @@ async function phaseLoupBlancTimer(token: string, data: any, ctx: ExecutionConte
   if (!checkMsg.components?.length) { console.log("[loupBlancTimer] Already resolved"); return; }
 
   // Timeout — no kill
+  // Try to get lang from game state; fallback to "fr"
+  let lbTimerLang: Locale = "fr";
+  if (data.gameChannelId && data.lobbyMessageId) {
+    try {
+      const lm: any = await getMessage(token, data.gameChannelId, data.lobbyMessageId);
+      const g = parseGameFromEmbed(lm);
+      if (g?.lang) lbTimerLang = g.lang;
+    } catch {}
+  }
+  const i18n = t(lbTimerLang);
   await editMessage(token, dmChannelId, dmMessageId, {
     embeds: [{
-      title: "⚪ Loup-Garou Blanc — Temps écoulé",
-      description: "Tu n'as pas choisi à temps. Aucun loup n'est éliminé cette nuit.",
+      title: i18n.game.loupBlancTimeout,
+      description: i18n.game.loupBlancTimeoutDesc,
       color: 0xffffff,
       thumbnail: { url: getRoleImage("loup_blanc") },
     }],
@@ -4027,10 +4130,12 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
     } catch {}
   }
 
+  const i18n = t(game.lang ?? "fr");
+
   // Update lobby status with countdown
   await updatePhaseStatus(token, game,
-    `💬 Discussion — ${discussionSeconds}s`,
-    `*Les villageois discutent librement...*\n\n⏰ Fin de la discussion <t:${deadline}:R>`,
+    i18n.game.discussionStatus(discussionSeconds),
+    i18n.game.discussionStatusDesc(deadline),
     EMBED_COLOR_ORANGE, SCENE_IMAGES.dawn_breaks,
   );
 
@@ -4049,7 +4154,7 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
         const role = game.roles![bot.id] ?? "villageois";
         await sleep(2000 + Math.floor(Math.random() * 2000));
         try {
-          await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers);
+          await executeBotDiscussion(token, env, bot, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers, game);
         } catch (e) {
           console.error(`[discussion] ⏱️ bot msg error:`, e);
         }
@@ -4116,11 +4221,13 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
   const livingPlayers = game.players.filter((id) => !dead.includes(id));
   const voteSeconds = game.voteTime ?? 60;
 
+  const i18n = t(game.lang ?? "fr");
+
   // Update lobby status
   const deadline2 = Math.floor(Date.now() / 1000) + voteSeconds;
   await updatePhaseStatus(token, game,
-    "🗳️ Vote du village",
-    `*Le village doit choisir qui éliminer...*\n\n⏰ Fin du vote: <t:${deadline2}:R>`,
+    i18n.game.dayVoteStatus,
+    i18n.game.dayVoteStatusDesc(deadline2),
     EMBED_COLOR, SCENE_IMAGES.day_elimination,
   );
   const deadline = Math.floor(Date.now() / 1000) + voteSeconds;
@@ -4160,6 +4267,7 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
     couple: game.couple,
     discussionTime: game.discussionTime,
     voteTime: game.voteTime,
+    lang: game.lang,
   };
 
   const stateUrl = `https://garou.bot/dv/${encodeDayVoteState(dvState)}`;
@@ -4168,9 +4276,9 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
   const voterLines = allVoters.map((id) => {
     if (id.startsWith("bot_")) {
       const b = aliveBots.find((b) => b.id === id);
-      return `⬜ 🤖 ${b?.name ?? id} — *en attente...*`;
+      return `⬜ 🤖 ${b?.name ?? id} — *${i18n.game.dayVoteWaiting}*`;
     }
-    return `⬜ <@${id}> — *en attente...*`;
+    return `⬜ <@${id}> — *${i18n.game.dayVoteWaiting}*`;
   });
 
   // Build buttons (5 per row max)
@@ -4188,7 +4296,7 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
   }
   // Add skip button
   currentRow.push({
-    type: 2, style: 2, label: "⏭️ Passer",
+    type: 2, style: 2, label: i18n.game.dayVoteSkipBtn,
     custom_id: `day_skip_${game.gameNumber}`,
   });
   if (currentRow.length > 5) {
@@ -4200,12 +4308,12 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
 
   const voteMsg: any = await sendMessage(token, game.gameChannelId, {
     embeds: [{
-      title: `🗳️ Vote du village — Partie #${game.gameNumber}`,
+      title: i18n.game.dayVoteTitle(game.gameNumber),
       url: stateUrl,
       description: [
-        "Votez pour éliminer un suspect, ou passez votre tour.",
+        i18n.game.dayVoteDesc,
         "",
-        `⏰ Fin du vote: <t:${deadline}:R>`,
+        i18n.game.dayVoteDeadline(deadline),
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
@@ -4240,7 +4348,7 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
       await sleep(2000 + Math.floor(Math.random() * 2000));
       try {
         const botRole = game.roles?.[bot.id] ?? "villageois";
-        await executeBotDayVote(token, env, bot, bots, game.gameChannelId, voteMsg.id, game.gameNumber, botRole, ctx);
+        await executeBotDayVote(token, env, bot, bots, game.gameChannelId, voteMsg.id, game.gameNumber, botRole, ctx, game);
       } catch (err) {
         console.error(`[dayVote] Bot ${bot.name} vote failed:`, err);
       }
@@ -4254,17 +4362,18 @@ async function phaseDayVote(token: string, data: any, ctx: ExecutionContext, env
 
 async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur.", flags: 64 } });
+  if (!userId) return json({ type: 4, data: { content: t("fr").errors.error, flags: 64 } });
 
   const dv = parseDayVoteFromEmbed(interaction.message);
-  if (!dv) return json({ type: 4, data: { content: "❌ Erreur: vote introuvable.", flags: 64 } });
+  if (!dv) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(dv.lang ?? "fr");
 
   if (!dv.voters.includes(userId)) {
-    return json({ type: 4, data: { content: "❌ Tu ne peux pas voter (éliminé ou non-joueur).", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.errors.cantVote, flags: 64 } });
   }
 
   if (Math.floor(Date.now() / 1000) > dv.deadline) {
-    return json({ type: 4, data: { content: "⏰ Le temps de vote est écoulé!", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.errors.voteTimeUp, flags: 64 } });
   }
 
   const customId: string = interaction.data?.custom_id || "";
@@ -4275,7 +4384,7 @@ async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext):
   } else {
     const targetId = customId.replace(`day_vote_${dv.gameNumber}_`, "");
     if (!dv.targets.find((t) => t.id === targetId)) {
-      return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+      return json({ type: 4, data: { content: i18n.errors.invalidTarget, flags: 64 } });
     }
     dv.votes[userId] = targetId;
   }
@@ -4285,22 +4394,22 @@ async function handleDayVote(interaction: any, env: Env, ctx: ExecutionContext):
     const vote = dv.votes[id];
     const isBot = id.startsWith("bot_");
     const displayName = isBot ? `🤖 ${dv.targets.find((t) => t.id === id)?.name ?? id}` : `<@${id}>`;
-    if (!vote) return `⬜ ${displayName} — *en attente...*`;
-    if (vote === "skip") return `⏭️ ${displayName} — **Passe**`;
+    if (!vote) return `⬜ ${displayName} — *${i18n.game.dayVoteWaiting}*`;
+    if (vote === "skip") return `⏭️ ${displayName} — ${i18n.game.dayVoteSkipped}`;
     const target = dv.targets.find((t) => t.id === vote);
-    return `✅ ${displayName} — a voté pour **${target?.name ?? "?"}**`;
+    return `✅ ${displayName} — ${i18n.game.dayVotedFor(target?.name ?? "?")}`;
   });
 
   const allVoted = dv.voters.every((id) => dv.votes[id]);
 
   const updatedUrl = `https://garou.bot/dv/${encodeDayVoteState(dv)}`;
   const updatedEmbed = {
-    title: `🗳️ Vote du village — Partie #${dv.gameNumber}`,
+    title: i18n.game.dayVoteTitle(dv.gameNumber),
     url: updatedUrl,
     description: [
-      "Votez pour éliminer un suspect, ou passez votre tour.",
+      i18n.game.dayVoteDesc,
       "",
-      `⏰ Fin du vote: <t:${dv.deadline}:R>`,
+      i18n.game.dayVoteDeadline(dv.deadline),
       "",
       "━━━━━━━━━━━━━━━━━━━━",
       "",
@@ -4338,6 +4447,8 @@ async function phaseDayVoteTimer(token: string, data: any, ctx: ExecutionContext
 }
 
 async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionContext, env: Env) {
+  const i18n = t(dv.lang ?? "fr");
+
   // Count votes (ignore "skip")
   const tally: Record<string, number> = {};
   for (const [, targetId] of Object.entries(dv.votes)) {
@@ -4350,8 +4461,8 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
     // All skip or no votes
     await sendMessage(token, dv.gameChannelId, {
       embeds: [{
-        title: "🗳️ Résultat du vote",
-        description: "Le village n'a pas réussi à se mettre d'accord. **Personne n'est éliminé!**",
+        title: i18n.game.dayVoteResultTitle,
+        description: i18n.game.dayVoteNoConsensus,
         color: EMBED_COLOR_GREEN,
       }],
     });
@@ -4371,11 +4482,11 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
     }).join(", ");
     await sendMessage(token, dv.gameChannelId, {
       embeds: [{
-        title: "🗳️ Égalité!",
+        title: i18n.game.dayVoteTie,
         description: [
-          `Égalité entre ${tiedNames} (${maxVotes} voix chacun).`,
+          i18n.game.dayVoteTieDesc(tiedNames, maxVotes),
           "",
-          "**Personne n'est éliminé!**",
+          i18n.game.dayVoteNobodyEliminated,
         ].join("\n"),
         color: EMBED_COLOR_GREEN,
       }],
@@ -4424,15 +4535,17 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
   const eliminatedDisplay = isBot
     ? `🤖 **${eliminatedName}**`
     : `**${eliminatedName}** (<@${eliminatedId}>)`;
+  const eliminatedRoleName = getRoleName(eliminatedRole, dv.lang ?? "fr");
+  const eliminatedRoleDesc = getRoleDescription(eliminatedRole, dv.lang ?? "fr");
   await sendMessage(token, dv.gameChannelId, {
     embeds: [{
-      title: "⚖️ Le village a rendu son verdict!",
+      title: i18n.game.dayVoteVerdict,
       description: [
-        `${eliminatedDisplay} a été éliminé(e) par le village!`,
+        i18n.game.dayVoteEliminated(eliminatedDisplay),
         "",
-        `${roleInfo.emoji} C'était **${roleInfo.name}**!`,
+        i18n.game.dayVoteWas(roleInfo.emoji, eliminatedRoleName),
         "",
-        `*${roleInfo.description}*`,
+        `*${eliminatedRoleDesc}*`,
       ].join("\n"),
       color: EMBED_COLOR,
       thumbnail: { url: getRoleImage(eliminatedRole) },
@@ -4467,15 +4580,16 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
       }
       const partnerRole = game.roles?.[partnerId] ?? "villageois";
       const partnerRoleInfo = ROLES[partnerRole] ?? ROLES.villageois!;
+      const partnerRoleName = getRoleName(partnerRole, dv.lang ?? "fr");
       const partnerDisplay = partnerIsBot ? `🤖 **${pName}**` : `**${pName}** (<@${partnerId}>)`;
       await sleep(2000);
       await sendMessage(token, dv.gameChannelId, {
         embeds: [{
-          title: "💔 Le couple est brisé...",
+          title: i18n.game.coupleBroken,
           description: [
-            `${partnerDisplay} meurt de chagrin.`,
+            i18n.game.coupleGrief(partnerDisplay),
             "",
-            `${partnerRoleInfo.emoji} C'était **${partnerRoleInfo.name}**!`,
+            i18n.game.dayVoteWas(partnerRoleInfo.emoji, partnerRoleName),
           ].join("\n"),
           color: 0xe91e63,
         }],
@@ -4483,11 +4597,11 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
     }
   }
 
-  // Append to game history
+  // Append to game history (always English for logs)
   await appendHistory(
     env.ACTIVE_PLAYERS,
     game.gameNumber,
-    `Jour: ${eliminatedName} a été éliminé(e) par le village. ${roleInfo.name}.`,
+    `Day: ${eliminatedName} was eliminated by the village. ${roleInfo.name}.`,
   );
 
   // Check chasseur
@@ -4553,8 +4667,8 @@ async function resolveDayVote(token: string, dv: DayVoteState, ctx: ExecutionCon
 
   await sendMessage(token, game.gameChannelId, {
     embeds: [{
-      title: "🌙 Le village se rendort...",
-      description: "*Les villageois ferment les yeux...*\n*Le silence retombe sur le village...*",
+      title: i18n.game.nightTransition,
+      description: i18n.game.nightTransitionDesc,
       color: EMBED_COLOR_NIGHT,
       image: { url: SCENE_IMAGES.night_falls },
     }],
@@ -4599,10 +4713,11 @@ async function startNextNight(token: string, dv: DayVoteState, ctx: ExecutionCon
   }
 
   // Send transition message
+  const i18nNight = t(game.lang ?? "fr");
   await sendMessage(token, dv.gameChannelId, {
     embeds: [{
-      title: "🌙 Le village se rendort...",
-      description: "*Les villageois ferment les yeux...*\n*Le silence retombe sur le village...*",
+      title: i18nNight.game.nightTransition,
+      description: i18nNight.game.nightTransitionDesc,
       color: EMBED_COLOR_NIGHT,
       image: { url: SCENE_IMAGES.night_falls },
     }],
@@ -4616,18 +4731,19 @@ async function startNextNight(token: string, dv: DayVoteState, ctx: ExecutionCon
 
 async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+  if (!userId) return json({ type: 4, data: { content: t("fr").errors.userNotFound, flags: 64 } });
 
   const vote = parseVoteFromEmbed(interaction.message);
-  if (!vote) return json({ type: 4, data: { content: "❌ Erreur: vote introuvable.", flags: 64 } });
+  if (!vote) return json({ type: 4, data: { content: t("fr").errors.stateNotFound, flags: 64 } });
+  const i18n = t(vote.lang ?? "fr");
 
   if (!vote.wolves.includes(userId)) {
-    return json({ type: 4, data: { content: "❌ Seuls les loups-garous peuvent voter.", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.game.onlyWolvesVote, flags: 64 } });
   }
 
   // Check if time expired
   if (Math.floor(Date.now() / 1000) > vote.deadline) {
-    return json({ type: 4, data: { content: "⏰ Le temps de vote est écoulé!", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.errors.voteTimeUp, flags: 64 } });
   }
 
   // Extract target ID from custom_id: vote_kill_{gameNumber}_{targetId}
@@ -4635,7 +4751,7 @@ async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext)
   const targetId = customId.replace(`vote_kill_${vote.gameNumber}_`, "");
 
   const target = vote.targets.find((t) => t.id === targetId);
-  if (!target) return json({ type: 4, data: { content: "❌ Cible invalide.", flags: 64 } });
+  if (!target) return json({ type: 4, data: { content: i18n.errors.invalidTarget, flags: 64 } });
 
   // Record vote
   vote.votes[userId] = targetId;
@@ -4661,18 +4777,19 @@ async function handleVoteKill(interaction: any, env: Env, ctx: ExecutionContext)
 
 async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+  if (!userId) return json({ type: 4, data: { content: t("fr").errors.userNotFound, flags: 64 } });
 
   const game = parseGameFromEmbed(interaction.message);
-  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
-  if (!game.roles) return json({ type: 4, data: { content: "❌ Les rôles n'ont pas encore été distribués.", flags: 64 } });
+  if (!game) return json({ type: 4, data: { content: t("fr").errors.gameNotFound, flags: 64 } });
+  const i18n = t(game.lang ?? "fr");
+  if (!game.roles) return json({ type: 4, data: { content: i18n.errors.rolesNotDistributed, flags: 64 } });
 
   if (!game.players.includes(userId)) {
-    return json({ type: 4, data: { content: "❌ Tu ne fais pas partie de cette partie.", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.errors.notInGame, flags: 64 } });
   }
 
   const roleKey = game.roles[userId];
-  if (!roleKey) return json({ type: 4, data: { content: "❌ Aucun rôle trouvé pour toi.", flags: 64 } });
+  if (!roleKey) return json({ type: 4, data: { content: i18n.errors.noRoleFound, flags: 64 } });
 
   const role = ROLES[roleKey]!;
   const token = env.DISCORD_BOT_TOKEN;
@@ -4727,9 +4844,11 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
   }
 
   // Build description lines
+  const roleName = getRoleName(roleKey, game.lang ?? "fr");
+  const roleDesc = getRoleDescription(roleKey, game.lang ?? "fr");
   const descLines = [
     "",
-    `> ${role.description}`,
+    `> ${roleDesc}`,
     "",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
@@ -4741,17 +4860,17 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
       .filter(([id, r]) => (r === "loup" || r === "loup_blanc") && id !== userId)
       .map(([id]) => `🐺 <@${id}>`);
     if (teammates.length > 0) {
-      descLines.push(`**Tes coéquipiers:**`, ...teammates, "", "━━━━━━━━━━━━━━━━━━━━", "");
+      descLines.push(i18n.game.yourTeammates, ...teammates, "", "━━━━━━━━━━━━━━━━━━━━", "");
     }
     if (roleKey === "loup_blanc") {
-      descLines.push("⚪ **Objectif secret:** Élimine tous les autres joueurs — loups compris — pour gagner seul!", "", "━━━━━━━━━━━━━━━━━━━━", "");
+      descLines.push(i18n.game.loupBlancSecretObj, "", "━━━━━━━━━━━━━━━━━━━━", "");
     }
   }
 
   descLines.push(
-    `🎮 **Partie #${game.gameNumber}**`,
-    `👥 **${game.players.length} joueurs**`,
-    `⚔️ Équipe: **${role.team === "loups" ? "Loups-Garous 🐺" : "Village 🏘️"}**`,
+    i18n.game.gameLabel(game.gameNumber),
+    i18n.game.playersLabel(game.players.length),
+    `${i18n.game.teamLabel} **${role.team === "loups" ? i18n.game.teamWolves : i18n.game.teamVillage}**`,
   );
 
   return json({
@@ -4759,11 +4878,11 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
     data: {
       embeds: [
         {
-          title: `${role.emoji} Tu es ${role.name}`,
+          title: i18n.game.youAre(role.emoji, roleName),
           description: descLines.join("\n"),
           color: role.team === "loups" ? EMBED_COLOR : EMBED_COLOR_GREEN,
           image: { url: getRoleImage(roleKey) },
-          footer: { text: "🤫 Ne révèle ton rôle à personne!" },
+          footer: { text: i18n.game.dontRevealFooter },
         },
       ],
       flags: 64,
@@ -4775,17 +4894,18 @@ async function handleRevealRole(interaction: any, env: Env, ctx: ExecutionContex
 
 async function handleStart(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+  if (!userId) return json({ type: 4, data: { content: t("fr").errors.userNotFound, flags: 64 } });
 
   const game = parseGameFromEmbed(interaction.message);
-  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+  if (!game) return json({ type: 4, data: { content: t("fr").errors.gameNotFound, flags: 64 } });
+  const i18n = t(game.lang ?? "fr");
 
   if (userId !== game.creatorId) {
-    return json({ type: 4, data: { content: `❌ Seul le créateur (<@${game.creatorId}>) peut lancer la partie.`, flags: 64 } });
+    return json({ type: 4, data: { content: i18n.game.onlyCreatorStart(game.creatorId), flags: 64 } });
   }
 
   if (game.players.length < 1) {
-    return json({ type: 4, data: { content: "❌ Il faut au minimum 1 joueur pour lancer.", flags: 64 } });
+    return json({ type: 4, data: { content: i18n.game.needMinPlayers, flags: 64 } });
   }
 
   const token = env.DISCORD_BOT_TOKEN;
@@ -4800,6 +4920,7 @@ async function handleStart(interaction: any, env: Env, ctx: ExecutionContext): P
       name: p.name,
       traits: p.traits,
       emoji: p.emoji,
+      avatarUrl: p.avatarUrl,
       alive: true,
     }));
     game.botCount = bots.length;
@@ -4808,7 +4929,7 @@ async function handleStart(interaction: any, env: Env, ctx: ExecutionContext): P
 
   const totalWithBots = game.players.length + (game.botCount ?? 0);
   if (totalWithBots < MIN_PLAYERS) {
-    return json({ type: 4, data: { content: `❌ Il faut au minimum ${MIN_PLAYERS} joueurs (humains + bots) pour lancer.`, flags: 64 } });
+    return json({ type: 4, data: { content: i18n.game.needMinPlayersTotal(MIN_PLAYERS), flags: 64 } });
   }
 
   // Use deferred response + background for the animation
@@ -4818,13 +4939,14 @@ async function handleStart(interaction: any, env: Env, ctx: ExecutionContext): P
 
 async function handleSkipCountdown(interaction: any, env: Env, ctx: ExecutionContext): Promise<Response> {
   const userId = interaction.member?.user?.id || interaction.user?.id;
-  if (!userId) return json({ type: 4, data: { content: "❌ Erreur: utilisateur introuvable.", flags: 64 } });
+  if (!userId) return json({ type: 4, data: { content: t("fr").errors.userNotFound, flags: 64 } });
 
   const game = parseGameFromEmbed(interaction.message);
-  if (!game) return json({ type: 4, data: { content: "❌ Erreur: partie introuvable.", flags: 64 } });
+  if (!game) return json({ type: 4, data: { content: t("fr").errors.gameNotFound, flags: 64 } });
+  const i18n = t(game.lang ?? "fr");
 
   if (userId !== game.creatorId) {
-    return json({ type: 4, data: { content: `❌ Seul le créateur (<@${game.creatorId}>) peut sauter le compte à rebours.`, flags: 64 } });
+    return json({ type: 4, data: { content: i18n.game.onlyCreatorSkip(game.creatorId), flags: 64 } });
   }
 
   const token = env.DISCORD_BOT_TOKEN;
@@ -4918,7 +5040,7 @@ export default {
     }
 
     console.error("Unknown interaction:", JSON.stringify({ type: interaction.type, customId: interaction.data?.custom_id, component_type: interaction.data?.component_type }));
-    return json({ type: 4, data: { content: "❌ Action inconnue.", flags: 64 } });
+    return json({ type: 4, data: { content: t("fr").errors.unknownAction, flags: 64 } });
   },
 
   /** Queue consumer — each message gets a FRESH worker invocation with full CPU budget.

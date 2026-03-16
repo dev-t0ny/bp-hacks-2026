@@ -155,22 +155,6 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
         components: [
           {
             type: 3,
-            custom_id: "cfg_lang",
-            placeholder: c.langLabel,
-            min_values: 1,
-            max_values: 1,
-            options: [
-              { label: c.langFr, value: "fr", default: config.lang === "fr" },
-              { label: c.langEn, value: "en", default: config.lang === "en" },
-            ],
-          },
-        ],
-      },
-      {
-        type: 1,
-        components: [
-          {
-            type: 3,
             custom_id: "cfg_preset",
             placeholder: c.selectPreset,
             min_values: 1,
@@ -217,6 +201,38 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
         type: 1,
         components: [
           {
+            type: 3,
+            custom_id: "cfg_timers",
+            placeholder: c.timerLabel,
+            min_values: 1,
+            max_values: 1,
+            options: [
+              { label: c.ultraFast, value: "30_30", default: config.discussionTime === 30 && config.voteTime === 30 },
+              { label: c.fast1, value: "60_30", default: config.discussionTime === 60 && config.voteTime === 30 },
+              { label: c.fast2, value: "90_30", default: config.discussionTime === 90 && config.voteTime === 30 },
+              { label: c.normal, value: "120_60", default: config.discussionTime === 120 && config.voteTime === 60 },
+              { label: c.long, value: "180_90", default: config.discussionTime === 180 && config.voteTime === 90 },
+              { label: c.veryLong, value: "210_120", default: config.discussionTime === 210 && config.voteTime === 120 },
+            ],
+          },
+        ],
+      },
+      {
+        type: 1,
+        components: [
+          {
+            type: 2,
+            style: config.lang === "fr" ? 1 : 2,
+            label: "🇫🇷",
+            custom_id: "cfg_lang_fr",
+          },
+          {
+            type: 2,
+            style: config.lang === "en" ? 1 : 2,
+            label: "🇬🇧",
+            custom_id: "cfg_lang_en",
+          },
+          {
             type: 2,
             style: config.anonymousVotes ? 2 : 1,
             label: c.publicVote,
@@ -233,13 +249,6 @@ export function buildStep1Embed(config: ConfigState, customPresets: PresetConfig
             style: 1,
             label: c.configureRoles,
             custom_id: "cfg_next",
-          },
-          {
-            type: 2,
-            style: 3,
-            label: c.createWithPreset,
-            custom_id: "cfg_create",
-            disabled: !configIsValid(config.selectedRoles),
           },
         ],
       },
