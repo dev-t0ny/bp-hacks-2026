@@ -1784,14 +1784,6 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
     const target = targets[Math.floor(Math.random() * targets.length)]!;
     console.log(`[chasseur] Bot ${chasseurId} auto-shooting ${target.name}`);
 
-    await sendMessage(token, game.gameChannelId, {
-      embeds: [{
-        title: "🏹 Le chasseur tire une dernière flèche!",
-        description: `Dans un dernier souffle, le chasseur abat **${target.name}**!`,
-        color: 0xe67e22, image: { url: SCENE_IMAGES.snipe_reveal },
-      }],
-    });
-
     if (!game.dead) game.dead = [];
     game.dead.push(target.id);
 
@@ -1803,6 +1795,24 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
       try { await setChannelPermission(token, game.gameChannelId, target.id, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
     }
 
+    const targetRoleKey = game.roles?.[target.id] ?? "villageois";
+    const targetRoleInfo = ROLES[targetRoleKey] ?? ROLES.villageois!;
+    const targetDisplay = target.id.startsWith("bot_") ? `🤖 **${target.name}**` : `**${target.name}** (<@${target.id}>)`;
+    await sleep(2000);
+    await sendMessage(token, game.gameChannelId, {
+      embeds: [{
+        title: "🏹 Le chasseur tire une dernière flèche!",
+        description: [
+          `Dans un dernier souffle, le chasseur abat ${targetDisplay}!`,
+          "",
+          `${targetRoleInfo.emoji} C'était **${targetRoleInfo.name}**!`,
+        ].join("\n"),
+        color: 0xe67e22,
+        thumbnail: { url: getRoleImage(targetRoleKey) },
+        image: { url: SCENE_IMAGES.snipe_reveal },
+      }],
+    });
+
     // Couple death chain
     if (game.couple && game.couple.includes(target.id)) {
       const pid = target.id === game.couple[0] ? game.couple[1] : game.couple[0];
@@ -1812,7 +1822,11 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
           try { await setChannelPermission(token, game.gameChannelId, pid, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
         }
         const pName = pid.startsWith("bot_") ? chBots.find(b => b.id === pid)?.name ?? "?" : ((await getGuildMember(token, game.guildId, pid).catch(() => null) as any)?.nick || "?");
-        await sendMessage(token, game.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: `**${pName}** meurt de chagrin.`, color: 0xe91e63 }] });
+        const pRoleKey = game.roles?.[pid] ?? "villageois";
+        const pRoleInfo = ROLES[pRoleKey] ?? ROLES.villageois!;
+        const pDisplay = pid.startsWith("bot_") ? `🤖 **${pName}**` : `**${pName}** (<@${pid}>)`;
+        await sleep(2000);
+        await sendMessage(token, game.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: [`${pDisplay} meurt de chagrin.`, "", `${pRoleInfo.emoji} C'était **${pRoleInfo.name}**!`].join("\n"), color: 0xe91e63 }] });
       }
     }
 
@@ -1827,7 +1841,7 @@ async function triggerChasseurShoot(token: string, game: GameState, chasseurId: 
     }
 
     const wr = checkWinCondition(game);
-    if (wr) { await sleep(2000); await announceVictory(token, game, wr, env); return; }
+    if (wr) { await sleep(3000); await announceVictory(token, game, wr, env); return; }
     await sleep(2000);
     await dispatchPhase(token, "day_discussion", { game }, ctx, env);
     return;
@@ -1870,14 +1884,6 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
   } });
 
   ctx.waitUntil((async () => {
-    await sendMessage(token, s.gameChannelId, {
-      embeds: [{
-        title: "🏹 Le chasseur tire une dernière flèche!",
-        description: `Dans un dernier souffle, le chasseur abat **${target.name}** (<@${target.id}>)!`,
-        color: 0xe67e22, image: { url: SCENE_IMAGES.snipe_reveal },
-      }],
-    });
-
     let game: GameState | null = null;
     try {
       const lobbyMsg: any = await getMessage(token, s.gameChannelId, s.lobbyMessageId);
@@ -1886,6 +1892,21 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
     if (!game) return;
     if (!game.dead) game.dead = [];
     game.dead.push(target.id);
+
+    const tRoleKey = game.roles?.[target.id] ?? "villageois";
+    const tRoleInfo = ROLES[tRoleKey] ?? ROLES.villageois!;
+    const tDisplay = target.id.startsWith("bot_") ? `🤖 **${target.name}**` : `**${target.name}** (<@${target.id}>)`;
+    await sendMessage(token, s.gameChannelId, {
+      embeds: [{
+        title: "🏹 Le chasseur tire une dernière flèche!",
+        description: [
+          `Dans un dernier souffle, le chasseur abat ${tDisplay}!`,
+          "",
+          `${tRoleInfo.emoji} C'était **${tRoleInfo.name}**!`,
+        ].join("\n"),
+        color: 0xe67e22, thumbnail: { url: getRoleImage(tRoleKey) }, image: { url: SCENE_IMAGES.snipe_reveal },
+      }],
+    });
 
     try {
       await setChannelPermission(token, s.gameChannelId, target.id, {
@@ -1900,8 +1921,12 @@ async function handleChasseurShoot(interaction: any, env: Env, ctx: ExecutionCon
         try { await setChannelPermission(token, s.gameChannelId, partnerId, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
         const pm: any = await getGuildMember(token, game.guildId, partnerId).catch(() => null);
         const pName = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
+        const pRoleKey = game.roles?.[partnerId] ?? "villageois";
+        const pRoleInfo = ROLES[pRoleKey] ?? ROLES.villageois!;
+        const pDisplay = partnerId.startsWith("bot_") ? `🤖 **${pName}**` : `**${pName}** (<@${partnerId}>)`;
+        await sleep(2000);
         await sendMessage(token, s.gameChannelId, {
-          embeds: [{ title: "💔 Le couple est brisé...", description: `**${pName}** (<@${partnerId}>) meurt de chagrin.`, color: 0xe91e63 }],
+          embeds: [{ title: "💔 Le couple est brisé...", description: [`${pDisplay} meurt de chagrin.`, "", `${pRoleInfo.emoji} C'était **${pRoleInfo.name}**!`].join("\n"), color: 0xe91e63 }],
         });
       }
     }
@@ -1949,20 +1974,27 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
     }],
     components: [],
   });
-  await sendMessage(token, s.gameChannelId, {
-    embeds: [{
-      title: "🏹 Le chasseur tire une dernière flèche!",
-      description: `Dans un dernier souffle, le chasseur abat **${target.name}** (<@${target.id}>)!`,
-      color: 0xe67e22, image: { url: SCENE_IMAGES.snipe_reveal },
-    }],
-  });
-
   let game: GameState | null = null;
   try { const lm: any = await getMessage(token, s.gameChannelId, s.lobbyMessageId); game = parseGameFromEmbed(lm); } catch {}
   if (!game) return;
   if (!game.dead) game.dead = [];
   game.dead.push(target.id);
   try { await setChannelPermission(token, s.gameChannelId, target.id, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
+
+  const tRoleKey2 = game.roles?.[target.id] ?? "villageois";
+  const tRoleInfo2 = ROLES[tRoleKey2] ?? ROLES.villageois!;
+  const tDisplay2 = target.id.startsWith("bot_") ? `🤖 **${target.name}**` : `**${target.name}** (<@${target.id}>)`;
+  await sendMessage(token, s.gameChannelId, {
+    embeds: [{
+      title: "🏹 Le chasseur tire une dernière flèche!",
+      description: [
+        `Dans un dernier souffle, le chasseur abat ${tDisplay2}!`,
+        "",
+        `${tRoleInfo2.emoji} C'était **${tRoleInfo2.name}**!`,
+      ].join("\n"),
+      color: 0xe67e22, thumbnail: { url: getRoleImage(tRoleKey2) }, image: { url: SCENE_IMAGES.snipe_reveal },
+    }],
+  });
 
   if (game.couple && game.couple.includes(target.id)) {
     const pid = target.id === game.couple[0] ? game.couple[1] : game.couple[0];
@@ -1971,7 +2003,11 @@ async function phaseChasseurTimer(token: string, data: any, ctx: ExecutionContex
       try { await setChannelPermission(token, s.gameChannelId, pid, { allow: String(1 << 10), deny: String(1 << 11), type: 1 }); } catch {}
       const pm: any = await getGuildMember(token, game.guildId, pid).catch(() => null);
       const pn = pm?.nick || pm?.user?.global_name || pm?.user?.username || "?";
-      await sendMessage(token, s.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: `**${pn}** (<@${pid}>) meurt de chagrin.`, color: 0xe91e63 }] });
+      const pRoleKey2 = game.roles?.[pid] ?? "villageois";
+      const pRoleInfo2 = ROLES[pRoleKey2] ?? ROLES.villageois!;
+      const pDisplay2 = pid.startsWith("bot_") ? `🤖 **${pn}**` : `**${pn}** (<@${pid}>)`;
+      await sleep(2000);
+      await sendMessage(token, s.gameChannelId, { embeds: [{ title: "💔 Le couple est brisé...", description: [`${pDisplay2} meurt de chagrin.`, "", `${pRoleInfo2.emoji} C'était **${pRoleInfo2.name}**!`].join("\n"), color: 0xe91e63 }] });
     }
   }
 
