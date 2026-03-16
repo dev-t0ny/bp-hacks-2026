@@ -2328,36 +2328,41 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
     return;
   }
 
-  const deadline = Math.floor(Date.now() / 1000) + VOYANTE_TIMEOUT_SECONDS;
+  try {
+    const deadline = Math.floor(Date.now() / 1000) + VOYANTE_TIMEOUT_SECONDS;
 
-  // Create private thread for voyante
-  const voyanteThread: any = await createThread(token, game.gameChannelId, {
-    name: "🔮 Vision",
-    type: 12,
-    auto_archive_duration: 1440,
-  });
+    // Create private thread for voyante
+    const voyanteThread: any = await createThread(token, game.gameChannelId, {
+      name: "🔮 Vision",
+      type: 12,
+      auto_archive_duration: 1440,
+    });
 
-  await addThreadMember(token, voyanteThread.id, voyanteId);
+    await addThreadMember(token, voyanteThread.id, voyanteId);
 
-  const vyState: VoyanteState = {
-    gameNumber: game.gameNumber,
-    guildId: game.guildId,
-    gameChannelId: game.gameChannelId,
-    voyanteThreadId: voyanteThread.id,
-    lobbyMessageId: game.lobbyMessageId!,
-    voyanteId,
-    targets,
-    deadline,
-    allRoles: game.roles,
-  };
+    const vyState: VoyanteState = {
+      gameNumber: game.gameNumber,
+      guildId: game.guildId,
+      gameChannelId: game.gameChannelId,
+      voyanteThreadId: voyanteThread.id,
+      lobbyMessageId: game.lobbyMessageId!,
+      voyanteId,
+      targets,
+      deadline,
+      allRoles: game.roles,
+    };
 
-  await sendMessage(token, voyanteThread.id, {
-    content: `<@${voyanteId}>\n\n🔮 **La Voyante se réveille!** Choisis un joueur à espionner.`,
-  });
-  const vyMsg: any = await sendMessage(token, voyanteThread.id, buildVoyanteEmbed(vyState));
+    await sendMessage(token, voyanteThread.id, {
+      content: `<@${voyanteId}>\n\n🔮 **La Voyante se réveille!** Choisis un joueur à espionner.`,
+    });
+    const vyMsg: any = await sendMessage(token, voyanteThread.id, buildVoyanteEmbed(vyState));
 
-  // Schedule timeout via queue (fresh worker invocation)
-  await schedulePhase(env, "voyante_timer", { voyanteMessageId: vyMsg.id, voyanteThreadId: voyanteThread.id, game }, VOYANTE_TIMEOUT_SECONDS);
+    // Schedule timeout via queue (fresh worker invocation)
+    await schedulePhase(env, "voyante_timer", { voyanteMessageId: vyMsg.id, voyanteThreadId: voyanteThread.id, game }, VOYANTE_TIMEOUT_SECONDS);
+  } catch (err) {
+    console.error(`[voyante] ❌ Failed to set up voyante thread, skipping to wolf:`, err);
+    await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
+  }
 }
 
 async function phaseVoyanteTimer(token: string, data: any, ctx: ExecutionContext, env: Env) {
