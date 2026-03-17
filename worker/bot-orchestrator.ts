@@ -538,7 +538,7 @@ export function buildOrchestratorPrompt(
       : "MESSAGES RÉCENTS: Aucun message encore.",
     "",
     gameHistory.length > 0
-      ? `HISTORIQUE DE LA PARTIE:\n${gameHistory.slice(-15).join("\n")}`
+      ? `HISTORIQUE DE LA PARTIE (FAITS PUBLICS connus de tous):\n${gameHistory.slice(-15).join("\n")}`
       : "HISTORIQUE: Début de partie.",
     "",
     "RÈGLES STRICTES:",
@@ -549,7 +549,7 @@ export function buildOrchestratorPrompt(
     "5. Si personne n'est interpellé → un bot lance un sujet: suspicion, observation, question à un autre joueur, partage subtil d'info secrète.",
     "6. Favorise les bots qui ont moins parlé. Un bot avec 0 messages devrait vouloir s'exprimer.",
     "7. Les bots bavards/impulsifs parlent plus souvent. Les silencieux/discrets parlent moins mais font des interventions plus percutantes.",
-    "8. Chaque bot ne connaît QUE ses propres connaissances secrètes. Il ne sait PAS le rôle des autres.",
+    "8. Chaque bot ne connaît QUE ses propres connaissances secrètes. MAIS l'HISTORIQUE est PUBLIC: quand un joueur meurt, son rôle est révélé à TOUS. Si l'historique dit 'C'était Voyante', TOUS les bots le savent. Ne questionne JAMAIS un rôle révélé à la mort.",
     "9. Les loups ne se dénoncent JAMAIS. Ils accusent des innocents et se défendent calmement.",
     "10. Le message doit faire 1-2 phrases MAX, en français familier comme sur Discord (pas formel).",
     "11. Ne répète PAS ce qui a déjà été dit. Apporte un argument NOUVEAU ou rebondis.",
