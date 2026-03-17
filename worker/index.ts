@@ -42,6 +42,9 @@ import {
   type ParsedSorciereResponse,
   type ParsedCupidonResponse,
   type ParsedLoupBlancResponse,
+  buildOrchestratorPrompt,
+  parseOrchestratorResponse,
+  type OrchestratorBot,
 } from "./bot-orchestrator";
 import {
   type GameState,
@@ -2781,18 +2784,27 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
   );
 
   // Targets = all living players (humans + bots) except voyante
-  const targetIds = game.players.filter((id) => id !== voyanteId && !dead.includes(id));
-  const humanTargets = await Promise.all(
-    targetIds.map(async (id) => {
-      const member: any = await getGuildMember(token, game.guildId, id);
-      return { id, name: member.nick || member.user.global_name || member.user.username };
-    })
-  );
-  // Also include alive bots as targets
-  const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
-  const botTargets = bots.filter((b) => b.alive && b.id !== voyanteId && !dead.includes(b.id)).map((b) => ({ id: b.id, name: b.name }));
-  const targets = [...humanTargets, ...botTargets];
-  console.log(`[voyante] Targets: ${targets.map(t => t.name).join(", ")} (${humanTargets.length} humans, ${botTargets.length} bots)`);
+  let targets: { id: string; name: string }[] = [];
+  let bots: BotPlayer[] = [];
+  try {
+    const targetIds = game.players.filter((id) => id !== voyanteId && !dead.includes(id));
+    const humanTargets = await Promise.all(
+      targetIds.map(async (id) => {
+        try {
+          const member: any = await getGuildMember(token, game.guildId, id);
+          return { id, name: member.nick || member.user.global_name || member.user.username };
+        } catch { return { id, name: id }; }
+      })
+    );
+    bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
+    const botTargets = bots.filter((b) => b.alive && b.id !== voyanteId && !dead.includes(b.id)).map((b) => ({ id: b.id, name: b.name }));
+    targets = [...humanTargets, ...botTargets];
+  } catch (err) {
+    console.error(`[voyante] Failed to build targets, skipping to wolf phase:`, err);
+    await schedulePhase(env, "wolf_phase", { game }, 1);
+    return;
+  }
+  console.log(`[voyante] Targets: ${targets.map(t => t.name).join(", ")} (${targets.length} total)`);
 
   // BOT AUTO-PLAY: If voyante is a bot, use LLM to pick target and store result
   if (voyanteId.startsWith("bot_")) {
@@ -2887,7 +2899,7 @@ async function phaseVoyante(token: string, game: GameState, ctx: ExecutionContex
     await schedulePhase(env, "voyante_timer", { voyanteMessageId: vyMsg.id, voyanteThreadId: voyanteThread.id, game }, VOYANTE_TIMEOUT_SECONDS);
   } catch (err) {
     console.error(`[voyante] ❌ Failed to set up voyante thread, skipping to wolf:`, err);
-    await dispatchPhase(token, "wolf_phase", { game }, ctx, env);
+    await schedulePhase(env, "wolf_phase", { game }, 1);
   }
 }
 
@@ -3319,12 +3331,11 @@ async function phaseDawn(token: string, data: any, ctx: ExecutionContext, env: E
     const roleName = getRoleName(roleKey, game.lang ?? "fr");
     await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Nuit: ${d.name} a été ${d.cause}. C'était ${roleName}.`);
   }
+  // Sorcière actions are SECRET — not added to public game history.
+  // The public only sees "no one died" (if saved) or "X was poisoned" (already in deaths above).
+  // The sorcière bot knows via her own botMemory.
   if (_witchSaved) {
-    await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Nuit: La Sorcière a sauvé ${_wolfVictimName} avec sa potion de vie.`);
-  }
-  if (_witchKillId) {
-    const killName = deaths.find((d) => d.id === _witchKillId)?.name ?? _witchKillId;
-    await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Nuit: La Sorcière a empoisonné ${killName}.`);
+    await appendHistory(env.ACTIVE_PLAYERS, game.gameNumber, `Nuit: Personne n'a été dévoré cette nuit (quelqu'un a été sauvé).`);
   }
 
   // Update witch potions: consume used potions
@@ -4255,77 +4266,99 @@ async function phaseDiscussion(token: string, data: any, ctx: ExecutionContext, 
 
   console.log(`[discussion] ⏱️ START: ${discussionSeconds}s, gameChannel=${game.gameChannelId}`);
 
-  // Reactive bot discussion — bots respond when mentioned or naturally chime in
+  // LLM-driven bot discussion — one LLM call per tick decides who speaks + what they say
   const bots = await loadBots(env.ACTIVE_PLAYERS, game.gameNumber);
   const aliveBots = bots.filter((b) => b.alive);
   if (aliveBots.length > 0 && game.roles) {
-    const botAlivePlayers = await buildBotAlivePlayersList(token, game, livingPlayers, aliveBots);
     const endTime = Date.now() + (discussionSeconds - 12) * 1000; // Stop 12s before vote
-    console.log(`[discussion] ⏱️ reactive bot discussion, ${aliveBots.length} bots, ${discussionSeconds}s`);
+    console.log(`[discussion] 🧠 LLM orchestrator, ${aliveBots.length} bots, ${discussionSeconds}s`);
     ctx.waitUntil((async () => {
       const speakCount: Record<string, number> = {};
       for (const b of aliveBots) speakCount[b.id] = 0;
+      let consecutiveSilence = 0;
 
       // Initial delay before first bot speaks
       await sleep(3000 + Math.floor(Math.random() * 4000));
 
       while (Date.now() < endTime) {
-        // Fetch recent messages to see who's being talked about
-        let mentionedBots: BotPlayer[] = [];
+        // Load all bot memories + build orchestrator bot list
+        const orchBots: OrchestratorBot[] = [];
+        for (const bot of aliveBots) {
+          const mem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, bot.id);
+          const role = game.roles![bot.id] ?? "villageois";
+          const knowledge: string[] = [];
+          if (mem.knownWolves.length > 0) knowledge.push(`🐺 Loups connus: ${mem.knownWolves.join(", ")}`);
+          if (mem.knownInnocents.length > 0) knowledge.push(`✅ Innocents: ${mem.knownInnocents.join(", ")}`);
+          if (mem.voyanteResults.length > 0) knowledge.push(`🔮 Voyante: ${mem.voyanteResults.map((r) => `${r.name}=${r.role}`).join(", ")}`);
+          if (mem.couplePartner) knowledge.push(`💘 Partenaire: ${mem.couplePartner}`);
+          if (mem.wolfChatMessages.length > 0) knowledge.push(`👂 Loups entendus: ${mem.wolfChatMessages.slice(-3).join("; ")}`);
+          if (mem.discussionNotes.length > 0) knowledge.push(`📝 Notes: ${mem.discussionNotes.slice(-3).join("; ")}`);
+          orchBots.push({ name: bot.name, emoji: bot.emoji, traits: bot.traits, role, timesSpoken: speakCount[bot.id] ?? 0, knowledge });
+        }
+
+        // Fetch recent messages for context
+        let recentMessages: string[] = [];
         try {
-          const msgs: any[] = await getChannelMessages(token, game.gameChannelId, undefined, 8);
-          const recentTexts = msgs
-            .filter((m: any) => m.content && !m.webhook_id && !m.author?.bot)
-            .map((m: any) => m.content.toLowerCase())
-            .slice(0, 5);
-          const recentContent = recentTexts.join(" ");
-
-          // Check which bots are mentioned by name in recent human messages
-          mentionedBots = aliveBots.filter((b) =>
-            recentContent.includes(b.name.toLowerCase()),
-          );
-        } catch {}
-
-        // Pick who speaks: prioritize mentioned bots, then random
-        let speaker: BotPlayer | undefined;
-        if (mentionedBots.length > 0) {
-          // Mentioned bot that hasn't spoken too much
-          const candidates = mentionedBots.filter((b) => (speakCount[b.id] ?? 0) < 5);
-          speaker = candidates[Math.floor(Math.random() * candidates.length)];
-        }
-        if (!speaker) {
-          // Random bot weighted by how little they've spoken
-          const weights = aliveBots.map((b) => Math.max(1, 4 - (speakCount[b.id] ?? 0)));
-          const totalWeight = weights.reduce((a, c) => a + c, 0);
-          let roll = Math.random() * totalWeight;
-          for (let i = 0; i < aliveBots.length; i++) {
-            roll -= weights[i]!;
-            if (roll <= 0) { speaker = aliveBots[i]; break; }
-          }
-        }
-        if (!speaker) speaker = aliveBots[Math.floor(Math.random() * aliveBots.length)]!;
-
-        // Chance to stay silent this tick (more likely if bot already spoke a lot)
-        const spoken = speakCount[speaker.id] ?? 0;
-        const silenceChance = mentionedBots.includes(speaker) ? 0.1 : (0.2 + spoken * 0.1);
-        if (Math.random() < silenceChance) {
-          await sleep(5000 + Math.floor(Math.random() * 5000));
-          continue;
-        }
-
-        const role = game.roles![speaker.id] ?? "villageois";
-        try {
-          await executeBotDiscussion(token, env, speaker, bots, game.gameChannelId, game.gameNumber, role, botAlivePlayers, game);
-          speakCount[speaker.id] = (speakCount[speaker.id] ?? 0) + 1;
+          const msgs: any[] = await getChannelMessages(token, game.gameChannelId, undefined, 15);
+          recentMessages = msgs.reverse()
+            .filter((m: any) => m.content && !m.content.startsWith("🗳️") && !m.content.startsWith("☀️") && !m.content.startsWith("🌙"))
+            .map((m: any) => {
+              if (m.webhook_id) return `${m.author?.username ?? "?"}: ${m.content}`;
+              if (m.author?.bot) return null;
+              const author = m.author?.global_name || m.author?.username || "?";
+              return `${author}: ${m.content}`;
+            })
+            .filter(Boolean).slice(-12) as string[];
         } catch (e) {
-          console.error(`[discussion] ⏱️ bot msg error (${speaker.name}):`, e);
+          console.error(`[discussion] 🧠 Failed to fetch recent messages:`, e);
         }
 
-        // Variable delay: shorter when conversation is active, longer when quiet
-        const baseDelay = mentionedBots.length > 0 ? 6000 : 10000;
-        await sleep(baseDelay + Math.floor(Math.random() * 8000));
+        const history = await loadHistory(env.ACTIVE_PLAYERS, game.gameNumber);
+        const prompt = buildOrchestratorPrompt(orchBots, recentMessages, history);
+
+        try {
+          const raw = await callLLM(prompt, env);
+          console.log(`[discussion] 🧠 orchestrator raw: ${raw.slice(0, 200)}`);
+          const result = parseOrchestratorResponse(raw, aliveBots.map((b) => b.name));
+
+          if (result === "silence") {
+            consecutiveSilence++;
+            console.log(`[discussion] 🧠 silence (${consecutiveSilence}x)`);
+            // After 3 silences, force someone to speak by looping again quickly
+            if (consecutiveSilence >= 3) {
+              consecutiveSilence = 0;
+              await sleep(2000);
+            } else {
+              await sleep(4000 + Math.floor(Math.random() * 4000));
+            }
+            continue;
+          }
+
+          if (result && result.speaker && result.message) {
+            consecutiveSilence = 0;
+            const bot = aliveBots.find((b) => b.name === result.speaker);
+            if (bot) {
+              try {
+                await sendBotMessage(token, game, bot, result.message);
+                speakCount[bot.id] = (speakCount[bot.id] ?? 0) + 1;
+                console.log(`[discussion] 🧠 ${bot.name} (${speakCount[bot.id]}x): ${result.message.slice(0, 80)}`);
+                // Save discussion note to memory
+                const mem = await loadBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, bot.id);
+                mem.discussionNotes = [...(mem.discussionNotes ?? []).slice(-4), `Moi: ${result.message.slice(0, 80)}`];
+                await saveBotMemory(env.ACTIVE_PLAYERS, game.gameNumber, bot.id, mem);
+              } catch (e) {
+                console.error(`[discussion] 🧠 send error (${bot.name}):`, e);
+              }
+            }
+          }
+        } catch (e) {
+          console.error(`[discussion] 🧠 orchestrator LLM error:`, e);
+        }
+
+        // Natural delay between messages (LLM call already took ~3-5s)
+        await sleep(3000 + Math.floor(Math.random() * 5000));
       }
-      console.log(`[discussion] ⏱️ discussion ended, speak counts:`, JSON.stringify(speakCount));
+      console.log(`[discussion] 🧠 discussion ended, speak counts:`, JSON.stringify(speakCount));
     })());
   }
 

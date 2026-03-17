@@ -492,3 +492,93 @@ export async function appendHistory(kv: KVNamespace, gameNumber: number, event: 
 export async function clearGameHistory(kv: KVNamespace, gameNumber: number) {
   await kv.delete(`game:${gameNumber}:history`);
 }
+
+// ── LLM Discussion Orchestrator ─────────────────────────────────────
+
+export interface OrchestratorBot {
+  name: string;
+  emoji: string;
+  traits: string[];
+  role: string;
+  timesSpoken: number;
+  knowledge: string[];
+}
+
+export interface OrchestratorResult {
+  speaker: string;
+  message: string;
+}
+
+export function buildOrchestratorPrompt(
+  bots: OrchestratorBot[],
+  recentMessages: string[],
+  gameHistory: string[],
+): string {
+  const botDescriptions = bots.map((b) => {
+    const strategy = ROLE_STRATEGIES[b.role] ?? ROLE_STRATEGIES.villageois!;
+    const knowledgeStr = b.knowledge.length > 0
+      ? `  Connaissances secrètes: ${b.knowledge.join(" | ")}`
+      : "";
+    return [
+      `- ${b.emoji} ${b.name} (${b.traits.join(", ")}) — a parlé ${b.timesSpoken} fois`,
+      `  Rôle SECRET: ${strategy.roleName}`,
+      `  Stratégie: ${strategy.dayStrategy}`,
+      knowledgeStr,
+    ].filter(Boolean).join("\n");
+  }).join("\n\n");
+
+  return [
+    "Tu es le narrateur invisible d'une partie de Loup-Garou en ligne. Tu dois simuler UNE intervention de bot dans la discussion.",
+    "",
+    "JOUEURS BOTS VIVANTS:",
+    botDescriptions,
+    "",
+    recentMessages.length > 0
+      ? `MESSAGES RÉCENTS DU CHAT (du plus ancien au plus récent):\n${recentMessages.join("\n")}`
+      : "MESSAGES RÉCENTS: Aucun message encore.",
+    "",
+    gameHistory.length > 0
+      ? `HISTORIQUE DE LA PARTIE:\n${gameHistory.slice(-15).join("\n")}`
+      : "HISTORIQUE: Début de partie.",
+    "",
+    "RÈGLES STRICTES:",
+    "1. Tu DOIS choisir un bot qui parle. Le silence est TRÈS RARE (seulement si vraiment personne n'a rien à dire ET que la conversation vient de s'arrêter).",
+    "2. PRIORITÉ ABSOLUE: Si un joueur HUMAIN (pas un bot) a posé une question ou fait un commentaire dans les messages récents et que PERSONNE n'y a répondu → un bot DOIT répondre à ce joueur DIRECTEMENT. Réponds à SA question, ne change pas de sujet.",
+    "3. Si quelqu'un interpelle, accuse ou mentionne un bot → CE BOT DOIT répondre. C'est la priorité #2.",
+    "4. Si un bot vient de dire quelque chose → un autre bot peut rebondir, être d'accord, contredire, ou ajouter un argument.",
+    "5. Si personne n'est interpellé → un bot lance un sujet: suspicion, observation, question à un autre joueur, partage subtil d'info secrète.",
+    "6. Favorise les bots qui ont moins parlé. Un bot avec 0 messages devrait vouloir s'exprimer.",
+    "7. Les bots bavards/impulsifs parlent plus souvent. Les silencieux/discrets parlent moins mais font des interventions plus percutantes.",
+    "8. Chaque bot ne connaît QUE ses propres connaissances secrètes. Il ne sait PAS le rôle des autres.",
+    "9. Les loups ne se dénoncent JAMAIS. Ils accusent des innocents et se défendent calmement.",
+    "10. Le message doit faire 1-2 phrases MAX, en français familier comme sur Discord (pas formel).",
+    "11. Ne répète PAS ce qui a déjà été dit. Apporte un argument NOUVEAU ou rebondis.",
+    "12. Ne révèle JAMAIS le rôle d'un bot directement. Utilise des indices subtils.",
+    "13. N'invente PAS de faits. Base les arguments sur l'historique et les messages récents réels.",
+    "14. Les bots DOIVENT interagir entre eux ET avec les humains — poser des questions, se répondre, débattre.",
+    "",
+    'Réponds en JSON UNIQUEMENT: { "speaker": "<nom exact du bot>", "message": "<texte>" }',
+    'En cas exceptionnel de silence complet: { "silence": true }',
+  ].join("\n");
+}
+
+export function parseOrchestratorResponse(raw: string, validBotNames: string[]): OrchestratorResult | "silence" | null {
+  const json = extractJSON(raw);
+  if (!json) return null;
+
+  if (json.silence === true) return "silence";
+
+  if (json.speaker && json.message) {
+    // Fuzzy match speaker name
+    const lower = json.speaker.toLowerCase().trim();
+    const match = validBotNames.find((n) => n.toLowerCase() === lower)
+      ?? validBotNames.find((n) => n.toLowerCase().startsWith(lower))
+      ?? validBotNames.find((n) => lower.includes(n.toLowerCase()));
+    if (!match) return null;
+    const message = String(json.message).trim();
+    if (!message || message.length > 500) return null;
+    return { speaker: match, message };
+  }
+
+  return null;
+}
